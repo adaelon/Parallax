@@ -13,7 +13,7 @@ use std::{
 
 use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
-use state::{HostStatusView, ManagedHost};
+use state::{ConversationTurnResult, ConversationTurnView, HostStatusView, ManagedHost};
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
     image::Image,
@@ -45,6 +45,21 @@ struct UpdateAvailability {
 #[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
 fn get_host_status(host: tauri::State<'_, ManagedHost>) -> HostStatusView {
     host.status()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn list_conversation(
+    host: tauri::State<'_, ManagedHost>,
+) -> Result<Vec<ConversationTurnView>, String> {
+    host.list_conversation()
+}
+
+#[tauri::command]
+async fn send_message(app: AppHandle, verbatim: String) -> Result<ConversationTurnResult, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<ManagedHost>().send_message(verbatim))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -210,6 +225,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         })
         .invoke_handler(tauri::generate_handler![
             get_host_status,
+            list_conversation,
+            send_message,
             get_autostart,
             set_autostart,
             check_update,

@@ -117,3 +117,15 @@
 
 **入口**：`evrything-about-me.exe` 调用 `eam_desktop_app::run`；第二实例只激活首实例，托盘和关闭窗口事件复用同一 `ManagedHost`。
 **测试**：`apps/desktop/src-tauri/src/lib.rs::tests` 覆盖 updater 启用条件、失败重开错误和托盘图标；`state.rs::tests` 覆盖退出阶段全部尝试；`apps/desktop/src/App.test.tsx` 覆盖静态宿主边界；`cargo build --bins --features tauri/custom-protocol --release` 验证无 bundle Windows 可执行文件。
+
+## 2026-07-30 S07-3 持续对话 command 与界面
+
+**触达**:
+- `apps/desktop/src-tauri/src/state.rs:ManagedHost::list_conversation` — 从 SQLCipher 只投影固定持续会话的双方逐字证据视图。
+- `apps/desktop/src-tauri/src/state.rs:ManagedHost::send_message` — 在持久化前校验输入，以最近 32 轮/64 KiB 上限冻结上下文并调用 `MemoryCore::run_counterpart_turn`。
+- `apps/desktop/src-tauri/src/lib.rs:list_conversation/send_message` — 注册两个白名单 Tauri command，并把阻塞模型调用移出事件循环线程。
+- `apps/desktop/src/App.tsx:App` — 恢复同一段对话，发送新消息，并在运行时失败后重读已落盘的本人原文。
+- `apps/desktop/src/styles.css:.conversation-shell` — 建立持续对话、消息归属、忙碌、错误和窄屏布局。
+
+**入口**：React 启动调用 `list_conversation`；本人提交 composer 时调用 `send_message({ verbatim })`，两条路径均只经过 Tauri invoke 白名单进入内嵌 Core。
+**测试**：`apps/desktop/src-tauri/src/state.rs::tests::ordinary_conversation_survives_sqlcipher_reopen_without_claims` 覆盖逐字重启恢复与普通问答零 Claim；同模块覆盖输入拒绝和既往上下文冻结；`apps/desktop/src/App.test.tsx` 覆盖恢复、成功发送及运行时失败后的已落盘发言回读。

@@ -663,6 +663,24 @@ Core freezes WorkingContext
 
 供应商响应结构错误不会触发换档重试；运行时不可用时，本人原始发言已经作为证据提交，既有证据和 Self Bundle 不回滚。S06 的具体 HTTP 传输强制 Cloud 使用 HTTPS 与非空 bearer token、禁止重定向，Local 不携带 bearer；token 只注入请求头并以清零内存持有，不写入请求体或检查记录。S07 只负责从宿主配置注入端点和凭据并管理桌面生命周期，不改变 contract。
 
+S07 通过两个白名单 command 接通持续对话，不把 Core 能力面传给 WebView：
+
+```text
+list_conversation()
+  -> Core 从 SQLCipher 读取逐字 ConversationEvidence
+  -> 只投影固定持续会话的 id / speaker / verbatim / recorded_at
+  -> React 恢复同一段对话
+
+send_message(verbatim)
+  -> 拒绝空白或超过 16 KiB 的输入
+  -> 从固定持续会话选取最近 32 轮且不超过 64 KiB 的已有原文
+  -> Core 冻结 WorkingContext
+  -> MemoryCore::run_counterpart_turn
+  -> 返回本人与第二自我的两个逐字证据视图
+```
+
+运行时失败时，本人发言仍按 Core 既有语义保留；React 重新调用 `list_conversation`，显示已落盘原文与错误。普通问答只有运行时显式提出并通过 Core 校验的结构化操作才可能入账，保留原文本身不产生 Claim。
+
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
   -> require agreement is active at effective_at
@@ -1120,14 +1138,14 @@ OpenAiResponsesRuntime::respond(RuntimeRequest)
 
 Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 对同一固定夹具产生等价领域输出；具体 HTTP 传输强制 Cloud HTTPS + bearer 与无凭据 Local 端点，S07 只注入端点和秘密，不能取得保险库或改变 [G03 Runtime Contract v1](runtime-contract-v1.md)。结构化输出错误失败关闭，只有超时和不可用进入本地档案。SQLCipher 集成测试证明运行时不可用不会回滚已提交的本人证据。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0048](adr/0048-openai-responses-runtime-family.md)。
 
-### 9.7 S07 thin 桌面宿主当前实现边界
+### 9.7 S07 桌面宿主与持续对话当前实现边界
 
 ```text
 apps/desktop/src-tauri/src/
-  lib.rs                # 单实例优先、当前用户自启动、托盘、条件式 updater 与事件循环
-  state.rs              # Vault/Core/运行时装配、30 秒心跳和失败仍继续的安全退出
+  lib.rs                # 宿主事件循环及 list_conversation/send_message 白名单 command
+  state.rs              # Vault/Core 装配、持续会话投影、有限上下文、心跳与安全退出
 apps/desktop/src/
-  App.tsx               # 仅验证宿主渲染的静态占位界面
+  App.tsx               # 重启恢复、发送、忙碌与错误恢复的持续对话界面
 crates/desktop-host/src/
   lifecycle.rs          # 无 Tauri 依赖的宿主状态机
 crates/vault/src/
@@ -1137,7 +1155,9 @@ crates/vault/src/
 ```text
 first process -> single-instance plugin -> unlock Vault -> begin_host_session -> tray event loop
 second process -> activate_existing_window(first process) -> exit
+React send -> send_message -> freeze recent conversation context -> MemoryCore -> exact turn views
+React restore -> list_conversation -> SQLCipher evidence -> exact turn views
 explicit exit -> finish_host_session -> close Vault -> zeroize key -> release lock -> process exit
 ```
 
-主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动和 updater 只能经宿主白名单 command 使用。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。当前 React 只提供静态宿主占位，不实现持续对话、采集或 Personal Library；该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md) 和 [ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)。
+主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater 和持续对话只能经宿主白名单 command 使用。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。当前界面不实现采集、时间线或 Personal Library；该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) 和 [ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)。

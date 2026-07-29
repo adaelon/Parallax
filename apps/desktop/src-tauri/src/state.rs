@@ -5,7 +5,10 @@ use std::{
     time::Duration,
 };
 
-use eam_core::{Clock, CounterpartRuntime, MemoryCore, SystemClock};
+use eam_core::{
+    Clock, ConversationEvidence, CounterpartRuntime, EvidenceId, MemoryCore, MemoryRepository,
+    SessionId, Speaker, SystemClock,
+};
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, OpenAiResponsesRuntime, RuntimeTarget,
@@ -16,6 +19,10 @@ use serde::Serialize;
 const LOCAL_RESPONSES_ENDPOINT: &str = "http://127.0.0.1:11434/v1/responses";
 const CLOUD_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const RUNTIME_TIMEOUT: Duration = Duration::from_secs(45);
+const CONTINUOUS_SESSION_ID: &str = "continuous-conversation";
+const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_CONTEXT_TURNS: usize = 32;
+const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 
 type AppRuntime = Box<dyn CounterpartRuntime + Send>;
 type AppCore = MemoryCore<VaultRepository, AppRuntime, SystemClock>;
@@ -46,6 +53,22 @@ pub struct HostStatusView {
     vault_ready: bool,
     updater_configured: bool,
     detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationTurnView {
+    id: u64,
+    speaker: &'static str,
+    verbatim: String,
+    recorded_at_millis: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationTurnResult {
+    person: ConversationTurnView,
+    counterpart: ConversationTurnView,
 }
 
 impl ManagedHost {
@@ -126,6 +149,24 @@ impl ManagedHost {
                     .map_err(|error| error.to_string())
             }
             HostSlot::Locked(_) | HostSlot::FailedClosed(_) => Ok(()),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn list_conversation(&self) -> Result<Vec<ConversationTurnView>, String> {
+        match &*self.lock() {
+            HostSlot::Ready(host) => list_conversation_from_core(&host.core),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn send_message(&self, verbatim: String) -> Result<ConversationTurnResult, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => send_message_with_core(&mut host.core, verbatim),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
         }
     }
@@ -241,6 +282,120 @@ fn configured_runtime() -> Result<AppRuntime, String> {
     }
 }
 
+fn list_conversation_from_core<R, T, C>(
+    core: &MemoryCore<R, T, C>,
+) -> Result<Vec<ConversationTurnView>, String>
+where
+    R: MemoryRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    core.repository()
+        .all_evidence()
+        .map_err(|error| error.to_string())
+        .map(|evidence| {
+            evidence
+                .iter()
+                .filter(|turn| turn.session_id().as_str() == CONTINUOUS_SESSION_ID)
+                .map(ConversationTurnView::from)
+                .collect()
+        })
+}
+
+fn send_message_with_core<R, T, C>(
+    core: &mut MemoryCore<R, T, C>,
+    verbatim: String,
+) -> Result<ConversationTurnResult, String>
+where
+    R: MemoryRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    validate_message(&verbatim)?;
+    let prior_turns = core
+        .repository()
+        .all_evidence()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|turn| turn.session_id().as_str() == CONTINUOUS_SESSION_ID)
+        .collect::<Vec<_>>();
+    let context_ids = select_context_ids(&prior_turns);
+    let working_context = core
+        .freeze_working_context(&context_ids)
+        .map_err(|error| error.to_string())?;
+    let outcome = core
+        .run_counterpart_turn(
+            SessionId::new(CONTINUOUS_SESSION_ID),
+            verbatim,
+            working_context,
+        )
+        .map_err(|error| error.to_string())?;
+    let person = conversation_turn(core, outcome.person_evidence_id())?;
+    let counterpart = conversation_turn(core, outcome.counterpart_evidence_id())?;
+    Ok(ConversationTurnResult {
+        person,
+        counterpart,
+    })
+}
+
+fn validate_message(verbatim: &str) -> Result<(), String> {
+    if verbatim.trim().is_empty() {
+        return Err("message cannot be empty".to_owned());
+    }
+    if verbatim.len() > MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "message exceeds the {MAX_MESSAGE_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
+fn select_context_ids(evidence: &[ConversationEvidence]) -> Vec<EvidenceId> {
+    let mut bytes = 0;
+    let mut selected = Vec::new();
+    for turn in evidence.iter().rev().take(MAX_CONTEXT_TURNS) {
+        let next_bytes = bytes + turn.verbatim().len();
+        if next_bytes > MAX_CONTEXT_BYTES {
+            break;
+        }
+        bytes = next_bytes;
+        selected.push(turn.id());
+    }
+    selected.reverse();
+    selected
+}
+
+fn conversation_turn<R, T, C>(
+    core: &MemoryCore<R, T, C>,
+    evidence_id: EvidenceId,
+) -> Result<ConversationTurnView, String>
+where
+    R: MemoryRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    core.repository()
+        .evidence(evidence_id)
+        .map_err(|error| error.to_string())?
+        .as_ref()
+        .map(ConversationTurnView::from)
+        .ok_or_else(|| format!("conversation evidence {} is missing", evidence_id.get()))
+}
+
+impl From<&ConversationEvidence> for ConversationTurnView {
+    fn from(value: &ConversationEvidence) -> Self {
+        Self {
+            id: value.id().get(),
+            speaker: match value.speaker() {
+                Speaker::Person => "person",
+                Speaker::Counterpart => "counterpart",
+            },
+            verbatim: value.verbatim().to_owned(),
+            recorded_at_millis: value.recorded_at().as_millis(),
+        }
+    }
+}
+
 fn collect_shutdown_errors(
     finish: Result<(), String>,
     close: Result<(), String>,
@@ -272,7 +427,25 @@ const fn encode_host_state(state: HostState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
+    use eam_core::{
+        InMemoryRepository, IncrementingClock, PersonTurnClassification, RuntimeResponse,
+        ScriptedRuntime,
+    };
+    use eam_vault::VaultKey;
+    use tempfile::tempdir;
+
     use super::*;
+
+    const TEST_VAULT_KEY: [u8; 32] = [0x73; 32];
+    static SQLCIPHER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn sqlcipher_test_lock() -> MutexGuard<'static, ()> {
+        SQLCIPHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn shutdown_collects_every_stage_failure_in_order() {
@@ -294,5 +467,86 @@ mod tests {
     #[test]
     fn shutdown_success_requires_all_stages() {
         assert_eq!(collect_shutdown_errors(Ok(()), Ok(()), Ok(())), Ok(()));
+    }
+
+    #[test]
+    fn ordinary_conversation_survives_sqlcipher_reopen_without_claims() {
+        let _guard = sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let repository =
+            VaultRepository::open(directory.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+        let runtime = ScriptedRuntime::new(
+            [PersonTurnClassification::Question],
+            [RuntimeResponse::new("我会记得这段原话。")],
+        );
+        let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(10_000));
+
+        let result = send_message_with_core(&mut core, "你会记得这句话吗？".to_owned()).unwrap();
+        assert_eq!(result.person.verbatim, "你会记得这句话吗？");
+        assert_eq!(result.counterpart.verbatim, "我会记得这段原话。");
+        assert!(core.repository().all_claims().unwrap().is_empty());
+
+        let (repository, _, _) = core.into_parts();
+        repository.close().unwrap();
+        let repository =
+            VaultRepository::open(directory.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+        let core = MemoryCore::new(
+            repository,
+            ScriptedRuntime::default(),
+            IncrementingClock::new(20_000),
+        );
+
+        let restored = list_conversation_from_core(&core).unwrap();
+        assert_eq!(restored, vec![result.person, result.counterpart]);
+        assert!(core.repository().all_claims().unwrap().is_empty());
+        let (repository, _, _) = core.into_parts();
+        repository.close().unwrap();
+    }
+
+    #[test]
+    fn rejects_blank_and_oversized_messages_before_persistence() {
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            ScriptedRuntime::default(),
+            IncrementingClock::new(30_000),
+        );
+
+        assert!(send_message_with_core(&mut core, "   ".to_owned()).is_err());
+        assert!(send_message_with_core(&mut core, "x".repeat(MAX_MESSAGE_BYTES + 1)).is_err());
+        assert!(core.repository().all_evidence().unwrap().is_empty());
+    }
+
+    #[test]
+    fn later_turn_receives_prior_continuous_conversation_as_frozen_context() {
+        let runtime = ScriptedRuntime::new(
+            [
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+            ],
+            [
+                RuntimeResponse::new("第一答"),
+                RuntimeResponse::new("第二答"),
+            ],
+        );
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            runtime,
+            IncrementingClock::new(40_000),
+        );
+
+        send_message_with_core(&mut core, "第一问".to_owned()).unwrap();
+        send_message_with_core(&mut core, "第二问".to_owned()).unwrap();
+
+        let requests = core.runtime().seen_requests();
+        assert!(requests[0].working_context().evidence().is_empty());
+        assert_eq!(
+            requests[1]
+                .working_context()
+                .evidence()
+                .iter()
+                .map(ConversationEvidence::verbatim)
+                .collect::<Vec<_>>(),
+            vec!["第一问", "第一答"]
+        );
     }
 }
