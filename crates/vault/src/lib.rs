@@ -5,6 +5,7 @@ mod crypto;
 mod dpapi;
 mod error;
 mod key_store;
+mod object_store;
 mod repository;
 mod schema;
 

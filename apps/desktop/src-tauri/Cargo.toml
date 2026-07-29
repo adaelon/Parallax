@@ -16,6 +16,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 [dependencies]
 eam_core = { package = "core", path = "../../../crates/core" }
 eam_desktop_host = { package = "desktop-host", path = "../../../crates/desktop-host" }
+eam_ingestion = { package = "ingestion", path = "../../../crates/ingestion" }
 eam_runtime_gateway = { package = "runtime-gateway", path = "../../../crates/runtime-gateway" }
 eam_vault = { package = "vault", path = "../../../crates/vault" }
 serde = { version = "=1.0.229", features = ["derive"] }

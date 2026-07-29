@@ -1,5 +1,35 @@
 # 代码链路
 
+## 2026-07-30 S08-3 宿主白名单归档入口
+
+**触达**:
+- `apps/desktop/src-tauri/src/state.rs:ManagedHost::import_context_file` — 在可信宿主内运行有界摄取并只返回归档状态、原因和去重结果。
+- `apps/desktop/src-tauri/src/lib.rs:import_context_file` — 新增单一领域型异步 Tauri command，不暴露通用文件或 repository 能力。
+- `apps/desktop/src-tauri/capabilities/main.json:main` — 保持仅 `core:default`，明确无通用文件、shell、HTTP、进程或凭据权限。
+
+**入口**：WebView 只能调用 `import_context_file({ path, approveOversized })`，实际文件观察、认证加密和 SQLCipher 写入均留在内嵌 Core。
+**测试**：`apps/desktop/src-tauri/src/state.rs::tests::bounded_import_view_*` 覆盖普通归档、非 Markdown 原因、超限等待和非普通文件拒绝；desktop-app 10 个库测试保持绿色。
+
+## 2026-07-30 S08-2 加密对象库与归档引用
+
+**触达**:
+- `crates/vault/src/object_store.rs:ObjectStore` — 以 HMAC-SHA256 内容标识、XChaCha20-Poly1305 认证密文和原子发布实现去重对象库。
+- `crates/vault/src/schema.rs:MIGRATION_5` — 新增加密归档证据元数据、状态/原因约束和对象引用索引。
+- `crates/vault/src/repository.rs:ArchiveRepository` — 对象先写、SQLCipher 引用后提交，并在启动时清理无引用对象。
+- `crates/vault/src/repository.rs:VaultRepository::read_archived_content` — 在可信 Core 内认证解密已归档原件。
+
+**入口**：`ingest_inbox_file` 通过 `ArchiveRepository` 把已稳定字节交给 `VaultRepository`；重开保险库时自动执行对象引用校准。
+**测试**：`crates/vault/tests/archive_persistence.rs` 覆盖内容去重、同来源幂等、删除投递原件后的跨重启恢复；`repository::tests::database_failure_leaves_recoverable_orphan_removed_on_reopen` 覆盖 SQLCipher 提交故障与无引用对象清理。
+
+## 2026-07-30 S08-1 Context Inbox 普通文件边界
+
+**触达**:
+- `crates/ingestion/src/domain.rs:evaluate_observations` — 固定稳定普通文件、超限批准、重解析点/非普通文件拒绝及归档状态契约。
+- `crates/ingestion/src/service.rs:ingest_inbox_file` — 以两次元数据观察、无跟随打开和读取后复核实现先归档前的有界文件摄取。
+
+**入口**：可信宿主向 `ingest_inbox_file` 提供明确路径、导入策略、超限批准和归档时间；该子片只调用抽象 `ArchiveRepository`。
+**测试**：`crates/ingestion/src/domain.rs::tests` 覆盖状态转换正反例；`crates/ingestion/src/service.rs::tests` 覆盖 Markdown 仅归档、非 Markdown 固定拒绝原因、目录拒绝与超限等待。
+
 ## 2026-07-29 S01 可执行的最小记忆闭环
 
 **触达**:

@@ -5,6 +5,7 @@ use std::{error::Error, fmt, io};
 pub enum VaultError {
     AlreadyOpen,
     AlreadyInitialized,
+    ArchiveInterrupted,
     CipherUnavailable,
     EntropyUnavailable,
     ExistingVaultWithoutKeyMetadata,
@@ -24,6 +25,9 @@ impl fmt::Display for VaultError {
         match self {
             Self::AlreadyOpen => formatter.write_str("vault already has an active writer"),
             Self::AlreadyInitialized => formatter.write_str("vault key metadata already exists"),
+            Self::ArchiveInterrupted => {
+                formatter.write_str("archive database commit was interrupted")
+            }
             Self::CipherUnavailable => {
                 formatter.write_str("the SQLite binding does not expose SQLCipher")
             }
@@ -71,6 +75,7 @@ impl Error for VaultError {
             Self::Sqlite(error) => Some(error),
             Self::AlreadyOpen
             | Self::AlreadyInitialized
+            | Self::ArchiveInterrupted
             | Self::CipherUnavailable
             | Self::EntropyUnavailable
             | Self::ExistingVaultWithoutKeyMetadata

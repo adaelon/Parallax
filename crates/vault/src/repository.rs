@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
 };
@@ -16,10 +17,16 @@ use eam_identity::{
     IntroductionAnswer, IntroductionItem, SelfBundleRepository, SelfBundleState, SelfBundleVersion,
     SelfIntroductionCategory, WakeCommit, WakeExit, WakeTrigger,
 };
+use eam_ingestion::{
+    ArchiveInput, ArchiveReceipt, ArchiveRepository, ArchiveStatus, ArchivedEvidence,
+    UnparsedReason,
+};
 use fs4::{FileExt, TryLockError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::{VaultError, VaultKey, crypto::sqlcipher_key_pragma, schema::migrate};
+use crate::{
+    VaultError, VaultKey, crypto::sqlcipher_key_pragma, object_store::ObjectStore, schema::migrate,
+};
 
 const DATABASE_FILE: &str = "self.db";
 const WRITER_LOCK_FILE: &str = "self.db.writer.lock";
@@ -27,10 +34,12 @@ const WRITER_LOCK_FILE: &str = "self.db.writer.lock";
 pub struct VaultRepository {
     connection: Option<Connection>,
     writer_lock: Option<File>,
+    object_store: ObjectStore,
     vault_key: VaultKey,
     database_path: PathBuf,
     next_evidence_id: u64,
     next_claim_id: u64,
+    next_archive_id: u64,
 }
 
 impl VaultRepository {
@@ -59,16 +68,22 @@ impl VaultRepository {
         configure_connection(&connection)?;
         migrate(&mut connection)?;
 
+        let object_store = ObjectStore::open(vault_root, vault_key.objects_key()?)?;
+        object_store.cleanup_unreferenced(&referenced_object_ids(&connection)?)?;
+
         let next_evidence_id = next_identifier(&connection, "conversation_evidence")?;
         let next_claim_id = next_identifier(&connection, "claims")?;
+        let next_archive_id = next_identifier(&connection, "archived_evidence")?;
 
         Ok(Self {
             connection: Some(connection),
             writer_lock: Some(writer_lock),
+            object_store,
             vault_key,
             database_path,
             next_evidence_id,
             next_claim_id,
+            next_archive_id,
         })
     }
 
@@ -97,6 +112,64 @@ impl VaultRepository {
             .pragma_query_value(None, "user_version", |row| row.get(0))?)
     }
 
+    /// Lists archived Context Inbox evidence without exposing object keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encrypted metadata is unreadable or invalid.
+    pub fn archived_evidence(&self) -> Result<Vec<ArchivedEvidence>, VaultError> {
+        let mut statement = self.connection().prepare(
+            "SELECT id, source_locator, content_length, status, unparsed_reason, archived_at
+             FROM archived_evidence ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(id, source_locator, content_length, status, reason, archived_at_millis)| {
+                    Ok(ArchivedEvidence {
+                        archive_id: u64::try_from(id)
+                            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                        source_locator,
+                        content_length: u64::try_from(content_length)
+                            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                        status: decode_archive_status(status, reason)?,
+                        archived_at_millis,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Decrypts one archived original inside the trusted Core boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the archive ID is missing, the object is absent,
+    /// or authenticated decryption fails.
+    pub fn read_archived_content(&self, archive_id: u64) -> Result<Vec<u8>, VaultError> {
+        let object_id = self
+            .connection()
+            .query_row(
+                "SELECT object_id FROM archived_evidence WHERE id = ?1",
+                [to_vault_sql_id(archive_id)?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        self.object_store.read(&object_id)
+    }
+
     /// Checkpoints encrypted WAL state, closes `SQLCipher`, clears the owned
     /// Vault Key, and releases the writer lock.
     ///
@@ -114,6 +187,80 @@ impl VaultRepository {
             .expect("an open vault always owns a database connection")
     }
 
+    fn archive_with_hook<F>(
+        &mut self,
+        input: &ArchiveInput<'_>,
+        before_commit: F,
+    ) -> Result<ArchiveReceipt, VaultError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), VaultError>,
+    {
+        if input.source_locator.is_empty() {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let content_length =
+            i64::try_from(input.content.len()).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let stored = self.object_store.store(input.content)?;
+        let existing = self
+            .connection()
+            .query_row(
+                "SELECT id, status, unparsed_reason FROM archived_evidence
+                 WHERE source_kind = 0 AND source_locator = ?1 AND object_id = ?2",
+                params![input.source_locator, stored.id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((archive_id, status, reason)) = existing {
+            return Ok(ArchiveReceipt {
+                archive_id: u64::try_from(archive_id)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                status: decode_archive_status(status, reason)?,
+                object_reused: true,
+                source_version_reused: true,
+            });
+        }
+
+        let archive_id = self.next_archive_id;
+        let (status, unparsed_reason) = encode_archive_status(input.status);
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        transaction.execute(
+            "INSERT INTO archived_evidence
+             (id, source_kind, source_locator, object_id, content_length,
+              status, unparsed_reason, archived_at)
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                to_vault_sql_id(archive_id)?,
+                input.source_locator,
+                stored.id,
+                content_length,
+                status,
+                unparsed_reason,
+                input.archived_at_millis,
+            ],
+        )?;
+        before_commit(&transaction)?;
+        transaction.commit()?;
+        self.next_archive_id = archive_id
+            .checked_add(1)
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        Ok(ArchiveReceipt {
+            archive_id,
+            status: input.status,
+            object_reused: stored.reused,
+            source_version_reused: false,
+        })
+    }
+
     fn close_inner(&mut self) -> Result<(), VaultError> {
         let mut first_error = None;
 
@@ -129,6 +276,7 @@ impl VaultRepository {
         }
 
         self.vault_key.zeroize();
+        self.object_store.zeroize();
 
         if let Some(writer_lock) = self.writer_lock.take()
             && let Err(error) = FileExt::unlock(&writer_lock)
@@ -147,6 +295,14 @@ impl VaultRepository {
 impl Drop for VaultRepository {
     fn drop(&mut self) {
         let _ = self.close_inner();
+    }
+}
+
+impl ArchiveRepository for VaultRepository {
+    type Error = VaultError;
+
+    fn archive(&mut self, input: ArchiveInput<'_>) -> Result<ArchiveReceipt, Self::Error> {
+        self.archive_with_hook(&input, |_| Ok(()))
     }
 }
 
@@ -1023,6 +1179,34 @@ fn configure_connection(connection: &Connection) -> Result<(), VaultError> {
     Ok(())
 }
 
+fn referenced_object_ids(connection: &Connection) -> Result<HashSet<String>, VaultError> {
+    let mut statement = connection.prepare("SELECT DISTINCT object_id FROM archived_evidence")?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(VaultError::from)
+}
+
+const fn encode_archive_status(status: ArchiveStatus) -> (i64, Option<i64>) {
+    match status {
+        ArchiveStatus::Archived => (0, None),
+        ArchiveStatus::ArchivedUnparsed(UnparsedReason::UnsupportedFormat) => (1, Some(0)),
+    }
+}
+
+fn decode_archive_status(
+    status: i64,
+    unparsed_reason: Option<i64>,
+) -> Result<ArchiveStatus, VaultError> {
+    match (status, unparsed_reason) {
+        (0, None) => Ok(ArchiveStatus::Archived),
+        (1, Some(0)) => Ok(ArchiveStatus::ArchivedUnparsed(
+            UnparsedReason::UnsupportedFormat,
+        )),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
 fn next_identifier(connection: &Connection, table: &str) -> Result<u64, VaultError> {
     let query = format!("SELECT COALESCE(MAX(id), 0) FROM {table}");
     let maximum: i64 = connection.query_row(&query, [], |row| row.get(0))?;
@@ -1030,6 +1214,10 @@ fn next_identifier(connection: &Connection, table: &str) -> Result<u64, VaultErr
     maximum
         .checked_add(1)
         .ok_or(VaultError::InvalidKeyOrCorrupt)
+}
+
+fn to_vault_sql_id(id: u64) -> Result<i64, VaultError> {
+    i64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)
 }
 
 fn next_host_identifier(connection: &Connection, table: &str) -> Result<u64, RepositoryError> {
@@ -1525,5 +1713,33 @@ mod tests {
         let version = repository.sqlcipher_version().unwrap();
 
         assert!(version.starts_with("4."), "unexpected SQLCipher: {version}");
+    }
+
+    #[test]
+    fn database_failure_leaves_recoverable_orphan_removed_on_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let mut repository =
+            VaultRepository::open(directory.path(), VaultKey::new([0x29; 32])).unwrap();
+
+        let result = repository.archive_with_hook(
+            &ArchiveInput {
+                source_locator: "inbox/interrupted.md",
+                content: b"durable object before database reference",
+                status: ArchiveStatus::Archived,
+                archived_at_millis: 100,
+            },
+            |_| Err(VaultError::ArchiveInterrupted),
+        );
+
+        assert!(matches!(result, Err(VaultError::ArchiveInterrupted)));
+        assert!(repository.archived_evidence().unwrap().is_empty());
+        assert_eq!(repository.object_store.object_file_count().unwrap(), 1);
+        repository.close().unwrap();
+
+        let repository =
+            VaultRepository::open(directory.path(), VaultKey::new([0x29; 32])).unwrap();
+        assert!(repository.archived_evidence().unwrap().is_empty());
+        assert_eq!(repository.object_store.object_file_count().unwrap(), 0);
     }
 }

@@ -8,7 +8,6 @@ use crate::VaultError;
 
 const KDF_SALT: &[u8] = b"evrything-about-me/v1/vault-subkeys";
 const DATABASE_INFO: &[u8] = b"database";
-#[cfg(test)]
 const OBJECTS_INFO: &[u8] = b"objects";
 #[cfg(test)]
 const BACKUP_INFO: &[u8] = b"backup";
@@ -41,6 +40,10 @@ impl VaultKey {
 
     pub(crate) fn database_key(&self) -> Result<Zeroizing<[u8; 32]>, VaultError> {
         derive_subkey(&self.0, DATABASE_INFO)
+    }
+
+    pub(crate) fn objects_key(&self) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+        derive_subkey(&self.0, OBJECTS_INFO)
     }
 
     pub(crate) fn zeroize(&mut self) {

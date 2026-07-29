@@ -13,7 +13,10 @@ use std::{
 
 use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
-use state::{ConversationTurnResult, ConversationTurnView, HostStatusView, ManagedHost};
+use state::{
+    ConversationTurnResult, ConversationTurnView, HostStatusView, ImportContextFileView,
+    ManagedHost,
+};
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
     image::Image,
@@ -60,6 +63,20 @@ async fn send_message(app: AppHandle, verbatim: String) -> Result<ConversationTu
     tauri::async_runtime::spawn_blocking(move || app.state::<ManagedHost>().send_message(verbatim))
         .await
         .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn import_context_file(
+    app: AppHandle,
+    path: String,
+    approve_oversized: bool,
+) -> Result<ImportContextFileView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>()
+            .import_context_file(&path, approve_oversized)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -227,6 +244,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             get_host_status,
             list_conversation,
             send_message,
+            import_context_file,
             get_autostart,
             set_autostart,
             check_update,

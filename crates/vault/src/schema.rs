@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 4;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 5;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -151,6 +151,26 @@ CREATE INDEX host_runtime_gap_recovery_idx
     ON host_runtime_gaps(recovered_by_session_id);
 ";
 
+const MIGRATION_5: &str = r"
+CREATE TABLE archived_evidence (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    source_kind INTEGER NOT NULL CHECK (source_kind = 0),
+    source_locator TEXT NOT NULL CHECK (length(source_locator) > 0),
+    object_id TEXT NOT NULL CHECK (length(object_id) = 64),
+    content_length INTEGER NOT NULL CHECK (content_length >= 0),
+    status INTEGER NOT NULL CHECK (status IN (0, 1)),
+    unparsed_reason INTEGER CHECK (unparsed_reason IS NULL OR unparsed_reason = 0),
+    archived_at INTEGER NOT NULL,
+    CHECK (
+        (status = 0 AND unparsed_reason IS NULL)
+        OR (status = 1 AND unparsed_reason = 0)
+    ),
+    UNIQUE (source_kind, source_locator, object_id)
+) STRICT;
+
+CREATE INDEX archived_evidence_object_idx ON archived_evidence(object_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -172,6 +192,7 @@ where
             2 => transaction.execute_batch(MIGRATION_2)?,
             3 => transaction.execute_batch(MIGRATION_3)?,
             4 => transaction.execute_batch(MIGRATION_4)?,
+            5 => transaction.execute_batch(MIGRATION_5)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -314,6 +335,45 @@ mod tests {
         let table_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'host_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_archive_migration_keeps_host_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.execute_batch(MIGRATION_3).unwrap();
+        connection.execute_batch(MIGRATION_4).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 5 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(5))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'archived_evidence'",
                 [],
                 |row| row.get(0),
             )

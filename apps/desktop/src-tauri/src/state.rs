@@ -10,6 +10,10 @@ use eam_core::{
     SessionId, Speaker, SystemClock,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
+use eam_ingestion::{
+    ArchiveRepository, ArchiveStatus, ImportOutcome, ImportPolicy, RejectReason, UnparsedReason,
+    ingest_inbox_file,
+};
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, OpenAiResponsesRuntime, RuntimeTarget,
 };
@@ -33,6 +37,7 @@ pub struct ManagedHost {
     updater_configured: bool,
 }
 
+#[allow(clippy::large_enum_variant)] // One mutex-owned Core is resident; boxing adds no useful boundary.
 enum HostSlot {
     Ready(HostCore),
     Locked(String),
@@ -69,6 +74,17 @@ pub struct ConversationTurnView {
 pub struct ConversationTurnResult {
     person: ConversationTurnView,
     counterpart: ConversationTurnView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportContextFileView {
+    status: &'static str,
+    archive_id: Option<u64>,
+    reason: Option<&'static str>,
+    bytes: Option<u64>,
+    object_reused: bool,
+    source_version_reused: bool,
 }
 
 impl ManagedHost {
@@ -165,6 +181,28 @@ impl ManagedHost {
     pub fn send_message(&self, verbatim: String) -> Result<ConversationTurnResult, String> {
         match &mut *self.lock() {
             HostSlot::Ready(host) => send_message_with_core(&mut host.core, verbatim),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn import_context_file(
+        &self,
+        path: &str,
+        approve_oversized: bool,
+    ) -> Result<ImportContextFileView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                let archived_at_millis = host.host_clock.now().as_millis();
+                import_context_file_with_policy(
+                    host.core.repository_mut(),
+                    Path::new(path),
+                    &ImportPolicy::default(),
+                    approve_oversized,
+                    archived_at_millis,
+                )
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -382,6 +420,76 @@ where
         .ok_or_else(|| format!("conversation evidence {} is missing", evidence_id.get()))
 }
 
+fn import_context_file_with_policy<R: ArchiveRepository>(
+    repository: &mut R,
+    path: &Path,
+    policy: &ImportPolicy,
+    approve_oversized: bool,
+    archived_at_millis: i64,
+) -> Result<ImportContextFileView, String>
+where
+    R::Error: std::fmt::Display,
+{
+    let outcome = ingest_inbox_file(
+        repository,
+        path,
+        policy,
+        approve_oversized,
+        archived_at_millis,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(import_context_file_view(outcome))
+}
+
+const fn import_context_file_view(outcome: ImportOutcome) -> ImportContextFileView {
+    match outcome {
+        ImportOutcome::Discovered => ImportContextFileView {
+            status: "discovered",
+            archive_id: None,
+            reason: None,
+            bytes: None,
+            object_reused: false,
+            source_version_reused: false,
+        },
+        ImportOutcome::AwaitingApproval { bytes } => ImportContextFileView {
+            status: "awaitingApproval",
+            archive_id: None,
+            reason: None,
+            bytes: Some(bytes),
+            object_reused: false,
+            source_version_reused: false,
+        },
+        ImportOutcome::Rejected(reason) => ImportContextFileView {
+            status: "rejected",
+            archive_id: None,
+            reason: Some(match reason {
+                RejectReason::ReparsePoint => "REPARSE_POINT",
+                RejectReason::UnsupportedFileType => "UNSUPPORTED_FILE_TYPE",
+                RejectReason::HardLimitExceeded => "HARD_LIMIT_EXCEEDED",
+            }),
+            bytes: None,
+            object_reused: false,
+            source_version_reused: false,
+        },
+        ImportOutcome::Archived(receipt) => {
+            let (status, reason) = match receipt.status {
+                ArchiveStatus::Archived => ("archived", None),
+                ArchiveStatus::ArchivedUnparsed(UnparsedReason::UnsupportedFormat) => {
+                    ("archivedUnparsed", Some("UNSUPPORTED_FORMAT"))
+                }
+            };
+            ImportContextFileView {
+                status,
+                archive_id: Some(receipt.archive_id),
+                reason,
+                bytes: None,
+                object_reused: receipt.object_reused,
+                source_version_reused: receipt.source_version_reused,
+            }
+        }
+    }
+}
+
 impl From<&ConversationEvidence> for ConversationTurnView {
     fn from(value: &ConversationEvidence) -> Self {
         Self {
@@ -427,12 +535,16 @@ const fn encode_host_state(state: HostState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard};
+    use std::{
+        fs,
+        sync::{Mutex, MutexGuard},
+    };
 
     use eam_core::{
         InMemoryRepository, IncrementingClock, PersonTurnClassification, RuntimeResponse,
         ScriptedRuntime,
     };
+    use eam_ingestion::{ArchiveInput, ArchiveReceipt};
     use eam_vault::VaultKey;
     use tempfile::tempdir;
 
@@ -548,5 +660,77 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["第一问", "第一答"]
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingArchiveRepository {
+        statuses: Vec<ArchiveStatus>,
+    }
+
+    impl ArchiveRepository for RecordingArchiveRepository {
+        type Error = std::io::Error;
+
+        fn archive(&mut self, input: ArchiveInput<'_>) -> Result<ArchiveReceipt, Self::Error> {
+            self.statuses.push(input.status);
+            Ok(ArchiveReceipt {
+                archive_id: u64::try_from(self.statuses.len()).unwrap(),
+                status: input.status,
+                object_reused: false,
+                source_version_reused: false,
+            })
+        }
+    }
+
+    fn zero_window_policy(auto_limit: u64, hard_limit: u64) -> ImportPolicy {
+        ImportPolicy {
+            stability_window: Duration::ZERO,
+            auto_import_limit_bytes: auto_limit,
+            hard_import_limit_bytes: hard_limit,
+        }
+    }
+
+    #[test]
+    fn bounded_import_view_distinguishes_archived_and_unsupported_files() {
+        let directory = tempdir().unwrap();
+        let markdown = directory.path().join("context.md");
+        let binary = directory.path().join("context.bin");
+        fs::write(&markdown, b"# context").unwrap();
+        fs::write(&binary, b"opaque").unwrap();
+        let mut repository = RecordingArchiveRepository::default();
+        let policy = zero_window_policy(1024, 2048);
+
+        let archived =
+            import_context_file_with_policy(&mut repository, &markdown, &policy, false, 1).unwrap();
+        let unsupported =
+            import_context_file_with_policy(&mut repository, &binary, &policy, false, 2).unwrap();
+
+        assert_eq!(archived.status, "archived");
+        assert_eq!(archived.archive_id, Some(1));
+        assert_eq!(archived.reason, None);
+        assert_eq!(unsupported.status, "archivedUnparsed");
+        assert_eq!(unsupported.archive_id, Some(2));
+        assert_eq!(unsupported.reason, Some("UNSUPPORTED_FORMAT"));
+    }
+
+    #[test]
+    fn bounded_import_view_exposes_wait_and_rejection_without_archiving() {
+        let directory = tempdir().unwrap();
+        let oversized = directory.path().join("large.md");
+        fs::write(&oversized, vec![0_u8; 5]).unwrap();
+        let mut repository = RecordingArchiveRepository::default();
+        let policy = zero_window_policy(4, 8);
+
+        let waiting =
+            import_context_file_with_policy(&mut repository, &oversized, &policy, false, 3)
+                .unwrap();
+        let rejected =
+            import_context_file_with_policy(&mut repository, directory.path(), &policy, false, 4)
+                .unwrap();
+
+        assert_eq!(waiting.status, "awaitingApproval");
+        assert_eq!(waiting.bytes, Some(5));
+        assert_eq!(rejected.status, "rejected");
+        assert_eq!(rejected.reason, Some("UNSUPPORTED_FILE_TYPE"));
+        assert!(repository.statuses.is_empty());
     }
 }

@@ -208,6 +208,7 @@ accept_markdown(evidence_id, source_utf8, limits)
 | React + TypeScript | 视图状态、交互、可访问性、类型化命令客户端 | 密钥、持久化、文件解析、模型直连 |
 | Tauri 2 | Windows 单实例宿主、托盘、窗口与 WebView 生命周期、受限命令入口、打包入口 | 领域逻辑、保险库模式 |
 | Rust Core | 内嵌后台任务、Markdown 解析、领域模型、保险库单写、索引、策略、采集、运行时网关 | 直接渲染 UI、依赖 React 生命周期、作为 Windows Service 运行 |
+| Rust 摄取协调器 | 普通文件稳定性、资源上限、重解析点/非普通文件拒绝与先归档状态转换 | 解析内容、持有密钥、直接写数据库或跟随文件链接 |
 | Rust Obsidian 资料源适配器 | 只读扫描与观察、来源路径映射、变更协调 | 修改笔记、执行插件、把源目录当作权威存储 |
 | TypeScript 浏览器扩展 | 浏览证据采集与本地提交 | 查询个人上下文、调用模型 |
 | Core Markdown 解析模块 | 从单个 UTF-8 原文提取结构、原文范围和受限元数据 | 格式转换、文件访问、联网、调用模型或工具、执行文档内容 |
@@ -238,11 +239,13 @@ RecoveryWrapKey = HKDF-SHA256(RecoveryKey, random 256-bit salt, info="evrything-
 RecoveryUnlock = XChaCha20-Poly1305(RecoveryWrapKey, random 192-bit nonce, VaultKey, versioned AAD)
 ```
 
-S02 已按 [ADR-0046](adr/0046-vault-cryptographic-profile.md) 锁定派生函数和对象认证加密算法；对象库落盘仍留给后续切片。S03 按 [ADR-0047](adr/0047-versioned-independent-vault-unlock.md) 将两个互不依赖的封装原子写入一个版本化 `bundle.meta`：日常路径只解 DPAPI 字段，恢复路径只解恢复字段。恢复载体和元数据均不含个人信息，错误载体、错误密钥和认证篡改对外统一为 `UnlockFailed`；密钥轮换留到 S30。
+S02 已按 [ADR-0046](adr/0046-vault-cryptographic-profile.md) 锁定派生函数和对象认证加密算法；S08 将对象库落实为 HMAC-SHA256 带密钥内容标识、随机 nonce 的 XChaCha20-Poly1305 密文和原子发布文件。S03 按 [ADR-0047](adr/0047-versioned-independent-vault-unlock.md) 将两个互不依赖的封装原子写入一个版本化 `bundle.meta`：日常路径只解 DPAPI 字段，恢复路径只解恢复字段。恢复载体和元数据均不含个人信息，错误载体、错误密钥和认证篡改对外统一为 `UnlockFailed`；密钥轮换留到 S30。
 
 S04 将 `self.db` schema 升至 v2：`initial_self_introduction` 把六类自述绑定到既有本人证据与事实账本，`identity_state_versions` 和 `identity_state_evidence` 追加不可改写身份版本及其来源。六类自述在一个事务内入账；身份版本只在独立的结构化运行时提议通过作者、反思使命、身份隔离、字段完整性和来源范围校验后追加。
 
 S05 将 `self.db` schema 升至 v3：`self_bundle_versions` 追加完整不可改写快照，三个有序子表分别保存第二自我经历引用、信念引用和未完成意图。父版本、全部子项与唤醒提交元数据位于同一事务；任一引用或子项写入失败都会回滚整个新版本，重启只加载最后一个完整版本。
+
+S07 将 `self.db` schema 升至 v4，保存宿主会话、心跳和运行空缺。S08 升至 v5：`archived_evidence` 只保存加密边界内的来源定位器、对象映射、长度、归档状态和原因；相同内容可被不同来源记录复用，同一来源同一对象幂等。
 
 ### 4.2 逻辑数据模型
 
@@ -470,7 +473,7 @@ Obsidian 文件事件 | 启动和定期校准扫描
   -> 等待大小和修改时间稳定
   -> 验证普通本地文件；重解析点、符号链接或设备文件：REJECTED
   -> 超出自动导入上限：AWAITING_APPROVAL
-  -> 流式计算带密钥的内容标识并生成暂存密文对象
+  -> 在硬上限内读取原件，计算带密钥的内容标识并生成暂存密文对象
   -> 已存在内容对象：复用；同一来源版本已记录：STOP
   -> 原子发布密文对象
   -> 在 SQL 事务中写入 Evidence(status=ARCHIVED)
@@ -1024,7 +1027,7 @@ VaultRepository::close
   -> checkpoint encrypted WAL -> close SQLCipher -> zeroize owned VaultKey -> unlock writer
 ```
 
-`cipher_memory_security` 未启用：G01 的 Windows spike 证明 `VirtualLock` 配额失败会导致崩溃；关闭契约改为先释放 SQLCipher 的连接内密钥，再显式清零 Rust 持有的 Vault Key。对象库尚未实现，但 HKDF 与 XChaCha20-Poly1305 固定向量已锁定未来兼容性。该实现落实 [ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md) 和 [ADR-0046](adr/0046-vault-cryptographic-profile.md)。
+`cipher_memory_security` 未启用：G01 的 Windows spike 证明 `VirtualLock` 配额失败会导致崩溃；关闭契约改为先释放 SQLCipher 的连接内密钥，再显式清零 Rust 持有的 Vault Key。S02 先用 HKDF 与 XChaCha20-Poly1305 固定向量锁定兼容性，S08 再落地对象文件与归档引用。该实现落实 [ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md) 和 [ADR-0046](adr/0046-vault-cryptographic-profile.md)。
 
 ### 9.3 S03 当前实现边界
 
@@ -1161,3 +1164,36 @@ explicit exit -> finish_host_session -> close Vault -> zeroize key -> release lo
 ```
 
 主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater 和持续对话只能经宿主白名单 command 使用。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。当前界面不实现采集、时间线或 Personal Library；该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) 和 [ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)。
+
+### 9.8 S08 Context Inbox 先归档当前实现边界
+
+```text
+crates/ingestion/src/
+  domain.rs             # 稳定观察、超限批准、拒绝原因与 ARCHIVED 状态契约
+  service.rs            # 无跟随打开、有界读取、读取后复核与 ArchiveRepository 调用
+crates/vault/src/
+  object_store.rs       # HMAC 内容标识、XChaCha20-Poly1305 对象、原子发布与孤儿清理
+  schema.rs             # schema v5 archived_evidence 状态与对象引用
+  repository.rs         # 对象先写、SQLCipher 后引用、幂等与可信解密
+apps/desktop/src-tauri/src/
+  lib.rs                # import_context_file 白名单 command
+  state.rs              # 有限归档结果投影，不暴露对象标识或原文
+```
+
+```text
+import_context_file(path, approve_oversized)
+  -> observe metadata twice across stability window
+  -> reject reparse point / symlink / non-file; gate oversized input
+  -> open without following and recheck after bounded read
+  -> ObjectStore::store: keyed id -> authenticated ciphertext -> atomic publish
+  -> Vault transaction: archived_evidence(status, reason, object_id)
+  -> non-.md: ARCHIVED_UNPARSED(UNSUPPORTED_FORMAT)
+  -> .md: ARCHIVED; S09 才能识别、解析和推进可用状态
+
+VaultRepository::open
+  -> migrate schema v5
+  -> load referenced object ids
+  -> remove pending and unreferenced opaque objects
+```
+
+删除或移动投递原件不会删除已归档证据；同一来源同一内容幂等，不同来源相同内容复用一个密文对象并各自保留溯源记录。主窗口 capability 仍只有 `core:default`，WebView 只能调用领域 command，不能取得通用文件 API、repository、对象 ID、密钥或解密内容。当前 S08 不监视固定目录、不提供 Personal Library UI，也不理解 Markdown；这些分别留给后续宿主/资料源界面与 S09。该实现落实 [ADR-0007](adr/0007-context-inbox-import-semantics.md)、[ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0013](adr/0013-archive-before-understanding.md)、[ADR-0022](adr/0022-v1-markdown-only.md) 和 [ADR-0046](adr/0046-vault-cryptographic-profile.md)。

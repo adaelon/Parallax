@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "S07 main window: core IPC only; no plugin, file, shell, HTTP, process, or credential permissions.",
+  "description": "S08 main window: domain commands only; no plugin, generic file, shell, HTTP, process, or credential permissions.",
   "windows": ["main"],
   "permissions": ["core:default"]
 }

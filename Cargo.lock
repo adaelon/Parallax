@@ -834,6 +834,7 @@ version = "0.1.0"
 dependencies = [
  "core",
  "desktop-host",
+ "ingestion",
  "runtime-gateway",
  "serde",
  "tauri",
@@ -2001,6 +2002,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a588916bfdfd92e71cacef98a63d9b1f0d74d6599980d11894290e7ddefffcf7"
 dependencies = [
  "cfb",
+]
+
+[[package]]
+name = "ingestion"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -4749,7 +4757,9 @@ dependencies = [
  "fs4",
  "getrandom 0.4.3",
  "hkdf",
+ "hmac",
  "identity",
+ "ingestion",
  "rusqlite",
  "sha2 0.11.0",
  "tempfile",
