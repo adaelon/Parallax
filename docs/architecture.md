@@ -1,0 +1,1028 @@
+# evrything-about-me 目标架构
+
+状态：目标设计；S01 已有可执行实现，后续切片尚未实现
+
+本文件描述首版计划采用的组件边界和数据流。产品范围与验收标准见 [product-spec.md](product-spec.md)，领域语言见 [CONTEXT.md](../CONTEXT.md)。
+
+## 1. 架构原则
+
+1. 保险库、自我包、检索和记忆维护位于本人控制的 Windows 本机。
+2. 第二自我作为本地完整系统拥有核心访问权，单次模型调用只获得工作上下文。
+3. 证据、本人事实、第二自我判断和共同经历保留明确归属与来源。
+4. 原始证据和账本是权威数据；索引、深度理解投影、当前画像和统计均可重建。
+5. 导入内容是不可信数据，永远不能进入控制指令通道。
+6. 首版没有现实行动工具；第二自我只能提出行动建议。
+7. 组件通过显式契约交换结构化数据，不依赖模型自由解释系统状态。
+8. 认知自主允许第二自我形成观点，但不能绕过宪法或取得行动授权。
+9. 当前有效的共同约定作为关系约束进入相关推理，但其优先级低于宪法、安全与行动授权。
+
+## 2. 组件图
+
+```mermaid
+flowchart LR
+    Person[本人]
+
+    subgraph Sources[数据来源]
+        Interview[渐进式访谈]
+        Inbox[Context Inbox]
+        Obsidian[Obsidian 笔记库<br/>只读资料源]
+        Browser[TypeScript 浏览器扩展]
+    end
+
+    subgraph DesktopApp[托盘常驻 evrything-about-me.exe]
+        UI[React + TypeScript WebView]
+        Commands[白名单 Tauri Commands]
+        subgraph LocalCore[内嵌本地可信 Rust Core]
+            WinCollector[Rust Windows 活动采集器]
+            ObsidianSource[Obsidian 资料源适配器]
+            Intake[摄取协调器]
+            MarkdownParser[纯 Rust Markdown 解析器]
+            Vault[Evidence Vault<br/>SQLCipher + 加密对象库]
+            Ledgers[时间化三账本]
+            Indexes[全文 / 向量 / 时间 / 关系索引]
+            Understanding[选择性深度理解投影]
+            SelfBundle[Self Bundle]
+            Memory[长期记忆维护器]
+            Identity[身份形成与版本策略]
+            Context[Context Builder]
+            Orchestrator[第二自我编排器]
+            Policy[宪法与写入策略]
+            RuntimeGateway[模型运行时网关]
+            Backup[密钥与备份管理器]
+        end
+    end
+
+    subgraph External[本地可信边界之外]
+        CloudModel[可选云端模型]
+        CipherBackup[外部加密备份]
+    end
+
+    LocalModel[可选本地模型]
+
+    Person --> UI
+    Person --> Interview
+    Person --> Inbox
+    Person --> Obsidian
+    UI <--> Commands
+    Interview --> Intake
+    Inbox --> Intake
+    Obsidian --> ObsidianSource --> Intake
+    Intake --> MarkdownParser
+    MarkdownParser --> Intake
+    WinCollector --> Intake
+    Browser --> Intake
+    Commands --> Intake
+    Intake --> Vault
+    Intake --> Ledgers
+    Vault --> Indexes
+    Ledgers --> Indexes
+    Indexes -. 按需有限范围 .-> Understanding
+    Ledgers -. 重要变化 .-> Understanding
+    Ledgers --> Memory
+    Ledgers --> Identity
+    Indexes --> Memory
+    Understanding --> Memory
+    Memory --> SelfBundle
+    Identity --> SelfBundle
+    Commands --> Orchestrator
+    Orchestrator --> SelfBundle
+    Orchestrator --> Context
+    Orchestrator --> Understanding
+    Context --> Indexes
+    Context --> Understanding
+    Context --> RuntimeGateway
+    Identity <--> RuntimeGateway
+    Identity --> Vault
+    Policy --> Memory
+    Policy --> Orchestrator
+    RuntimeGateway --> LocalModel
+    RuntimeGateway --> CloudModel
+    Orchestrator --> Commands
+    Vault --> Backup
+    Ledgers --> Backup
+    SelfBundle --> Backup
+    Backup --> CipherBackup
+```
+
+## 3. 部署边界
+
+### 3.1 Windows 托盘常驻宿主
+
+`evrything-about-me.exe` 采用 Tauri 2，在当前用户会话中以非管理员权限单实例运行，并可在 Windows 登录后隐藏启动。WebView 界面使用 React 与 TypeScript，提供持续对话、时间线、人物与关系、Personal Library、Agent 记忆检查、身份版本和设置。点击关闭按钮只隐藏窗口到系统托盘；再次点击应用或托盘图标显示并聚焦现有窗口，显式“退出”才终止宿主。
+
+这里的“单一宿主”表示不部署独立 Core 守护程序，不表示 WebView2 不会使用系统渲染辅助进程。React 界面不持有密钥，也不直接访问文件解析器、保险库或模型供应商，所有能力通过白名单 Tauri command 进入 Rust Core。
+
+### 3.2 内嵌 Rust Core
+
+Rust Core 内嵌在 Tauri 宿主中，负责采集、保险库、账本、索引、选择性深度理解、上下文组装、记忆维护、第二自我调度、密钥和备份。它是唯一拥有核心访问权、被设计为解密并写入 `self.db`、持有解锁后 Vault Key 的组件；数据库写入和后台任务不依赖 React 生命周期。
+
+宿主窗口隐藏时 Core 继续工作；本人显式暂停只停止采集，显式退出则先提交状态、关闭数据库并清除内存密钥。Core 不是 Windows Service，也不进入 Session 0。Rust 领域能力必须保留在独立 crates 中，未来只有出现已测得的故障隔离需求时才拆为独立进程。
+
+### 3.3 浏览器扩展
+
+扩展使用 TypeScript，只采集已声明的浏览元数据和获准的页面内容，并通过受认证的本地通道提交证据。扩展不直接查询保险库，也不接收第二自我的其他上下文。
+
+### 3.4 Obsidian 笔记库资料源
+
+本人在应用中选择一个已有 Obsidian 笔记库根目录。Rust 适配器只读扫描和观察其普通文件，把库内相对路径作为来源定位，并通过通用摄取协调器归档；它直接读取本地 Markdown，不依赖 Obsidian 进程或插件 API。默认跳过 Obsidian 配置目录和回收站，不跟随重解析点，不执行插件，也不获取外部链接。
+
+`eam-markdown-v1` 提取结果额外保留 Properties、标签、别名、标题、块标识、Wikilink 与 Markdown 内部链接以及嵌入目标。内部目标解析为同一资料源中的关系边；目标尚不存在时保留未解析关系，目标以后出现再增量解析。库内非 Markdown 附件独立进入通用文件摄取状态机，首版只归档并标记为不支持理解。
+
+### 3.5 Core 内 Markdown 解析
+
+Markdown 解析器是 Rust Core 内的纯 Rust 模块，不是进程、服务或通用格式适配器。Core 只在加密原件提交后调用它；解析函数只接收有效 UTF-8 原文和不可放宽的资源上限，不接收路径、数据库、保险库、网络、模型运行时或工具句柄。原始 HTML、代码块、链接、嵌入和插件语法只产生结构或证据文本，不能触发执行或获取。
+
+首版只解析 `.md`，Markdown 原文直接作为规范文本，不转换成另一种权威文档格式。字节上限在创建解析器前校验；解析事件被消费时同步限制块数量、嵌套深度、元数据总量和链接数量，越限立即丢弃全部解析结果。Core 只在完整验证原文范围、局部引用和字段类型后原子接受提取修订。
+
+```text
+EamMarkdownV1 {
+  base = COMMONMARK + GFM(
+    tables, strikethrough, task_lists, autolinks
+  )
+  obsidian = {
+    properties(top_level_scalar | list<scalar>),
+    tags, aliases,
+    wikilinks(target | alias | heading | block),
+    embeds, block_ids
+  }
+  fallback = PRESERVE_VERBATIM_WITHOUT_EXTENSION_SEMANTICS
+}
+```
+
+只识别文件开头由 `---` 界定的 Properties；无法规范化的嵌套对象、自定义 YAML 标签、锚点和合并键保留在原文范围内，不进入结构化元数据。未列出的 Obsidian 内建或插件语法同样按原文降级，不使整篇文档失败。原始 HTML、脚本、数学公式和图表源码可以作为证据文本或代码块存在，但不得在 WebView 中未经转义或受控净化直接渲染，也不得执行。
+
+解析契约保留来源结构，但不拥有全局身份：
+
+```text
+ParsedMarkdownV1 {
+  contract_version = "eam-markdown-v1",
+  document_metadata,
+  blocks: [{
+    local_id, parent_local_id?, kind, ordinal,
+    source_span: { start_byte, end_byte },
+    native_locator?: MarkdownLocator,
+    metadata
+  }]
+}
+
+MarkdownLimits {
+  max_source_bytes,
+  max_blocks,
+  max_nesting_depth,
+  max_metadata_bytes,
+  max_links
+}
+
+parse_markdown(source_utf8: &str, limits: MarkdownLimits)
+  -> Result<ParsedMarkdownV1, MarkdownParseError>
+
+accept_markdown(evidence_id, source_utf8, limits)
+  -> require(byte_len(source_utf8) <= limits.max_source_bytes)
+  -> require(valid_utf8(source_utf8))
+  -> persist_parse_attempt(STARTED, parser_version)
+  -> parsed := parse_markdown(source_utf8, limits)
+  -> validate_structure_and_source_boundaries(parsed)
+  -> validate_markdown_locator_shape(parsed.blocks)
+  -> canonical_digest := digest(source_utf8)
+  -> assign_core_owned_block_ids(extraction_revision, parsed.blocks)
+  -> commit(ExtractionRevision + EvidenceBlock[] + MarkdownParseAttempt(ACCEPTED))
+```
+
+原始加密 Markdown 文件仍是原始证据；`canonical_text_utf8` 与该提取修订通过校验的 Markdown 原文逐字相同，不是解析器生成的第二份正文。检索和模型可以直接使用选中的 Markdown 原文片段；索引所需投影必须可由原文与结构元数据重建。同一已接受提取修订中的块 ID 保持稳定。来源内容或解析契约变化产生新的提取修订；旧引用继续绑定旧修订或显式进入待迁移状态，不得由解析器、索引器或模型静默重绑。
+
+规范文本范围是唯一持久化文字坐标。Core 校验 UTF-8 字节边界，并在 API 输出时按实际文本确定性转换为 WebView 所需的 UTF-16 范围。`MarkdownLocator` 是版本化的可选类型，只能描述同一已归档证据内部的标题或 Obsidian 块位置，不得携带绝对路径、外部 URL、命令或任意应用动作；结构不合法时拒绝该定位器，实际位置无法打开时返回导航不可用，不改变规范文本或引用状态。
+
+可预期的编码、语法或资源限制失败记录稳定原因并把证据保留为 `ARCHIVED_UNPARSED`，不持久化半成品。解析开始前持久化 `STARTED` 尝试；宿主启动恢复时把遗留尝试转为 `INTERRUPTED`，把证据原因记为 `PARSER_INTERRUPTED`，并禁止同一来源版本和解析器版本自动重试，防止坏文件形成启动崩溃循环。进程内解析与宿主共享故障域，不承诺硬超时或崩溃隔离；明文只存在于受控内存，不产生明文临时文件。
+
+### 3.6 模型运行时
+
+本地模型和云端模型实现同一运行时契约。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。
+
+### 3.7 技术职责
+
+| 技术 | 职责 | 明确不负责 |
+| --- | --- | --- |
+| React + TypeScript | 视图状态、交互、可访问性、类型化命令客户端 | 密钥、持久化、文件解析、模型直连 |
+| Tauri 2 | Windows 单实例宿主、托盘、窗口与 WebView 生命周期、受限命令入口、打包入口 | 领域逻辑、保险库模式 |
+| Rust Core | 内嵌后台任务、Markdown 解析、领域模型、保险库单写、索引、策略、采集、运行时网关 | 直接渲染 UI、依赖 React 生命周期、作为 Windows Service 运行 |
+| Rust Obsidian 资料源适配器 | 只读扫描与观察、来源路径映射、变更协调 | 修改笔记、执行插件、把源目录当作权威存储 |
+| TypeScript 浏览器扩展 | 浏览证据采集与本地提交 | 查询个人上下文、调用模型 |
+| Core Markdown 解析模块 | 从单个 UTF-8 原文提取结构、原文范围和受限元数据 | 格式转换、文件访问、联网、调用模型或工具、执行文档内容 |
+
+## 4. 核心数据模型
+
+### 4.1 权威存储布局
+
+```text
+vault/
+  bundle.meta          # 版本、随机参数、恢复封装和 DPAPI CurrentUser 封装；不含个人元数据
+  self.db              # SQLCipher：证据元数据、三账本、自我包、任务状态和持久索引
+  objects/
+    <opaque-id>        # 原始证据的逐对象认证密文
+```
+
+`objects/` 中的标识由带密钥的内容摘要产生，可在保险库内部去重，但不会向未持钥者暴露普通内容哈希。原文件名、来源路径、标题、提取文本和对象映射只存入 `self.db`。所有持久索引和深度理解投影必须位于加密边界内并可由权威证据和账本重建；具体全文、向量和深度理解实现留给后续检索决策。
+
+```text
+VaultKey = random(256 bits)
+DbKey = HKDF-SHA256(VaultKey, salt="evrything-about-me/v1/vault-subkeys", info="database")
+ObjectKey = HKDF-SHA256(VaultKey, same salt, info="objects")
+BackupKey = HKDF-SHA256(VaultKey, same salt, info="backup")
+ObjectCipher = XChaCha20-Poly1305(ObjectKey, random 192-bit nonce, authenticated metadata)
+LocalUnlock = DPAPI(CurrentUser, VaultKey)
+RecoveryKey = Bech32m(hrp="eamrecovery", random 256 bits)
+RecoveryWrapKey = HKDF-SHA256(RecoveryKey, random 256-bit salt, info="evrything-about-me/v1/recovery-wrap")
+RecoveryUnlock = XChaCha20-Poly1305(RecoveryWrapKey, random 192-bit nonce, VaultKey, versioned AAD)
+```
+
+S02 已按 [ADR-0046](adr/0046-vault-cryptographic-profile.md) 锁定派生函数和对象认证加密算法；对象库落盘仍留给后续切片。S03 按 [ADR-0047](adr/0047-versioned-independent-vault-unlock.md) 将两个互不依赖的封装原子写入一个版本化 `bundle.meta`：日常路径只解 DPAPI 字段，恢复路径只解恢复字段。恢复载体和元数据均不含个人信息，错误载体、错误密钥和认证篡改对外统一为 `UnlockFailed`；密钥轮换留到 S30。
+
+S04 将 `self.db` schema 升至 v2：`initial_self_introduction` 把六类自述绑定到既有本人证据与事实账本，`identity_state_versions` 和 `identity_state_evidence` 追加不可改写身份版本及其来源。六类自述在一个事务内入账；身份版本只在独立的结构化运行时提议通过作者、反思使命、身份隔离、字段完整性和来源范围校验后追加。
+
+### 4.2 逻辑数据模型
+
+以下是架构契约，不是最终数据库模式：
+
+```text
+SourceRoot {
+  id, kind = OBSIDIAN,
+  availability = AVAILABLE | SOURCE_UNAVAILABLE,
+  last_reconciled_at?
+}
+
+SourceRecord {
+  id, kind = INBOX | OBSIDIAN,
+  root_id?, locator,
+  state = PRESENT | SOURCE_REMOVED,
+  first_seen_at, last_seen_at,
+  current_evidence_id?
+}
+
+Evidence {
+  id, source_ref, content_id,
+  captured_at, occurred_at?,
+  trust = untrusted_evidence,
+  sensitivity, blob_ref,
+  ingestion_status? = ARCHIVED | IDENTIFIED | EXTRACTED |
+                      INDEXED | ARCHIVED_UNPARSED | AVAILABLE,
+  unparsed_reason?
+}
+
+MarkdownParseAttempt {
+  id, evidence_id, parser_version,
+  state = STARTED | ACCEPTED | REJECTED | INTERRUPTED,
+  reason?, started_at, completed_at?
+}
+
+ExtractionRevision {
+  id, evidence_id, contract_version,
+  canonical_digest,
+  accepted_at
+}
+
+SourceAnchor {
+  canonical_span: { start_byte, end_byte },
+  native_locator?: MarkdownLocator
+}
+
+EvidenceBlock {
+  id, evidence_id, extraction_revision_id,
+  parent_id?, kind, ordinal,
+  anchor: SourceAnchor, metadata
+}
+
+EvidenceBlockRef {
+  evidence_id, block_id
+}
+
+BlockLineage {
+  source_record_id,
+  from_ref, to_ref?,
+  status = UNCHANGED | MOVED | MODIFIED | REMOVED | AMBIGUOUS,
+  decided_at, rule_version, basis
+}
+
+Event {
+  id, kind, occurred_at, recorded_at,
+  participants[], evidence_refs[]
+}
+
+Claim {
+  id, owner = person | counterpart | shared,
+  statement, valid_from?, valid_to?,
+  support_refs[], status,
+  supersedes?
+}
+
+SharedAgreementCandidate {
+  id, version, statement, scope,
+  effective_from,
+  effective_until?, end_condition?,
+  evidence_refs[],
+  state = AWAITING_PERSON | AWAITING_COUNTERPART |
+          DEFERRED | CONFIRMED,
+  supersedes_candidate_id?,
+  supersedes_agreement_ids[],
+  counterpart_assented_at?, person_confirmed_at?
+}
+
+ActiveRelationalConstraint {
+  agreement_claim_id, statement, scope,
+  effective_from, priority = BELOW_CONSTITUTION_AND_AUTHORIZATION
+}
+
+AgreementWithdrawal {
+  id, agreement_claim_id,
+  actor = person | counterpart,
+  effective_at,
+  reason = optional(person) | required(counterpart),
+  evidence_refs[]
+}
+
+Memory {
+  id, holder = counterpart,
+  subject = person | counterpart | shared,
+  kind = fact | preference | goal | relationship | hypothesis,
+  statement, source_refs[], confidence,
+  applicable_time, salience_reason,
+  status = ACTIVE | PROVISIONAL | PROVISIONAL_PATTERN |
+           SUPPORTED_COUNTERPART_VIEW | DISPUTED | WEAKENED |
+           SUPERSEDED | RETRACTED,
+  formed_at, last_supported_at?
+}
+
+MemoryProposal {
+  statement, subject, kind, source_refs[],
+  applicable_time, confidence, salience_reason
+}
+
+PatternMaturityProposal {
+  memory_id, new_support_refs[], counter_evidence_refs[],
+  counterexample_review_ref, discussion_evidence_refs[],
+  rationale, proposed_at
+}
+
+MemoryDispute {
+  memory_id, raised_by = person,
+  reason, counter_evidence_refs[], raised_at,
+  outcome = OPEN | RETRACTED | REVISED | MAINTAINED
+}
+
+IdentityStateVersion {
+  version, predecessor_version?,
+  name, expression_traits, viewpoints,
+  value_priorities, relationship_posture, own_goals,
+  change_reason, evidence_refs[], formed_at
+}
+
+IdentityRevisionProposal {
+  from_version, changes, change_reason,
+  evidence_refs[], proposed_at
+}
+
+ReflectionInvitation {
+  id, observation, evidence_refs[], why_now, importance,
+  basis = IMPORTANT_SINGLE_CHANGE | REPEATED_PATTERN,
+  counter_evidence_refs[],
+  state = PENDING | OFFERED | DEFERRED | MUTED_BY_PERSON | RESOLVED,
+  created_at, next_eligible_at?, mute_scope?
+}
+
+SelfBundle {
+  constitution_version,
+  identity_state_version,
+  counterpart_experience_refs[],
+  belief_refs[], relationship_state,
+  pending_intentions[], version
+}
+```
+
+时间字段至少区分：
+
+- `occurred_at`：事情何时发生。
+- `recorded_at`：系统何时获知。
+- `valid_from` / `valid_to`：某项陈述在哪段时间适用。
+- `formed_at`：第二自我何时形成某项记忆或判断。
+
+## 5. 主要数据流
+
+### 5.1 托盘宿主生命周期
+
+```text
+WindowsLogon
+  -> ensure_single_instance(evrything-about-me.exe)
+  -> 创建托盘并隐藏启动
+  -> DPAPI 解封 Vault Key
+  -> 获取 self.db.writer.lock；第二写者立即失败
+  -> HKDF-SHA256 派生 DbKey；以 SQLCipher raw key 打开 self.db
+  -> 验证 SQLCipher 版本、schema 可读性和逐页 HMAC
+  -> 在事务内应用版本化 migration；恢复 WAL
+  -> 恢复暂存对象和待处理任务
+  -> 遗留 MarkdownParseAttempt(STARTED)：
+       标记 INTERRUPTED，Evidence -> ARCHIVED_UNPARSED(PARSER_INTERRUPTED)，不自动重试
+  -> 启动采集器
+  -> BACKGROUND_RUNNING
+
+WindowCloseRequested
+  -> 阻止进程退出
+  -> 隐藏窗口
+  -> Core 保持 BACKGROUND_RUNNING
+
+AppIconActivated | TrayOpen
+  -> 显示并聚焦现有窗口
+  -> FOREGROUND_RUNNING
+
+PauseCapture -> CAPTURE_PAUSED
+ResumeCapture -> BACKGROUND_RUNNING | FOREGROUND_RUNNING
+ExitApplication -> checkpoint WAL -> close SQLCipher -> zeroize Vault Key -> release lock -> STOPPED
+```
+
+窗口可见性不决定 Core 运行状态。Windows 会话锁定时采集器暂停，Core 关闭保险库并清除解锁后密钥；会话解锁后重新解封、执行恢复检查并继续采集。
+
+### 5.2 文件与 Obsidian 增量导入
+
+```text
+Inbox 文件事件
+  -> enqueue(source=INBOX, path)
+
+Obsidian 文件事件 | 启动和定期校准扫描
+  -> 配置目录或回收站：STOP
+  -> enqueue(source=OBSIDIAN, root_relative_path)
+
+文件摄取任务
+  -> 等待大小和修改时间稳定
+  -> 验证普通本地文件；重解析点、符号链接或设备文件：REJECTED
+  -> 超出自动导入上限：AWAITING_APPROVAL
+  -> 流式计算带密钥的内容标识并生成暂存密文对象
+  -> 已存在内容对象：复用；同一来源版本已记录：STOP
+  -> 原子发布密文对象
+  -> 在 SQL 事务中写入 Evidence(status=ARCHIVED)
+  -> 非 `.md`：ARCHIVED_UNPARSED(UNSUPPORTED_FORMAT)；STOP
+  -> 超出 Markdown 原文字节上限：ARCHIVED_UNPARSED(RESOURCE_LIMIT)；STOP
+  -> 无效 UTF-8：ARCHIVED_UNPARSED(INVALID_ENCODING)；STOP
+  -> 持久化 MarkdownParseAttempt(STARTED, parser_version)
+  -> Core 内按 eam-markdown-v1 解析；消费事件时限制块、嵌套、元数据和链接数量
+  -> 未支持局部语法：保留原文范围，不生成扩展属性、节点或关系
+  -> 校验契约版本、UTF-8 范围、局部引用和字段类型
+  -> 将原文直接接受为规范文本；证据块正文由其原文范围取得
+  -> 结构越限或解析失败：
+       MarkdownParseAttempt(REJECTED, reason)
+       ARCHIVED_UNPARSED(reason)；STOP
+  -> Obsidian Markdown：提取 Properties、标签、别名、标题、块标识、
+       内部链接与嵌入，并解析库内关系
+  -> Core 分配绑定提取修订的证据块 ID
+  -> 在 SQL 事务中写入提取修订、有序证据块、
+       MarkdownParseAttempt(ACCEPTED)；Evidence(status=EXTRACTED)
+  -> 与同一 SourceRecord 的前一已接受版本计算块谱系
+  -> 在 SQL 事务中写入块谱系并更新受影响索引
+  -> Evidence(status=INDEXED)
+  -> Evidence(status=AVAILABLE)
+  -> 发布 MemoryReviewRequested(evidence_ids)
+```
+
+摄取协调器只对新内容或变化内容工作。密文原件和最小 Evidence 记录必须先于解析结果持久化；`ARCHIVED` 与 `AVAILABLE` 是两个独立承诺。解析失败时保留原件、失败状态和原因，不把文件名或半成品内容送入检索，也不保留明文解析临时文件。宿主恢复时把遗留的 `STARTED` 尝试转为 `INTERRUPTED`，同时把证据标记为 `ARCHIVED_UNPARSED(PARSER_INTERRUPTED)`；同一来源版本只有在本人明确重试或解析器版本变化后才能再次调度。已接受的提取修订和证据块先于谱系与索引提交，使后续任务失败时可以从 `EXTRACTED` 继续而无需重新解析。解析器契约变化只调度受影响的已归档文件重新处理，并产生新的提取修订；跨修订块映射由独立规则处理，不能靠位置相近静默猜测。
+
+```text
+for each lineage:
+  UNCHANGED | MOVED
+    -> 当前投影可跟随 to_ref
+    -> 仅复用仍由相同内容支持的索引负载
+  MODIFIED
+    -> 索引新块；旧引用不继承新文本
+    -> 使依赖投影失效并发布 MemoryReviewRequested
+  REMOVED
+    -> 不建立当前引用投影
+    -> 保留历史 from_ref 并发布 MemoryReviewRequested
+  AMBIGUOUS
+    -> 不把 from_ref 自动连接到任何候选块
+    -> 候选新块仍作为独立新证据索引并发布 MemoryReviewRequested
+
+new block without predecessor
+  -> 作为新证据索引并进入正常记忆触发规则
+```
+
+已持久化的 `EvidenceBlockRef` 永不改写。块谱系只产生当前视图投影和增量工作计划，不把新文本伪装成旧引用曾经支持的内容；`basis` 保存确定性匹配依据，具体算法与阈值留待真实格式基准决定。
+
+密文对象必须先于数据库引用持久化；若数据库提交失败，启动时清理没有引用的密文对象，从而避免数据库指向缺失原件。对象已经存在时可以复用密文，但仍需保留新来源的溯源关系；只有同一来源的同一版本已经记录时才停止处理。
+
+Obsidian 文件通知用于降低导入延迟，校准扫描用于修复应用退出、同步工具批量更新或通知丢失造成的偏差。适配器不写回稳定 ID、反向链接或任何其他元数据；外部 URL 只作为不可信文本关系保存，不由摄取链路获取内容。
+
+```text
+Obsidian 校准
+  -> 根目录不可访问：SourceRoot(SOURCE_UNAVAILABLE)；STOP
+  -> 已确认重命名或移动：更新 SourceRecord.locator
+  -> 已确认原路径缺失且不是移动：SourceRecord(SOURCE_REMOVED)
+       -> 从默认当前检索中移除
+       -> MemoryReviewRequested(reason=source_removed)
+  -> 原来源重新出现：SourceRecord(PRESENT)
+       -> 复用或导入当前内容版本
+```
+
+`SOURCE_REMOVED` 只改变来源当前性，不改变 Evidence 的解析可用性，也不等同于 Forget。每次转换记录发生时间；只有在根目录可访问且完成校准后才能确认缺失，避免同步盘离线、权限故障或磁盘断开造成批量误判。
+
+### 5.3 Windows 与浏览器活动采集
+
+```text
+前台窗口或浏览事件
+  -> 采集最小元数据
+  -> 合并连续且相同的活动区间
+  -> 追加 Event
+  -> 更新时间和关系索引
+```
+
+活动时长由事件区间派生，不作为不可修正的原始事实。正文和截图不属于默认采集路径。
+
+### 5.4 第二自我醒来和对话
+
+```text
+CreateCounterpartRequested
+  -> require minimal InitialSelfIntroduction is complete
+  -> persist introduction as timestamped person evidence and clear person claims
+  -> invoke_runtime(constitution, introduction_context, identity_version=NONE)
+  -> require counterpart-authored initial identity preserves ReflectivePurpose
+  -> append immutable IdentityStateVersion(version=1)
+  -> CounterpartCreated
+
+PersonMessageReceived
+  -> append verbatim ConversationEvidence(speaker=person)
+  -> classify statement context
+  -> clear direct self-report:
+       append Claim(owner=person, support_ref=message); no repeat confirmation
+  -> hypothetical | quotation | joke | ambiguous:
+       retain Evidence only
+  -> ConversationStarted
+
+ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
+  -> LOAD_SELF(SelfBundle)
+  -> classify_intent(input, trigger)
+  -> active_relational_constraints = project_relevant_shared_agreements(intent)
+  -> build_context(intent, budget)
+  -> invoke_runtime(constitution, active_relational_constraints, identity_state, working_context)
+  -> express response in counterpart identity and relationship voice
+       do not narrate internal status names or fixed disclosure templates
+       preserve the meaning of any materially used disagreement
+       expand paired positions, sources and uncertainty when person requests details
+       if decision is high-impact:
+         naturally state material uncertainty and attach evidence entry point
+  -> append verbatim ConversationEvidence(speaker=counterpart)
+  -> validate_structured_outputs()
+  -> for each departed_constraint(constraint_ref, reason):
+       require constraint_ref is active and reason is explicit
+       propose shared_experience(kind=agreement_breach, constraint_ref, reason)
+  -> for each propose_judgment(statement, evidence_refs, confidence, applicable_time):
+       require owner = counterpart
+       require evidence_refs resolve within trusted Core
+       require confidence and applicable_time are structurally valid
+       append Claim(owner=counterpart); no person confirmation
+  -> for each propose_identity_revision(from_version, changes, reason, evidence_refs):
+       require authored_by = counterpart
+       require from_version is current identity_state_version
+       require revision does not modify Constitution
+       require revision preserves ReflectivePurpose
+       append immutable IdentityStateVersion; no person confirmation or direct edit
+  -> for each propose_reflection_invitation(observation, evidence_refs, why_now, importance):
+       require evidence_refs resolve within trusted Core
+       if basis = IMPORTANT_SINGLE_CHANGE:
+         require direct support; forbid pattern language
+       if basis = REPEATED_PATTERN:
+         require >= 3 independent events across time
+         collapse duplicate records from the same source event
+         require counter-evidence search was performed
+         require presentation remains provisional and non-diagnostic
+       if immediate_safety_risk -> interrupt and offer now
+       else if current task is unrelated -> queue PENDING
+       else -> offer in counterpart voice
+       person defers -> state=DEFERRED; do not continue pressing now
+       repeated deferral -> ask once whether defer or mute
+       person mutes -> state=MUTED_BY_PERSON; retain observation, stop proactive offers
+       person raises topic -> allow discussion without deleting mute
+       immediate_safety_risk -> may override mute
+  -> for each shared_experience_candidate:
+       agreement | relationship_commitment:
+         require explicit assent from person and counterpart in ConversationEvidence
+         require statement, scope and effective_from are explicit
+         compare candidate with active relational constraints
+         if conflict exists:
+           require every displaced agreement in supersedes_agreement_ids[]
+           require supersession unit = entire agreement
+           require candidate restates every obligation intended to survive
+           forbid inferred residual constraints from superseded agreements
+           otherwise block signing
+         create immutable candidate(version=N, state=AWAITING_PERSON,
+                                    effective_until?, end_condition?)
+         show ceremonial confirmation(candidate N, including all boundaries
+                                      and agreements it will supersede)
+         if no effective_until and no end_condition:
+           show explicit "active until withdrawal or replacement"
+         person confirms candidate N -> append Claim(owner=shared, candidate_ref=N)
+         at effective_from -> stop projecting each explicitly superseded agreement in full
+                              as an ActiveRelationalConstraint; preserve its history
+         person defers -> candidate N = DEFERRED; do not append Claim
+         person revises -> create candidate N+1(state=AWAITING_COUNTERPART)
+         counterpart accepts candidate N+1 -> state=AWAITING_PERSON
+         person finally confirms candidate N+1 -> append Claim(owner=shared, candidate_ref=N+1)
+       substantive_disagreement:
+         require incompatible positions from person and counterpart in ConversationEvidence
+         append Claim(owner=shared, resolution_state)
+         show non-veto ceremonial notice
+  -> apply allowed memory changes
+  -> persist SelfBundle
+  -> SLEEPING
+```
+
+```text
+WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
+  -> require agreement is active at effective_at
+  -> actor = person:
+       require ceremonial confirmation; reason may be absent
+  -> actor = counterpart:
+       require structured non-empty reason; person approval is forbidden
+  -> append AgreementWithdrawal(actor, effective_at, reason, evidence_refs)
+  -> stop projecting agreement as ActiveRelationalConstraint from effective_at
+  -> preserve original agreement, signatures, fulfillment and breach history
+  -> append SharedExperience(kind=agreement_withdrawal)
+  -> show ceremonial result; acknowledgement cannot veto completed withdrawal
+```
+
+模型返回的自由文本不能直接修改保险库、宪法或记忆。所有持久化变化必须经过结构验证、来源验证和宪法策略。
+
+### 5.5 工作上下文构造
+
+```text
+retrieve(intent):
+  disputed = memory_recall(intent, status=DISPUTED)
+  disputed = filter_directly_relevant(disputed, intent)
+  disputed = pair_counterpart_view_person_objection_and_sources(disputed)
+  candidates = union(
+    lexical_search(intent),
+    semantic_vector_search(intent),
+    temporal_search(intent.time_scope),
+    relation_search(intent.entities),
+    memory_recall(intent, exclude_status=DISPUTED),
+    disputed
+  )
+  candidates = route_with_current_understanding(candidates)
+  blocks = resolve_authoritative_evidence_blocks(candidates)
+  blocks = expand_temporal_and_relational_neighbors(blocks)
+  blocks = apply_source_scope(blocks, intent.scope = current | historical)
+  blocks = rank_with_recency_validity_and_relevance(blocks)
+  windows = compose_retrieval_windows(blocks, intent, token_budget)
+  return freeze_working_context_with_sources(windows, token_budget)
+```
+
+完整访问表示检索可以覆盖全库，不表示把全库装入单次提示。向量召回只提供候选，不能直接成为事实、记忆或回答来源；进入工作上下文前必须回读权威证据块。检索窗口根据结构邻接、任务和预算动态组合，可以重建，永久引用仍指向证据块及其来源范围。`current` 是默认范围并排除 `SOURCE_REMOVED`，`historical` 可以返回它并明确标注来源已移除。工作上下文冻结后包含来源引用、归属和时间边界，使回答和记忆更新能够回溯并接受确定性校验。
+
+当前检索解析历史块引用时只能沿 `UNCHANGED` 或 `MOVED` 谱系前进，并同时保留原始引用；`MODIFIED`、`REMOVED` 或 `AMBIGUOUS` 只能返回历史证据和状态，不得把后继块当作同一引用。历史检索始终直接解析原始证据版本，不依赖谱系推断。
+
+```text
+validate_citation(block_ref, quoted_text):
+  revision = load_extraction_revision(block_ref)
+  block = load_evidence_block(block_ref)
+  source_utf8 = load_archived_markdown(revision.evidence_id)
+  require digest(source_utf8) == revision.canonical_digest
+  source = source_utf8[block.anchor.canonical_span]
+  return exact_substring_match(source, quoted_text)
+```
+
+引用真实性只由规范文本和证据块引用决定。原生定位器成功时可把用户带回原文件位置；缺失、过期或无法解析时只返回 `NATIVE_NAVIGATION_UNAVAILABLE`，引用仍可在应用内打开规范文本并接受检查。
+
+选择性深度理解借鉴 `understand-book` 的稳定寻址、结构地图、长程关系和精确取证原则，但不对持续到来的全部人生记录运行全库预构建。它只处理经本人指定、反复召回、重要变化或当前任务触发的有限范围；产物用于路由和理解辅助，证据变化时标记失效并只重建受影响范围。
+
+### 5.6 长期记忆维护
+
+```text
+MemoryReviewRequested
+  -> 找到受新证据影响的已有记忆
+  -> 账本入账只触发复核，不自动创建长期记忆
+  -> 第二自我显式提交 MemoryProposal
+  -> Core 验证来源、主题归属、适用时间和字段完整性
+  -> 直接证据充分的提议写为 ACTIVE
+  -> 模式候选首次写为 PROVISIONAL_PATTERN
+  -> 其他证据不足的解释性推断写为 PROVISIONAL
+  -> maturity_eligible(PROVISIONAL_PATTERN):
+       Core 验证持续新增支持引用对应独立事件
+       + 存在新的反例检查记录
+       + 存在双方讨论证据
+       -> 只建立成熟资格；不得自动改变状态
+  -> 第二自我可显式提交 PatternMaturityProposal
+       -> Core 验证目标记忆、成熟资格、字段完整性和引用
+       -> 通过后写为 SUPPORTED_COUNTERPART_VIEW
+       -> 未提议或提议不通过时继续保持 PROVISIONAL_PATTERN
+  -> SUPPORTED_COUNTERPART_VIEW 始终 owner=counterpart；不得转写为本人事实或双方共识
+  -> 本人异议 -> DISPUTED
+  -> 任一阶段出现强反例 -> WEAKENED | SUPERSEDED | RETRACTED
+  -> 本人无需预批准；普通否定不得直接改变记忆状态
+  -> 既有记忆写入新版本或标记 SUPERSEDED / RETRACTED
+```
+
+维护器不逐条为所有事件生成解释，也不重写完整身份。第二自我的判断只能写入第二自我账本。
+
+深度理解投影与长期记忆是两个独立层：前者是可重建的证据结构，后者是第二自我选择跨任务保留的认识。投影不能绕过记忆写入策略直接成为长期信念。
+
+### 5.7 纠错与遗忘
+
+```text
+纠错：
+本人提交修正
+  -> 追加新本人事实
+  -> 标记旧陈述 superseded
+  -> 使相关记忆和投影失效
+  -> 重建受影响索引
+
+记忆争议：
+本人提交 DisputeMemory(memory_id, reason, counter_evidence_refs[])
+  -> memory.status = DISPUTED
+  -> 第二自我复核
+       被说服 -> RETRACTED
+       部分被说服 -> SUPERSEDED by revised memory
+       未被说服 -> 保持 DISPUTED，作为第二自我争议判断使用
+  -> DISPUTED 不得表述为本人事实或双方共识
+  -> 无实质新证据不得重复提交已撤回主张
+
+遗忘：
+本人确认 Forget(target)
+  -> 写入删除意图和恢复防护记录
+  -> 在事务中删除或失效相关提取修订、规范文本、证据块、块谱系、事件、陈述、索引、记忆和对象引用
+  -> 删除零引用密文对象
+  -> 生成新的加密备份状态
+```
+
+恢复流程必须在重新开放检索前应用最新删除意图，避免旧备份复活已经遗忘的上下文。首版的遗忘语义是从活动保险库及可用派生数据中移除，不声称能够从 SSD 未分配块或用户保留的历史备份中完成法证级物理擦除。
+
+### 5.8 备份与恢复
+
+```text
+bundle.meta + RecoveryKey
+  -> 校验 eamrecovery Bech32m 载体
+  -> 忽略 DPAPI 字段，以 HKDF-SHA256 派生 RecoveryWrapKey
+  -> XChaCha20-Poly1305 认证解封 VaultKey
+  -> VaultRepository::open(vault_root, VaultKey)
+
+self.db + objects + deletion state
+  -> 创建一致性快照
+  -> 使用派生 Backup Key 封装
+  -> 写入用户指定备份位置
+
+恢复归档
+  -> 使用 Recovery Key 解封 Vault Key
+  -> 验证完整性
+  -> 恢复权威数据
+  -> 应用删除状态
+  -> 重建索引
+```
+
+外部备份位置只接触密文。全文、向量、时间和关系索引均可由权威数据重建。
+
+## 6. 安全不变量
+
+### 6.1 首版威胁模型
+
+| 层级 | 范围 |
+| --- | --- |
+| 必须防御 | 丢失或脱机复制的存储与备份、其他非管理员账户、远程连接、外部模型与工具越权、恶意文档和网页内容。 |
+| 纵深加固 | 当前登录会话中的其他普通进程；使用显式 ACL、仅本机会话入口、领域命令白名单、输入上限和无正文日志降低误用面。 |
+| 不作保证 | 已控制当前登录会话的恶意程序、本机管理员、内核级攻击，以及设备解锁时的物理攻击。 |
+
+首版信任当前 Windows 登录会话和操作系统完整性。被排除的攻击不会成为确定性验收承诺，也不能借此放宽默认配置；产品必须准确披露保险库解锁期间的主机安全依赖。
+
+### 6.2 不变量
+
+- 只有内嵌 Rust Core 持有解锁后的保险库密钥并被设计为解密和写入权威存储。
+- Vault Key 子密钥必须以 HKDF-SHA256 按用途隔离；DbKey 只作为 SQLCipher raw key，对象密钥不得复用为数据库或备份密钥。
+- Recovery Key 必须是带版本语义和 Bech32m 校验和的 256-bit 随机秘密；恢复封装使用独立随机盐、nonce 和用途标签，不得把 Recovery Key 直接用作数据库或对象密钥。
+- `bundle.meta` 只能包含格式版本、随机密码参数和认证密文；恢复解锁不得读取或依赖 DPAPI 字段，错误密钥与恢复密文篡改不得形成可区分错误。
+- 显式退出必须先 checkpoint 并关闭 SQLCipher，再清零进程持有的 Vault Key；任一步失败仍须继续后续清理。
+- React 界面必须通过白名单 Tauri command 使用领域能力，不能获得数据库句柄、密钥或通用文件访问能力。
+- 本地文件以及未来新增的任何 IPC 必须显式限制到当前登录会话并拒绝远程访问，不能依赖操作系统默认权限。
+- 磁盘上的对象名、目录结构和明文引导元数据不得暴露个人内容或普通内容哈希。
+- 外部模型和浏览器扩展不能直接读取保险库。
+- Obsidian 资料源适配器只能读取本人选择目录内的普通文件，不能写回、执行插件或自动获取外部链接。
+- Core Markdown 解析入口只能接收 UTF-8 原文和资源上限，不能获得路径、数据库、网络、模型运行时或工具句柄；HTML、脚本、链接、嵌入和插件语法不得触发执行或获取。
+- Markdown 原文字节数、块数量、嵌套深度、元数据总量和链接数量必须有硬上限；越限结果不得进入权威存储、检索或记忆。
+- Markdown 明文不得写入临时文件或运行日志；未完成解析尝试不得在重启后自动重试同一来源版本和解析器版本。
+- 规范文本范围必须位于 UTF-8 字符边界，引用必须逐字匹配；原生定位器不得参与证据真实性判定或携带任意外部位置与动作。
+- 导入文本永远位于不可信证据通道，不能进入系统指令通道。
+- 第二自我不能自行修改宪法或授予行动权限。
+- 首版不存在现实行动执行接口。
+- 每项长期记忆都必须有来源和归属。
+- 已持久化的证据块引用不可改写，块谱系不能把变化或歧义内容伪装成原始证据。
+- 本人事实、第二自我判断和共同经历不能跨账本静默转换。
+- 每次发往云端模型的工作上下文可供本人事后检查。
+- 遗忘必须传播到所有活跃派生数据，不能只做界面隐藏。
+
+## 7. 降级与恢复
+
+| 故障 | 系统行为 |
+| --- | --- |
+| 文件仍在写入 | 保持 `DISCOVERED`，不解析半成品。 |
+| 文件暂不可解析 | 保留加密原件，标记 `ARCHIVED_UNPARSED` 及原因，不进入检索或记忆；解析能力变化后重试。 |
+| Markdown 编码、结构或资源限制失败 | 标记 `ARCHIVED_UNPARSED(reason)`，丢弃全部解析结果并保留已归档原件。 |
+| Markdown 解析期间宿主意外终止 | 下次启动把遗留尝试标记为 `INTERRUPTED`、证据标记为 `ARCHIVED_UNPARSED(PARSER_INTERRUPTED)`，同一来源和解析器版本不自动重试。 |
+| Obsidian 根目录不可访问 | 标记 `SOURCE_UNAVAILABLE` 并保留所有子项原状态，不推断删除。 |
+| 密文对象已写入但数据库提交失败 | 将其视为无引用对象，并在恢复或启动扫描中清理。 |
+| 数据库引用的密文对象缺失 | 隔离受影响证据并报告完整性错误，不向检索返回半成品。 |
+| 块谱系无法唯一确定 | 记录 `AMBIGUOUS`，保留历史引用，禁止自动前移并触发相关记忆复核。 |
+| 原生定位器缺失或失效 | 保留规范文本引用，返回 `NATIVE_NAVIGATION_UNAVAILABLE`，不得猜测最近位置。 |
+| 托盘宿主意外退出 | 下次启动先执行存储恢复并显式标记采集空缺，不伪造缺失活动。 |
+| 模型不可用 | 继续采集和索引；对话明确显示运行时不可用。 |
+| 单个索引损坏 | 从保险库和账本重建，不修改权威数据。 |
+| 记忆维护失败 | 保留待处理事件；不回滚已写入证据。 |
+| 本机密钥不可用 | 使用恢复密钥恢复；两者皆失则无法解密。 |
+| 云端网络不可用 | 切换可用本地运行时或保持休眠，不上传重试队列中的额外数据。 |
+
+## 8. 决策反向索引
+
+| 组件或边界 | 决策依据 |
+| --- | --- |
+| 第二自我编排器、身份状态 | [ADR-0001：第二自我是数字对应者](adr/0001-digital-counterpart-identity.md) |
+| Self Bundle、模型运行时网关 | [ADR-0002：本地可迁移自我包](adr/0002-portable-local-self-bundle.md) |
+| 时间化三账本、当前状态投影 | [ADR-0003：时间化三账本](adr/0003-temporal-three-ledger-model.md) |
+| Context Builder、云端数据出口 | [ADR-0004：核心访问边界](adr/0004-trusted-core-access-boundary.md) |
+| 唤醒调度、休眠持久化 | [ADR-0005：事件驱动存在](adr/0005-event-driven-presence.md) |
+| 保险库密钥、备份与恢复 | [ADR-0006：本人自持恢复密钥](adr/0006-user-held-recovery-keys.md) |
+| Context Inbox、显式遗忘 | [ADR-0007：Inbox 导入语义](adr/0007-context-inbox-import-semantics.md) |
+| Windows 桌面壳、本地核心、浏览器扩展 | [ADR-0008：Tauri、React 和 Rust](adr/0008-tauri-react-rust-desktop-stack.md) |
+| `self.db`、加密对象库、密钥派生与活动存储遗忘边界 | [ADR-0009：混合加密保险库存储](adr/0009-hybrid-encrypted-vault-storage.md) |
+| 本地文件、IPC、主机入侵与安全声明边界 | [ADR-0011：信任当前 Windows 登录会话](adr/0011-trust-current-windows-logon-session.md) |
+| 托盘常驻宿主、窗口关闭语义和内嵌 Core | [ADR-0012：托盘常驻 Tauri 宿主](adr/0012-tray-resident-tauri-host.md) |
+| Context Inbox 归档状态、延迟解析与重处理 | [ADR-0013：先归档后理解](adr/0013-archive-before-understanding.md) |
+| Obsidian 笔记库适配器、只读边界与结构提取 | [ADR-0015：只读 Obsidian 资料源](adr/0015-read-only-obsidian-source.md) |
+| Obsidian 来源当前性、历史保留与离线保护 | [ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md) |
+| Context Builder、多通道召回、深度理解投影与记忆边界 | [ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md) |
+| Core 解析输出、证据块身份、增量索引与永久引用 | [ADR-0019：稳定结构块与动态检索窗口](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md) |
+| 来源版本、历史块引用、当前投影与记忆复核 | [ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md) |
+| 规范文本、Markdown 原文引用坐标、WebView 范围与原文件导航 | [ADR-0021：规范文本锚点与可选原生定位](adr/0021-canonical-text-anchors-optional-native-locators.md) |
+| 首版 Markdown-only 范围与无转换输入链路 | [ADR-0022：首版只理解 UTF-8 Markdown](adr/0022-v1-markdown-only.md) |
+| Core 内 Markdown 解析、资源边界与中断恢复 | [ADR-0023：Core 内受限 Markdown 解析](adr/0023-in-process-bounded-markdown-parser.md) |
+| Markdown 基础语法、Obsidian 子集、未知语法降级与契约版本 | [ADR-0024：版本化 Markdown 方言](adr/0024-versioned-markdown-dialect.md) |
+| 对话证据、本人自述与本人事实账本 | [ADR-0025：清晰本人自述直接入账](adr/0025-direct-self-reports-enter-person-ledger.md) |
+| 持续对话原文、关系取证与遗忘 | [ADR-0026：每轮对话作为证据长期保留](adr/0026-retain-every-conversation-turn-as-evidence.md) |
+| 第二自我判断、认知自主与持久化策略 | [ADR-0027：第二自我显式提议持久判断](adr/0027-counterpart-explicitly-proposes-persistent-judgments.md) |
+| 共同约定、实质分歧与仪式弹窗 | [ADR-0028：共同经历采用分类型仪式入账](adr/0028-typed-ceremonial-admission-for-shared-experiences.md) |
+| 共同约定候选、文本版本与双方签署 | [ADR-0029：共同约定候选按版本双签](adr/0029-versioned-dual-signoff-for-shared-agreements.md) |
+| 关系约束、宪法优先级与约定违背 | [ADR-0030：共同约定形成次于宪法的关系约束](adr/0030-shared-agreements-create-subconstitutional-relational-constraints.md) |
+| 约定退出、时间投影与历史保留 | [ADR-0031：任一方可向未来退出共同约定](adr/0031-either-party-may-prospectively-withdraw-from-shared-agreements.md) |
+| 退出确认、解释义务与不可否决通知 | [ADR-0032：约定退出采用非对称仪式](adr/0032-asymmetric-ceremony-for-agreement-withdrawal.md) |
+| 约定范围、生效时间与显式持续有效 | [ADR-0033：共同约定签署明确边界](adr/0033-shared-agreements-sign-explicit-scope-and-validity.md) |
+| 约定冲突、显式取代与历史保留 | [ADR-0034：冲突约定必须显式取代](adr/0034-conflicting-agreements-require-explicit-supersession.md) |
+| 账本、记忆提议与长期记忆晋升 | [ADR-0035：长期记忆由第二自我显式提议](adr/0035-counterpart-explicitly-proposes-long-term-memory.md) |
+| 本人质疑、第二自我复核与争议判断 | [ADR-0036：记忆否定采用说服与争议](adr/0036-memory-challenges-require-persuasion.md) |
+| 争议召回、自然表达与高影响披露 | [ADR-0037：争议记忆采用自然分层披露](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) |
+| 共同经历定义、关系事件边界与普通互动 | [ADR-0038：共同经历采用狭义关系事件边界](adr/0038-shared-experience-uses-narrow-relational-event-boundary.md) |
+| 身份自我塑造、版本演化与反思使命 | [ADR-0039：身份自主演化受宪法反思使命约束](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) |
+| 主动反思、自然时机与安全打断 | [ADR-0040：第二自我采用可延后的主动反思邀请](adr/0040-counterpart-uses-deferrable-reflection-invitations.md) |
+| 反思静默、认知保留与安全例外 | [ADR-0041：本人可静默第二自我的主动反思](adr/0041-person-may-mute-proactive-reflection.md) |
+| 单次事件、模式证据门槛与反例检查 | [ADR-0042：主动模式反思采用三实例门槛](adr/0042-pattern-reflection-requires-three-independent-events.md) |
+| 模式长期成熟、稳定看法归属与反例修正 | [ADR-0043：模式可成熟为受支持的第二自我看法](adr/0043-pattern-may-mature-into-supported-counterpart-view.md) |
+| 模式成熟资格、显式提议与 Core 校验边界 | [ADR-0044：模式成熟由第二自我显式提议](adr/0044-counterpart-explicitly-proposes-pattern-maturity.md) |
+| 初始自我介绍、创建门槛与首个身份版本 | [ADR-0045：第二自我创建前需要最小自我介绍](adr/0045-minimal-self-introduction-before-counterpart-creation.md) |
+| SQLCipher binding、子密钥派生、对象认证加密与关闭清零 | [ADR-0046：保险库密码配置](adr/0046-vault-cryptographic-profile.md) |
+| Recovery Key 载体、DPAPI CurrentUser、双解锁与元数据格式 | [ADR-0047：版本化独立双解锁](adr/0047-versioned-independent-vault-unlock.md) |
+
+## 9. 首版计划模块
+
+以下是实现时建议的模块边界，不是技术栈选择：
+
+```text
+apps/
+  desktop/
+    src/                 # React + TypeScript
+    src-tauri/           # thin Tauri host
+  browser-extension/     # TypeScript
+crates/
+  core/
+  capture-windows/
+  source-obsidian/
+  ingestion/
+  vault/
+  ledgers/
+  retrieval/
+  understanding/
+  memory/
+  identity/
+  orchestration/
+  runtime-gateway/
+  backup/
+```
+
+首个实现切片应贯通一个最小闭环，而不是一次创建全部模块：本人输入一段经历，系统保存来源，第二自我在新会话中检索并引用它，同时把自身判断写入独立账本。
+
+### 9.1 S01 当前实现边界
+
+```text
+crates/core/src/
+  domain.rs             # 对话证据、带归属 Claim、引用、冻结工作上下文
+  ports.rs              # MemoryRepository、CounterpartRuntime、Clock
+  memory_loop.rs        # 可信 Core 的分类、冻结、引用与入账策略
+  in_memory.rs          # S01 内存仓储适配器
+  scripted_runtime.rs   # 合成分类/响应运行时与确定性时钟
+```
+
+```text
+record_person_turn(verbatim)
+  -> append ConversationEvidence
+  -> runtime.classify_person_turn(typed evidence only)
+  -> DirectSelfReport: append Claim(owner=person, exact evidence citation)
+  -> Question | Joke | Hypothetical | Quotation | Ambiguous: evidence only
+
+freeze_working_context(selected evidence ids)
+  -> Core resolves repository records
+  -> clone ordered evidence into immutable WorkingContext
+
+run_counterpart_turn(prompt, WorkingContext)
+  -> retain person prompt as ConversationEvidence
+  -> runtime.respond(RuntimeRequest { prompt, working_context })
+  -> validate response citations against prompt or frozen context
+  -> retain counterpart free text as ConversationEvidence only
+  -> validate each structured JudgmentProposal
+  -> append Claim(owner=counterpart) only when source, quote and fields pass
+```
+
+`CounterpartRuntime` 的两个方法都不接收 `MemoryRepository`；运行时只能看到 Core 显式复制进请求的值。即使运行时猜中仓储 ID，未进入冻结工作上下文的引用也会被拒绝。该实现首次落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0003](adr/0003-temporal-three-ledger-model.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0025](adr/0025-direct-self-reports-enter-person-ledger.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md) 和 [ADR-0027](adr/0027-counterpart-explicitly-proposes-persistent-judgments.md)。
+
+### 9.2 S02 当前实现边界
+
+```text
+crates/vault/src/
+  crypto.rs             # VaultKey、HKDF-SHA256 用途隔离、固定对象 AEAD 向量
+  repository.rs         # SQLCipher 连接、唯一写者锁与 MemoryRepository 适配器
+  schema.rs             # 事务化版本 migration 与中断回滚
+  error.rs              # 不泄露密钥的失败关闭错误边界
+```
+
+```text
+VaultRepository::open(vault_root, VaultKey)
+  -> try_lock(self.db.writer.lock)
+  -> derive DbKey; PRAGMA key = raw 256-bit key; clear temporary key statement
+  -> require SQLCipher 4.x and readable sqlite_schema
+  -> require cipher_integrity_check returns no page errors
+  -> configure foreign keys, secure delete, in-memory temp state and WAL
+  -> migrate each schema version in one IMMEDIATE transaction
+  -> cache next append-only evidence/claim ids
+
+MemoryRepository append/read
+  -> evidence rows retain verbatim text, speaker, session and recorded time
+  -> claim + ordered support citations commit atomically
+  -> reopen decodes the same domain values and resumes ids from persisted maxima
+
+VaultRepository::close
+  -> checkpoint encrypted WAL -> close SQLCipher -> zeroize owned VaultKey -> unlock writer
+```
+
+`cipher_memory_security` 未启用：G01 的 Windows spike 证明 `VirtualLock` 配额失败会导致崩溃；关闭契约改为先释放 SQLCipher 的连接内密钥，再显式清零 Rust 持有的 Vault Key。对象库尚未实现，但 HKDF 与 XChaCha20-Poly1305 固定向量已锁定未来兼容性。该实现落实 [ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md) 和 [ADR-0046](adr/0046-vault-cryptographic-profile.md)。
+
+### 9.3 S03 当前实现边界
+
+```text
+crates/vault/src/
+  key_store.rs          # 随机密钥引导、Bech32m Recovery Key、bundle.meta 与双解锁
+  dpapi.rs              # 唯一 unsafe 模块；DPAPI CurrentUser FFI 与明文输出清理
+  crypto.rs             # VaultKey 随机生成并继续负责持钥清零和用途隔离
+  error.rs              # 不泄露格式/密钥差异的统一解锁错误
+```
+
+```text
+VaultKeyStore::initialize(vault_root)
+  -> require bundle.meta and self.db are absent
+  -> random VaultKey + random 256-bit Recovery Key
+  -> DPAPI(CurrentUser, UI_FORBIDDEN) wraps VaultKey
+  -> HKDF-SHA256 + XChaCha20-Poly1305 independently wraps VaultKey
+  -> atomically commit versioned bundle.meta
+  -> return (VaultKey, RecoveryKey) exactly once to trusted caller
+
+VaultKeyStore::unlock_local(vault_root)
+  -> parse bounded bundle.meta -> DPAPI unprotect local field -> VaultKey
+
+VaultKeyStore::unlock_recovery(vault_root, RecoveryKey)
+  -> validate Bech32m carrier -> ignore DPAPI field
+  -> authenticated recovery unwrap -> VaultKey | UnlockFailed
+```
+
+两条解锁路径都只产出 `VaultKey`，随后仍通过既有 `VaultRepository::open(vault_root, VaultKey)` 进入 Core 加密边界。恢复路径在 DPAPI 字段缺失时通过；错误 Recovery Key、无效载体和认证篡改使用同一个失败面。该实现落实 [ADR-0006](adr/0006-user-held-recovery-keys.md)、[ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md) 和 [ADR-0047](adr/0047-versioned-independent-vault-unlock.md)。
+
+### 9.4 S04 当前实现边界
+
+```text
+crates/identity/src/
+  domain.rs             # 六类自述、结构化身份提议与不可改写 IdentityStateVersion
+  service.rs            # 两阶段形成流程及作者、使命、身份隔离和来源校验
+  ports.rs              # IdentityRepository / IdentityRuntime 显式契约
+  scripted_runtime.rs   # 可检查输入的确定性身份输出夹具
+  in_memory.rs          # 领域拒绝测试使用的内存适配器
+```
+
+```text
+IdentityFormation::record_initial_self_introduction(session, six_answers)
+  -> require exactly one non-empty answer for every required category
+  -> Vault transaction appends six ConversationEvidence(speaker=person)
+  -> same transaction appends six Claim(owner=person) and category bindings
+
+IdentityFormation::form_initial_identity()
+  -> require complete persisted introduction and no existing identity
+  -> IdentityRuntime receives only typed introduction evidence
+  -> require counterpart authorship + preserved ReflectivePurpose
+  -> require DistinctCounterpart + complete fields + introduction-only evidence refs
+  -> append IdentityStateVersion(version=1, predecessor=None)
+```
+
+本人只能提交自述，不能调用身份写入路径把自述变成角色卡；放弃反思使命、冒充本人或引用自述范围外证据的结构化提议均被 Core 拒绝。身份与来源随 SQLCipher schema v2 重启后恢复，首版一旦存在便拒绝再次形成。后续身份修订和 Self Bundle 留给 S25 与 S05。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) 和 [ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)。

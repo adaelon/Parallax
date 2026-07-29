@@ -1,0 +1,172 @@
+use rusqlite::{Connection, TransactionBehavior};
+
+use crate::VaultError;
+
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 2;
+
+const MIGRATION_1: &str = r"
+CREATE TABLE conversation_evidence (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    session_id TEXT NOT NULL,
+    speaker INTEGER NOT NULL CHECK (speaker IN (0, 1)),
+    verbatim TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE claims (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    owner INTEGER NOT NULL CHECK (owner IN (0, 1, 2)),
+    statement TEXT NOT NULL,
+    uncertainty INTEGER CHECK (uncertainty IS NULL OR uncertainty IN (0, 1, 2)),
+    applicable_kind INTEGER NOT NULL CHECK (applicable_kind IN (0, 1, 2, 3)),
+    applicable_start INTEGER,
+    applicable_end INTEGER,
+    recorded_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE claim_support (
+    claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL,
+    evidence_id INTEGER NOT NULL REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    quote TEXT NOT NULL,
+    PRIMARY KEY (claim_id, ordinal)
+) STRICT;
+
+CREATE INDEX claim_support_evidence_idx ON claim_support(evidence_id);
+";
+
+const MIGRATION_2: &str = r"
+CREATE TABLE initial_self_introduction (
+    category INTEGER PRIMARY KEY CHECK (category BETWEEN 0 AND 5),
+    evidence_id INTEGER NOT NULL UNIQUE
+        REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    claim_id INTEGER NOT NULL UNIQUE
+        REFERENCES claims(id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE identity_state_versions (
+    version INTEGER PRIMARY KEY CHECK (version > 0),
+    predecessor_version INTEGER UNIQUE
+        REFERENCES identity_state_versions(version) ON DELETE RESTRICT,
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    expression_traits TEXT NOT NULL CHECK (length(trim(expression_traits)) > 0),
+    viewpoints TEXT NOT NULL CHECK (length(trim(viewpoints)) > 0),
+    value_priorities TEXT NOT NULL CHECK (length(trim(value_priorities)) > 0),
+    relationship_posture TEXT NOT NULL CHECK (length(trim(relationship_posture)) > 0),
+    own_goals TEXT NOT NULL CHECK (length(trim(own_goals)) > 0),
+    change_reason TEXT NOT NULL CHECK (length(trim(change_reason)) > 0),
+    formed_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE identity_state_evidence (
+    identity_version INTEGER NOT NULL
+        REFERENCES identity_state_versions(version) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    evidence_id INTEGER NOT NULL
+        REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    PRIMARY KEY (identity_version, ordinal)
+) STRICT;
+
+CREATE INDEX identity_state_evidence_source_idx
+    ON identity_state_evidence(evidence_id);
+";
+
+pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
+    migrate_with_hook(connection, |_, _| Ok(()))
+}
+
+fn migrate_with_hook<F>(connection: &mut Connection, mut hook: F) -> Result<(), VaultError>
+where
+    F: FnMut(i64, &rusqlite::Transaction<'_>) -> Result<(), VaultError>,
+{
+    let mut version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > LATEST_SCHEMA_VERSION {
+        return Err(VaultError::UnsupportedSchema(version));
+    }
+
+    while version < LATEST_SCHEMA_VERSION {
+        let target = version + 1;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match target {
+            1 => transaction.execute_batch(MIGRATION_1)?,
+            2 => transaction.execute_batch(MIGRATION_2)?,
+            _ => return Err(VaultError::UnsupportedSchema(target)),
+        }
+        hook(target, &transaction)?;
+        transaction.pragma_update(None, "user_version", target)?;
+        transaction.commit()?;
+        version = target;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_migration_rolls_back_before_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            Err(VaultError::MigrationInterrupted(target))
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(1))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'conversation_evidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_identity_migration_keeps_the_previous_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 2 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(2))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'identity_state_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+}
