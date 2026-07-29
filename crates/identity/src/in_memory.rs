@@ -5,7 +5,7 @@ use eam_core::{
 
 use crate::{
     IdentityRepository, IdentityStateVersion, InitialSelfIntroduction, IntroductionAnswer,
-    IntroductionItem, SelfIntroductionCategory,
+    IntroductionItem, SelfBundleRepository, SelfBundleVersion, SelfIntroductionCategory,
 };
 
 pub struct InMemoryIdentityRepository {
@@ -15,6 +15,7 @@ pub struct InMemoryIdentityRepository {
     claims: Vec<Claim>,
     introduction: Option<InitialSelfIntroduction>,
     identities: Vec<IdentityStateVersion>,
+    self_bundles: Vec<SelfBundleVersion>,
 }
 
 impl InMemoryIdentityRepository {
@@ -27,6 +28,7 @@ impl InMemoryIdentityRepository {
             claims: Vec::new(),
             introduction: None,
             identities: Vec::new(),
+            self_bundles: Vec::new(),
         }
     }
 }
@@ -109,6 +111,43 @@ impl IdentityRepository for InMemoryIdentityRepository {
 
     fn current_identity_state(&self) -> Result<Option<IdentityStateVersion>, RepositoryError> {
         Ok(self.identities.last().cloned())
+    }
+}
+
+impl SelfBundleRepository for InMemoryIdentityRepository {
+    fn append_self_bundle(&mut self, bundle: SelfBundleVersion) -> Result<(), RepositoryError> {
+        match self.self_bundles.last() {
+            None => {
+                if bundle.version() != 1
+                    || bundle.predecessor_version().is_some()
+                    || bundle.wake_commit().is_some()
+                {
+                    return Err(RepositoryError::new(
+                        "initial Self Bundle must be version 1 without predecessor or wake commit",
+                    ));
+                }
+            }
+            Some(current) => {
+                let expected_version = current
+                    .version()
+                    .checked_add(1)
+                    .ok_or_else(|| RepositoryError::new("Self Bundle version space exhausted"))?;
+                if bundle.version() != expected_version
+                    || bundle.predecessor_version() != Some(current.version())
+                    || bundle.wake_commit().is_none()
+                {
+                    return Err(RepositoryError::new(
+                        "Self Bundle version does not continue the current immutable chain",
+                    ));
+                }
+            }
+        }
+        self.self_bundles.push(bundle);
+        Ok(())
+    }
+
+    fn current_self_bundle(&self) -> Result<Option<SelfBundleVersion>, RepositoryError> {
+        Ok(self.self_bundles.last().cloned())
     }
 }
 

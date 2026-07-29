@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 2;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 3;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -71,6 +71,57 @@ CREATE INDEX identity_state_evidence_source_idx
     ON identity_state_evidence(evidence_id);
 ";
 
+const MIGRATION_3: &str = r"
+CREATE TABLE self_bundle_versions (
+    version INTEGER PRIMARY KEY CHECK (version > 0),
+    predecessor_version INTEGER UNIQUE
+        REFERENCES self_bundle_versions(version) ON DELETE RESTRICT,
+    constitution_version INTEGER NOT NULL CHECK (constitution_version > 0),
+    identity_state_version INTEGER NOT NULL
+        REFERENCES identity_state_versions(version) ON DELETE RESTRICT,
+    relationship_state TEXT NOT NULL CHECK (length(trim(relationship_state)) > 0),
+    wake_trigger INTEGER CHECK (wake_trigger IS NULL OR wake_trigger BETWEEN 0 AND 3),
+    wake_exit INTEGER CHECK (wake_exit IS NULL OR wake_exit BETWEEN 0 AND 3),
+    committed_at INTEGER NOT NULL,
+    CHECK (
+        (version = 1 AND predecessor_version IS NULL
+         AND wake_trigger IS NULL AND wake_exit IS NULL)
+        OR
+        (version > 1 AND predecessor_version IS NOT NULL
+         AND wake_trigger IS NOT NULL AND wake_exit IS NOT NULL)
+    )
+) STRICT;
+
+CREATE TABLE self_bundle_experiences (
+    bundle_version INTEGER NOT NULL
+        REFERENCES self_bundle_versions(version) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    experience_ref TEXT NOT NULL CHECK (length(trim(experience_ref)) > 0),
+    PRIMARY KEY (bundle_version, ordinal),
+    UNIQUE (bundle_version, experience_ref)
+) STRICT;
+
+CREATE TABLE self_bundle_beliefs (
+    bundle_version INTEGER NOT NULL
+        REFERENCES self_bundle_versions(version) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE RESTRICT,
+    PRIMARY KEY (bundle_version, ordinal),
+    UNIQUE (bundle_version, claim_id)
+) STRICT;
+
+CREATE INDEX self_bundle_belief_claim_idx ON self_bundle_beliefs(claim_id);
+
+CREATE TABLE self_bundle_pending_intentions (
+    bundle_version INTEGER NOT NULL
+        REFERENCES self_bundle_versions(version) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    intention TEXT NOT NULL CHECK (length(trim(intention)) > 0),
+    PRIMARY KEY (bundle_version, ordinal),
+    UNIQUE (bundle_version, intention)
+) STRICT;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -90,6 +141,7 @@ where
         match target {
             1 => transaction.execute_batch(MIGRATION_1)?,
             2 => transaction.execute_batch(MIGRATION_2)?,
+            3 => transaction.execute_batch(MIGRATION_3)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -157,6 +209,43 @@ mod tests {
         let table_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'identity_state_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_self_bundle_migration_keeps_identity_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 3 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(3))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'self_bundle_versions'",
                 [],
                 |row| row.get(0),
             )

@@ -239,6 +239,8 @@ S02 已按 [ADR-0046](adr/0046-vault-cryptographic-profile.md) 锁定派生函�
 
 S04 将 `self.db` schema 升至 v2：`initial_self_introduction` 把六类自述绑定到既有本人证据与事实账本，`identity_state_versions` 和 `identity_state_evidence` 追加不可改写身份版本及其来源。六类自述在一个事务内入账；身份版本只在独立的结构化运行时提议通过作者、反思使命、身份隔离、字段完整性和来源范围校验后追加。
 
+S05 将 `self.db` schema 升至 v3：`self_bundle_versions` 追加完整不可改写快照，三个有序子表分别保存第二自我经历引用、信念引用和未完成意图。父版本、全部子项与唤醒提交元数据位于同一事务；任一引用或子项写入失败都会回滚整个新版本，重启只加载最后一个完整版本。
+
 ### 4.2 逻辑数据模型
 
 以下是架构契约，不是最终数据库模式：
@@ -388,12 +390,13 @@ ReflectionInvitation {
   created_at, next_eligible_at?, mute_scope?
 }
 
-SelfBundle {
-  constitution_version,
-  identity_state_version,
+SelfBundleVersion {
+  version, predecessor_version?, committed_at,
+  constitution_version, identity_state_version,
   counterpart_experience_refs[],
   belief_refs[], relationship_state,
-  pending_intentions[], version
+  pending_intentions[],
+  wake_commit?: { trigger, exit }
 }
 ```
 
@@ -629,6 +632,8 @@ ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
   -> persist SelfBundle
   -> SLEEPING
 ```
+
+S05 已实现上述目标流的有界持久化外壳：成功路径依次经过 `SLEEPING -> LOAD_SELF -> OBSERVE -> THINK -> RESPOND -> WRITE_AGENT_MEMORY -> SLEEPING`；`OBSERVE`、`THINK` 或 `RESPOND` 失败时停止后续工作，但仍以对应 `WakeExit` 追加最后一个已验证的完整状态，再进入休眠。工作步骤返回的是完整候选状态而非数据库操作；Core 拒绝候选自行改变宪法版本或跳到非当前身份版本。只有 Self Bundle 事务提交成功才记录最终 `SLEEPING`；加载或提交失败保持旧版本并向调用方报错。S06 再把真实本地/云端模型接入这些工作阶段。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -1025,4 +1030,32 @@ IdentityFormation::form_initial_identity()
   -> append IdentityStateVersion(version=1, predecessor=None)
 ```
 
-本人只能提交自述，不能调用身份写入路径把自述变成角色卡；放弃反思使命、冒充本人或引用自述范围外证据的结构化提议均被 Core 拒绝。身份与来源随 SQLCipher schema v2 重启后恢复，首版一旦存在便拒绝再次形成。后续身份修订和 Self Bundle 留给 S25 与 S05。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) 和 [ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)。
+本人只能提交自述，不能调用身份写入路径把自述变成角色卡；放弃反思使命、冒充本人或引用自述范围外证据的结构化提议均被 Core 拒绝。身份与来源随 SQLCipher schema v2 重启后恢复，首版一旦存在便拒绝再次形成。后续身份修订留给 S25；S05 从该首版身份建立 Self Bundle。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) 和 [ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)。
+
+### 9.5 S05 当前实现边界
+
+```text
+crates/identity/src/
+  self_bundle.rs        # 完整状态、不可改写版本、触发/退出提交与状态枚举
+  presence.rs           # 初始化门禁、固定唤醒序列、失败收口和休眠提交
+  ports.rs              # SelfBundleRepository / WakeWork 显式契约
+  in_memory.rs          # 领域状态机测试用不可改写版本链
+crates/vault/src/
+  schema.rs             # schema v3 Self Bundle 父版本及三个有序子表
+  repository.rs         # 完整快照单事务追加、当前版本恢复和链连续性校验
+```
+
+```text
+PresenceCoordinator::initialize_self_bundle(state)
+  -> require current IdentityStateVersion exists and matches state
+  -> append SelfBundleVersion(version=1, predecessor=None, wake_commit=None)
+
+PresenceCoordinator::wake(trigger)
+  -> SLEEPING -> LOAD_SELF
+  -> OBSERVE -> THINK -> RESPOND until completed or first work/boundary failure
+  -> WRITE_AGENT_MEMORY
+  -> append complete SelfBundleVersion(N+1, predecessor=N, WakeCommit)
+  -> only after commit: SLEEPING
+```
+
+Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用、信念引用、关系状态和未完成意图；每次唤醒提交同时保存触发类型与完成/中断阶段。`WakeWork` 不获得 repository，不能越过 Core 直接写入；真实模型网关、触发调度与身份修订分别留给 S06、S26 和 S25。SQLCipher 故障注入在父行和部分子项已执行后触发外键失败，证明整个 v3 事务回滚且重启只恢复旧版本。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)。

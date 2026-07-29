@@ -2,7 +2,7 @@ use eam_core::{RepositoryError, RuntimeError, SessionId, Timestamp};
 
 use crate::{
     IdentityStateVersion, InitialIdentityProposal, InitialIdentityRequest, InitialSelfIntroduction,
-    IntroductionAnswer,
+    IntroductionAnswer, SelfBundleState, SelfBundleVersion, WakeTrigger,
 };
 
 pub trait IdentityRepository {
@@ -58,4 +58,62 @@ pub trait IdentityRuntime {
         &mut self,
         request: InitialIdentityRequest,
     ) -> Result<InitialIdentityProposal, RuntimeError>;
+}
+
+pub trait SelfBundleRepository {
+    /// Appends one complete immutable Self Bundle version atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when version continuity, referenced state, or
+    /// the all-or-nothing persistence contract is violated.
+    fn append_self_bundle(&mut self, bundle: SelfBundleVersion) -> Result<(), RepositoryError>;
+
+    /// Loads the latest complete Self Bundle version, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when persisted bundle state is incomplete or
+    /// cannot be decoded.
+    fn current_self_bundle(&self) -> Result<Option<SelfBundleVersion>, RepositoryError>;
+}
+
+/// Executes bounded wake-cycle work without receiving repository access.
+///
+/// This is orchestration work, not the S06 model runtime gateway. Each phase
+/// receives a complete immutable state and must return a complete candidate;
+/// the trusted coordinator validates identity and constitutional boundaries.
+pub trait WakeWork {
+    /// Observes the wake trigger and returns the complete candidate state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a work error when observation cannot complete.
+    fn observe(
+        &mut self,
+        trigger: WakeTrigger,
+        state: &SelfBundleState,
+    ) -> Result<SelfBundleState, RuntimeError>;
+
+    /// Performs bounded reasoning and returns the complete candidate state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a work error when thinking cannot complete.
+    fn think(
+        &mut self,
+        trigger: WakeTrigger,
+        state: &SelfBundleState,
+    ) -> Result<SelfBundleState, RuntimeError>;
+
+    /// Produces the bounded response-stage state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a work error when response work cannot complete.
+    fn respond(
+        &mut self,
+        trigger: WakeTrigger,
+        state: &SelfBundleState,
+    ) -> Result<SelfBundleState, RuntimeError>;
 }

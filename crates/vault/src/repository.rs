@@ -9,7 +9,8 @@ use eam_core::{
 };
 use eam_identity::{
     IdentityProfile, IdentityRepository, IdentityStateVersion, InitialSelfIntroduction,
-    IntroductionAnswer, IntroductionItem, SelfIntroductionCategory,
+    IntroductionAnswer, IntroductionItem, SelfBundleRepository, SelfBundleState, SelfBundleVersion,
+    SelfIntroductionCategory, WakeCommit, WakeExit, WakeTrigger,
 };
 use fs4::{FileExt, TryLockError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -564,6 +565,209 @@ impl IdentityRepository for VaultRepository {
     }
 }
 
+impl SelfBundleRepository for VaultRepository {
+    fn append_self_bundle(&mut self, bundle: SelfBundleVersion) -> Result<(), RepositoryError> {
+        validate_self_bundle_chain(self.connection(), &bundle)?;
+        let (wake_trigger, wake_exit) = encode_wake_commit(bundle.wake_commit())?;
+        let version = to_sql_id(bundle.version())?;
+        let state = bundle.state();
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        transaction
+            .execute(
+                "INSERT INTO self_bundle_versions
+                 (version, predecessor_version, constitution_version, identity_state_version,
+                  relationship_state, wake_trigger, wake_exit, committed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    version,
+                    bundle.predecessor_version().map(to_sql_id).transpose()?,
+                    to_sql_id(state.constitution_version())?,
+                    to_sql_id(state.identity_state_version())?,
+                    state.relationship_state(),
+                    wake_trigger,
+                    wake_exit,
+                    bundle.committed_at().as_millis(),
+                ],
+            )
+            .map_err(repository_error)?;
+        insert_self_bundle_children(&transaction, version, state)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(())
+    }
+
+    fn current_self_bundle(&self) -> Result<Option<SelfBundleVersion>, RepositoryError> {
+        let stored = self
+            .connection()
+            .query_row(
+                "SELECT version, predecessor_version, constitution_version,
+                        identity_state_version, relationship_state, wake_trigger,
+                        wake_exit, committed_at
+                 FROM self_bundle_versions ORDER BY version DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(repository_error)?;
+        let Some((
+            version,
+            predecessor_version,
+            constitution_version,
+            identity_state_version,
+            relationship_state,
+            wake_trigger,
+            wake_exit,
+            committed_at,
+        )) = stored
+        else {
+            return Ok(None);
+        };
+        let version = u64::try_from(version).map_err(repository_error)?;
+        let predecessor_version = predecessor_version
+            .map(u64::try_from)
+            .transpose()
+            .map_err(repository_error)?;
+        let wake_commit = decode_wake_commit(wake_trigger, wake_exit)?;
+        let state = SelfBundleState::new(
+            u64::try_from(constitution_version).map_err(repository_error)?,
+            u64::try_from(identity_state_version).map_err(repository_error)?,
+            load_self_bundle_experiences(self.connection(), version)?,
+            load_self_bundle_beliefs(self.connection(), version)?,
+            relationship_state,
+            load_self_bundle_intentions(self.connection(), version)?,
+        )
+        .map_err(repository_error)?;
+
+        Ok(Some(SelfBundleVersion::restore(
+            version,
+            predecessor_version,
+            state,
+            wake_commit,
+            Timestamp::from_millis(committed_at),
+        )))
+    }
+}
+
+fn validate_self_bundle_chain(
+    connection: &Connection,
+    bundle: &SelfBundleVersion,
+) -> Result<(), RepositoryError> {
+    let current_version = connection
+        .query_row("SELECT MAX(version) FROM self_bundle_versions", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .map_err(repository_error)?
+        .map(u64::try_from)
+        .transpose()
+        .map_err(repository_error)?;
+
+    match current_version {
+        None if bundle.version() == 1
+            && bundle.predecessor_version().is_none()
+            && bundle.wake_commit().is_none() =>
+        {
+            Ok(())
+        }
+        None => Err(RepositoryError::new(
+            "initial Self Bundle must be version 1 without predecessor or wake commit",
+        )),
+        Some(current) => {
+            let expected = current
+                .checked_add(1)
+                .ok_or_else(|| RepositoryError::new("Self Bundle version space exhausted"))?;
+            if bundle.version() == expected
+                && bundle.predecessor_version() == Some(current)
+                && bundle.wake_commit().is_some()
+            {
+                Ok(())
+            } else {
+                Err(RepositoryError::new(
+                    "Self Bundle version does not continue the current immutable chain",
+                ))
+            }
+        }
+    }
+}
+
+fn encode_wake_commit(
+    wake_commit: Option<WakeCommit>,
+) -> Result<(Option<i64>, Option<i64>), RepositoryError> {
+    match wake_commit {
+        None => Ok((None, None)),
+        Some(commit) => Ok((
+            Some(commit.trigger().code()),
+            Some(
+                commit
+                    .exit()
+                    .code()
+                    .ok_or_else(|| RepositoryError::new("invalid persisted wake exit"))?,
+            ),
+        )),
+    }
+}
+
+fn insert_self_bundle_children(
+    transaction: &rusqlite::Transaction<'_>,
+    version: i64,
+    state: &SelfBundleState,
+) -> Result<(), RepositoryError> {
+    for (ordinal, experience_ref) in state.counterpart_experience_refs().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO self_bundle_experiences
+                 (bundle_version, ordinal, experience_ref) VALUES (?1, ?2, ?3)",
+                params![
+                    version,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    experience_ref,
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    for (ordinal, belief_ref) in state.belief_refs().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO self_bundle_beliefs
+                 (bundle_version, ordinal, claim_id) VALUES (?1, ?2, ?3)",
+                params![
+                    version,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(belief_ref.get())?,
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    for (ordinal, intention) in state.pending_intentions().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO self_bundle_pending_intentions
+                 (bundle_version, ordinal, intention) VALUES (?1, ?2, ?3)",
+                params![
+                    version,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    intention,
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
 fn acquire_writer_lock(path: &Path) -> Result<File, VaultError> {
     let file = OpenOptions::new()
         .create(true)
@@ -854,6 +1058,84 @@ fn load_identity_evidence(
                 .map_err(repository_error)
         })
         .collect()
+}
+
+fn decode_wake_commit(
+    trigger: Option<i64>,
+    exit: Option<i64>,
+) -> Result<Option<WakeCommit>, RepositoryError> {
+    match (trigger, exit) {
+        (None, None) => Ok(None),
+        (Some(trigger), Some(exit)) => {
+            let trigger = WakeTrigger::from_code(trigger)
+                .ok_or_else(|| RepositoryError::new("invalid persisted wake trigger"))?;
+            let exit = WakeExit::from_code(exit)
+                .ok_or_else(|| RepositoryError::new("invalid persisted wake exit"))?;
+            Ok(Some(WakeCommit::new(trigger, exit)))
+        }
+        _ => Err(RepositoryError::new(
+            "persisted wake commit is structurally incomplete",
+        )),
+    }
+}
+
+fn load_self_bundle_experiences(
+    connection: &Connection,
+    bundle_version: u64,
+) -> Result<Vec<String>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT experience_ref FROM self_bundle_experiences
+             WHERE bundle_version = ?1 ORDER BY ordinal",
+        )
+        .map_err(repository_error)?;
+    statement
+        .query_map([to_sql_id(bundle_version)?], |row| row.get::<_, String>(0))
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)
+}
+
+fn load_self_bundle_beliefs(
+    connection: &Connection,
+    bundle_version: u64,
+) -> Result<Vec<ClaimId>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT claim_id FROM self_bundle_beliefs
+             WHERE bundle_version = ?1 ORDER BY ordinal",
+        )
+        .map_err(repository_error)?;
+    let stored = statement
+        .query_map([to_sql_id(bundle_version)?], |row| row.get::<_, i64>(0))
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)?;
+    stored
+        .into_iter()
+        .map(|value| {
+            u64::try_from(value)
+                .map(ClaimId::from_raw)
+                .map_err(repository_error)
+        })
+        .collect()
+}
+
+fn load_self_bundle_intentions(
+    connection: &Connection,
+    bundle_version: u64,
+) -> Result<Vec<String>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT intention FROM self_bundle_pending_intentions
+             WHERE bundle_version = ?1 ORDER BY ordinal",
+        )
+        .map_err(repository_error)?;
+    statement
+        .query_map([to_sql_id(bundle_version)?], |row| row.get::<_, String>(0))
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)
 }
 
 #[cfg(test)]

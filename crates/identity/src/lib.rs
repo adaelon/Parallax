@@ -3,7 +3,9 @@
 mod domain;
 mod in_memory;
 mod ports;
+mod presence;
 mod scripted_runtime;
+mod self_bundle;
 mod service;
 
 pub use domain::{
@@ -12,8 +14,15 @@ pub use domain::{
     PersonRepresentation, ReflectivePurposeStatus, SelfIntroductionCategory,
 };
 pub use in_memory::InMemoryIdentityRepository;
-pub use ports::{IdentityRepository, IdentityRuntime};
+pub use ports::{IdentityRepository, IdentityRuntime, SelfBundleRepository, WakeWork};
+pub use presence::{
+    PresenceCoordinator, PresenceError, WakeInterruption, WakeInterruptionReason, WakeOutcome,
+};
 pub use scripted_runtime::ScriptedIdentityRuntime;
+pub use self_bundle::{
+    PresenceState, SelfBundleListField, SelfBundleState, SelfBundleValidationError,
+    SelfBundleVersion, WakeCommit, WakeExit, WakeTrigger,
+};
 pub use service::{
     IdentityError, IdentityField, IdentityFormation, IdentityProposalRejectionReason,
 };
