@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 3;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -122,6 +122,35 @@ CREATE TABLE self_bundle_pending_intentions (
 ) STRICT;
 ";
 
+const MIGRATION_4: &str = r"
+CREATE TABLE host_sessions (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    launch_mode INTEGER NOT NULL CHECK (launch_mode BETWEEN 0 AND 2),
+    started_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL CHECK (last_seen_at >= started_at),
+    ended_at INTEGER,
+    end_reason INTEGER CHECK (end_reason IS NULL OR end_reason IN (0, 1)),
+    CHECK (
+        (ended_at IS NULL AND end_reason IS NULL)
+        OR
+        (ended_at IS NOT NULL AND ended_at >= last_seen_at AND end_reason IS NOT NULL)
+    )
+) STRICT;
+
+CREATE TABLE host_runtime_gaps (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    from_at INTEGER NOT NULL,
+    to_at INTEGER NOT NULL CHECK (to_at >= from_at),
+    reason INTEGER NOT NULL CHECK (reason BETWEEN 0 AND 2),
+    clock_rollback INTEGER NOT NULL CHECK (clock_rollback IN (0, 1)),
+    recovered_by_session_id INTEGER NOT NULL
+        REFERENCES host_sessions(id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX host_runtime_gap_recovery_idx
+    ON host_runtime_gaps(recovered_by_session_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -142,6 +171,7 @@ where
             1 => transaction.execute_batch(MIGRATION_1)?,
             2 => transaction.execute_batch(MIGRATION_2)?,
             3 => transaction.execute_batch(MIGRATION_3)?,
+            4 => transaction.execute_batch(MIGRATION_4)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -246,6 +276,44 @@ mod tests {
         let table_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'self_bundle_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_host_lifecycle_migration_keeps_self_bundle_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.execute_batch(MIGRATION_3).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 4 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(4))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'host_sessions'",
                 [],
                 |row| row.get(0),
             )

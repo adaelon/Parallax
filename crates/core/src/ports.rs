@@ -1,4 +1,8 @@
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     Claim, ClaimId, ConversationEvidence, EvidenceId, PersonTurnClassification, RuntimeRequest,
@@ -149,6 +153,35 @@ pub trait CounterpartRuntime {
     fn respond(&mut self, request: RuntimeRequest) -> Result<RuntimeResponse, RuntimeError>;
 }
 
+impl<T> CounterpartRuntime for Box<T>
+where
+    T: CounterpartRuntime + ?Sized,
+{
+    fn classify_person_turn(
+        &mut self,
+        evidence: &ConversationEvidence,
+    ) -> Result<PersonTurnClassification, RuntimeError> {
+        self.as_mut().classify_person_turn(evidence)
+    }
+
+    fn respond(&mut self, request: RuntimeRequest) -> Result<RuntimeResponse, RuntimeError> {
+        self.as_mut().respond(request)
+    }
+}
+
 pub trait Clock {
     fn now(&mut self) -> Timestamp;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&mut self) -> Timestamp {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let millis = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+        Timestamp::from_millis(millis)
+    }
 }

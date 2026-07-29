@@ -21,5 +21,6 @@ pub use in_memory::InMemoryRepository;
 pub use memory_loop::{CoreError, MemoryCore};
 pub use ports::{
     Clock, CounterpartRuntime, MemoryRepository, RepositoryError, RuntimeError, RuntimeErrorKind,
+    SystemClock,
 };
 pub use scripted_runtime::{IncrementingClock, ScriptedRuntime};

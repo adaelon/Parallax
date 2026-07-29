@@ -91,3 +91,29 @@
 
 **入口**：`MemoryCore` 继续只依赖 `CounterpartRuntime`；宿主以 Cloud `gpt-5.6-terra` 和 Local `gpt-oss-20b` 构造 `OpenAiResponsesRuntime`，再由 `FallbackRuntime` 组合可用性降级。
 **测试**：`crates/runtime-gateway/tests/runtime_contract.rs` 覆盖 Local/Cloud 夹具等价、具体 Local HTTP 与 Cloud 明文端点发送前拒绝且凭据不入记录、严格请求字段、未选证据不外发、未知操作由 Core 拒绝、超时/不可用本地降级、结构错误失败关闭、失败尝试可检查，以及运行时不可用后 SQLCipher 证据跨重启仍存在。
+
+## 2026-07-29 S07-1 宿主生命周期与加密运行空缺
+
+**触达**:
+- `crates/desktop-host/src/domain.rs:HostSession/HostRuntimeGap` — 定义宿主会话、启动/退出原因、心跳边界和可审计空缺值。
+- `crates/desktop-host/src/lifecycle.rs:HostLifecycle` — 固定恢复、前后台显示、显式退出、升级退出和失败关闭转换。
+- `crates/desktop-host/src/ports.rs:HostLifecycleRepository` — 隔离会话开始、心跳、结束和空缺查询持久化契约。
+- `crates/vault/src/schema.rs:MIGRATION_4` — 新增加密宿主会话与运行空缺表，并保持 migration 原子回滚。
+- `crates/vault/src/repository.rs:HostLifecycleRepository` — 原子恢复一次崩溃/退出/升级空缺，拒绝过期会话心跳和重复结束。
+- `docs/host-lifecycle-v1.md:G04 Desktop Host Lifecycle v1` — 冻结单实例、自启动、签名升级、心跳空缺、WebView 能力和 Windows 测试方案。
+
+**入口**：Tauri 宿主打开保险库后调用 `begin_host_session`，运行时每 30 秒调用 `heartbeat_host_session`，显式退出或升级前调用 `finish_host_session`；窗口隐藏不结束会话。
+**测试**：`crates/desktop-host/src/lifecycle.rs::tests` 覆盖状态转换正反例；`crates/vault/tests/host_lifecycle_persistence.rs` 覆盖崩溃、显式退出、升级、时钟回退和过期会话拒绝的 SQLCipher 跨重启语义；`schema` 单测覆盖 v4 中断回滚。
+
+## 2026-07-29 S07-2 thin Tauri 2 宿主
+
+**触达**:
+- `apps/desktop/src-tauri/src/lib.rs:builder` — 首个注册单实例插件，接入当前用户 `--background` 自启动、托盘显示/隐藏、白名单 command 和条件式签名 updater。
+- `apps/desktop/src-tauri/src/lib.rs:spawn_heartbeat/shutdown_and_exit` — 每 30 秒提交加密心跳，并在显式退出时即使失败也继续安全清理后终止。
+- `apps/desktop/src-tauri/src/state.rs:ManagedHost` — 装配 Vault、Core、运行时与宿主状态机，不把 repository、密钥或凭据交给 WebView。
+- `apps/desktop/src-tauri/capabilities/main.json:main` — 仅向主窗口授予 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限。
+- `apps/desktop/src/App.tsx:App` — 提供只验证宿主渲染的静态前端，明确把持续对话留给下一子片。
+- `.gitignore:desktop generated outputs` — 排除 `node_modules`、Vite `dist` 和 Tauri 生成 schema，保留源码、lockfile、capability 与图标资产。
+
+**入口**：`evrything-about-me.exe` 调用 `eam_desktop_app::run`；第二实例只激活首实例，托盘和关闭窗口事件复用同一 `ManagedHost`。
+**测试**：`apps/desktop/src-tauri/src/lib.rs::tests` 覆盖 updater 启用条件、失败重开错误和托盘图标；`state.rs::tests` 覆盖退出阶段全部尝试；`apps/desktop/src/App.test.tsx` 覆盖静态宿主边界；`cargo build --bins --features tauri/custom-protocol --release` 验证无 bundle Windows 可执行文件。

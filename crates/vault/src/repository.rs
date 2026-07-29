@@ -7,6 +7,10 @@ use eam_core::{
     ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, EvidenceCitation, EvidenceId,
     MemoryRepository, RepositoryError, SessionId, Speaker, Timestamp, Uncertainty,
 };
+use eam_desktop_host::{
+    ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
+    HostSessionId, HostSessionStart, LaunchMode,
+};
 use eam_identity::{
     IdentityProfile, IdentityRepository, IdentityStateVersion, InitialSelfIntroduction,
     IntroductionAnswer, IntroductionItem, SelfBundleRepository, SelfBundleState, SelfBundleVersion,
@@ -279,6 +283,186 @@ impl MemoryRepository for VaultRepository {
         stored_claims
             .into_iter()
             .map(|stored| stored.decode(self.connection()))
+            .collect()
+    }
+}
+
+impl HostLifecycleRepository for VaultRepository {
+    fn begin_host_session(
+        &mut self,
+        started_at: Timestamp,
+        launch_mode: LaunchMode,
+    ) -> Result<HostSessionStart, RepositoryError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        let previous = transaction
+            .query_row(
+                "SELECT id, launch_mode, started_at, last_seen_at, ended_at, end_reason
+                 FROM host_sessions ORDER BY id DESC LIMIT 1",
+                [],
+                stored_host_session_from_row,
+            )
+            .optional()
+            .map_err(repository_error)?;
+        let session_id =
+            HostSessionId::from_raw(next_host_identifier(&transaction, "host_sessions")?);
+        transaction
+            .execute(
+                "INSERT INTO host_sessions
+                 (id, launch_mode, started_at, last_seen_at, ended_at, end_reason)
+                 VALUES (?1, ?2, ?3, ?3, NULL, NULL)",
+                params![
+                    to_sql_id(session_id.get())?,
+                    encode_launch_mode(launch_mode),
+                    started_at.as_millis(),
+                ],
+            )
+            .map_err(repository_error)?;
+
+        let recovered_gap = previous
+            .map(StoredHostSession::decode)
+            .transpose()?
+            .and_then(|previous| recovered_gap_spec(&previous, started_at))
+            .map(|(from, to, reason, clock_rollback)| {
+                let gap_id =
+                    HostGapId::from_raw(next_host_identifier(&transaction, "host_runtime_gaps")?);
+                transaction
+                    .execute(
+                        "INSERT INTO host_runtime_gaps
+                         (id, from_at, to_at, reason, clock_rollback,
+                          recovered_by_session_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            to_sql_id(gap_id.get())?,
+                            from.as_millis(),
+                            to.as_millis(),
+                            encode_gap_reason(reason),
+                            i64::from(clock_rollback),
+                            to_sql_id(session_id.get())?,
+                        ],
+                    )
+                    .map_err(repository_error)?;
+                Ok(HostRuntimeGap::restore(
+                    gap_id,
+                    from,
+                    to,
+                    reason,
+                    clock_rollback,
+                    session_id,
+                ))
+            })
+            .transpose()?;
+
+        transaction.commit().map_err(repository_error)?;
+        Ok(HostSessionStart::new(
+            HostSession::restore(session_id, launch_mode, started_at, started_at, None, None),
+            recovered_gap,
+        ))
+    }
+
+    fn heartbeat_host_session(
+        &mut self,
+        session_id: HostSessionId,
+        observed_at: Timestamp,
+    ) -> Result<HostSession, RepositoryError> {
+        let current = current_host_session(self.connection())?
+            .ok_or_else(|| RepositoryError::new("host session is not initialized"))?;
+        if current.id() != session_id || current.ended_at().is_some() {
+            return Err(RepositoryError::new(
+                "heartbeat must target the current open host session",
+            ));
+        }
+        let last_seen_at = std::cmp::max(current.last_seen_at(), observed_at);
+        self.connection()
+            .execute(
+                "UPDATE host_sessions SET last_seen_at = ?1 WHERE id = ?2",
+                params![last_seen_at.as_millis(), to_sql_id(session_id.get())?],
+            )
+            .map_err(repository_error)?;
+        Ok(HostSession::restore(
+            current.id(),
+            current.launch_mode(),
+            current.started_at(),
+            last_seen_at,
+            None,
+            None,
+        ))
+    }
+
+    fn finish_host_session(
+        &mut self,
+        session_id: HostSessionId,
+        ended_at: Timestamp,
+        reason: ExitReason,
+    ) -> Result<HostSession, RepositoryError> {
+        let current = current_host_session(self.connection())?
+            .ok_or_else(|| RepositoryError::new("host session is not initialized"))?;
+        if current.id() != session_id || current.ended_at().is_some() {
+            return Err(RepositoryError::new(
+                "finish must target the current open host session",
+            ));
+        }
+        let ended_at = std::cmp::max(current.last_seen_at(), ended_at);
+        self.connection()
+            .execute(
+                "UPDATE host_sessions
+                 SET last_seen_at = ?1, ended_at = ?1, end_reason = ?2
+                 WHERE id = ?3",
+                params![
+                    ended_at.as_millis(),
+                    encode_exit_reason(reason),
+                    to_sql_id(session_id.get())?,
+                ],
+            )
+            .map_err(repository_error)?;
+        Ok(HostSession::restore(
+            current.id(),
+            current.launch_mode(),
+            current.started_at(),
+            ended_at,
+            Some(ended_at),
+            Some(reason),
+        ))
+    }
+
+    fn all_host_sessions(&self) -> Result<Vec<HostSession>, RepositoryError> {
+        let mut statement = self
+            .connection()
+            .prepare(
+                "SELECT id, launch_mode, started_at, last_seen_at, ended_at, end_reason
+                 FROM host_sessions ORDER BY id",
+            )
+            .map_err(repository_error)?;
+        statement
+            .query_map([], stored_host_session_from_row)
+            .map_err(repository_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_error)?
+            .into_iter()
+            .map(StoredHostSession::decode)
+            .collect()
+    }
+
+    fn all_host_runtime_gaps(&self) -> Result<Vec<HostRuntimeGap>, RepositoryError> {
+        let mut statement = self
+            .connection()
+            .prepare(
+                "SELECT id, from_at, to_at, reason, clock_rollback,
+                        recovered_by_session_id
+                 FROM host_runtime_gaps ORDER BY id",
+            )
+            .map_err(repository_error)?;
+        statement
+            .query_map([], stored_host_gap_from_row)
+            .map_err(repository_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_error)?
+            .into_iter()
+            .map(StoredHostGap::decode)
             .collect()
     }
 }
@@ -848,12 +1032,186 @@ fn next_identifier(connection: &Connection, table: &str) -> Result<u64, VaultErr
         .ok_or(VaultError::InvalidKeyOrCorrupt)
 }
 
+fn next_host_identifier(connection: &Connection, table: &str) -> Result<u64, RepositoryError> {
+    let query = format!("SELECT COALESCE(MAX(id), 0) FROM {table}");
+    let maximum: i64 = connection
+        .query_row(&query, [], |row| row.get(0))
+        .map_err(repository_error)?;
+    let maximum = u64::try_from(maximum).map_err(repository_error)?;
+    let next = maximum
+        .checked_add(1)
+        .ok_or_else(|| RepositoryError::new("host lifecycle identifier space exhausted"))?;
+    Ok(next)
+}
+
 fn to_sql_id(id: u64) -> Result<i64, RepositoryError> {
     i64::try_from(id).map_err(repository_error)
 }
 
 fn repository_error(error: impl std::fmt::Display) -> RepositoryError {
     RepositoryError::new(error.to_string())
+}
+
+const fn encode_launch_mode(mode: LaunchMode) -> i64 {
+    match mode {
+        LaunchMode::Foreground => 0,
+        LaunchMode::Background => 1,
+        LaunchMode::UpdateRelaunch => 2,
+    }
+}
+
+fn decode_launch_mode(value: i64) -> Result<LaunchMode, RepositoryError> {
+    match value {
+        0 => Ok(LaunchMode::Foreground),
+        1 => Ok(LaunchMode::Background),
+        2 => Ok(LaunchMode::UpdateRelaunch),
+        _ => Err(RepositoryError::new("invalid persisted host launch mode")),
+    }
+}
+
+const fn encode_exit_reason(reason: ExitReason) -> i64 {
+    match reason {
+        ExitReason::Explicit => 0,
+        ExitReason::Update => 1,
+    }
+}
+
+fn decode_exit_reason(value: i64) -> Result<ExitReason, RepositoryError> {
+    match value {
+        0 => Ok(ExitReason::Explicit),
+        1 => Ok(ExitReason::Update),
+        _ => Err(RepositoryError::new("invalid persisted host exit reason")),
+    }
+}
+
+const fn encode_gap_reason(reason: HostGapReason) -> i64 {
+    match reason {
+        HostGapReason::Crash => 0,
+        HostGapReason::ExplicitExit => 1,
+        HostGapReason::Update => 2,
+    }
+}
+
+fn decode_gap_reason(value: i64) -> Result<HostGapReason, RepositoryError> {
+    match value {
+        0 => Ok(HostGapReason::Crash),
+        1 => Ok(HostGapReason::ExplicitExit),
+        2 => Ok(HostGapReason::Update),
+        _ => Err(RepositoryError::new("invalid persisted host gap reason")),
+    }
+}
+
+fn recovered_gap_spec(
+    previous: &HostSession,
+    started_at: Timestamp,
+) -> Option<(Timestamp, Timestamp, HostGapReason, bool)> {
+    let (candidate_from, reason) = match (previous.ended_at(), previous.end_reason()) {
+        (Some(ended_at), Some(ExitReason::Explicit)) => (ended_at, HostGapReason::ExplicitExit),
+        (Some(ended_at), Some(ExitReason::Update)) => (ended_at, HostGapReason::Update),
+        (None, None) => (previous.last_seen_at(), HostGapReason::Crash),
+        _ => return None,
+    };
+    match candidate_from.cmp(&started_at) {
+        std::cmp::Ordering::Less => Some((candidate_from, started_at, reason, false)),
+        std::cmp::Ordering::Greater => Some((started_at, started_at, reason, true)),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+fn current_host_session(connection: &Connection) -> Result<Option<HostSession>, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT id, launch_mode, started_at, last_seen_at, ended_at, end_reason
+             FROM host_sessions ORDER BY id DESC LIMIT 1",
+            [],
+            stored_host_session_from_row,
+        )
+        .optional()
+        .map_err(repository_error)?
+        .map(StoredHostSession::decode)
+        .transpose()
+}
+
+struct StoredHostSession {
+    id: i64,
+    launch_mode: i64,
+    started_at: i64,
+    last_seen_at: i64,
+    ended_at: Option<i64>,
+    end_reason: Option<i64>,
+}
+
+impl StoredHostSession {
+    fn decode(self) -> Result<HostSession, RepositoryError> {
+        if self.id <= 0 || self.last_seen_at < self.started_at {
+            return Err(RepositoryError::new("invalid persisted host session"));
+        }
+        let end_reason = self.end_reason.map(decode_exit_reason).transpose()?;
+        if self.ended_at.is_some() != end_reason.is_some()
+            || self.ended_at.is_some_and(|ended| ended < self.last_seen_at)
+        {
+            return Err(RepositoryError::new("invalid persisted host session end"));
+        }
+        Ok(HostSession::restore(
+            HostSessionId::from_raw(u64::try_from(self.id).map_err(repository_error)?),
+            decode_launch_mode(self.launch_mode)?,
+            Timestamp::from_millis(self.started_at),
+            Timestamp::from_millis(self.last_seen_at),
+            self.ended_at.map(Timestamp::from_millis),
+            end_reason,
+        ))
+    }
+}
+
+fn stored_host_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredHostSession> {
+    Ok(StoredHostSession {
+        id: row.get(0)?,
+        launch_mode: row.get(1)?,
+        started_at: row.get(2)?,
+        last_seen_at: row.get(3)?,
+        ended_at: row.get(4)?,
+        end_reason: row.get(5)?,
+    })
+}
+
+struct StoredHostGap {
+    id: i64,
+    from: i64,
+    to: i64,
+    reason: i64,
+    clock_rollback: i64,
+    recovered_by: i64,
+}
+
+impl StoredHostGap {
+    fn decode(self) -> Result<HostRuntimeGap, RepositoryError> {
+        if self.id <= 0
+            || self.recovered_by <= 0
+            || self.to < self.from
+            || !matches!(self.clock_rollback, 0 | 1)
+        {
+            return Err(RepositoryError::new("invalid persisted host runtime gap"));
+        }
+        Ok(HostRuntimeGap::restore(
+            HostGapId::from_raw(u64::try_from(self.id).map_err(repository_error)?),
+            Timestamp::from_millis(self.from),
+            Timestamp::from_millis(self.to),
+            decode_gap_reason(self.reason)?,
+            self.clock_rollback == 1,
+            HostSessionId::from_raw(u64::try_from(self.recovered_by).map_err(repository_error)?),
+        ))
+    }
+}
+
+fn stored_host_gap_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredHostGap> {
+    Ok(StoredHostGap {
+        id: row.get(0)?,
+        from: row.get(1)?,
+        to: row.get(2)?,
+        reason: row.get(3)?,
+        clock_rollback: row.get(4)?,
+        recovered_by: row.get(5)?,
+    })
 }
 
 const fn encode_speaker(speaker: Speaker) -> i64 {

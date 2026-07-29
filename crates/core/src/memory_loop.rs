@@ -241,6 +241,11 @@ where
     }
 
     #[must_use]
+    pub fn repository_mut(&mut self) -> &mut R {
+        &mut self.repository
+    }
+
+    #[must_use]
     pub const fn runtime(&self) -> &T {
         &self.runtime
     }

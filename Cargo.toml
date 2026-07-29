@@ -1,3 +1,10 @@
 [workspace]
-members = ["crates/core", "crates/identity", "crates/runtime-gateway", "crates/vault"]
+members = [
+    "apps/desktop/src-tauri",
+    "crates/core",
+    "crates/desktop-host",
+    "crates/identity",
+    "crates/runtime-gateway",
+    "crates/vault",
+]
 resolver = "2"

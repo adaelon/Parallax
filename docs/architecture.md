@@ -48,6 +48,7 @@ flowchart LR
             Orchestrator[第二自我编排器]
             Policy[宪法与写入策略]
             RuntimeGateway[模型运行时网关]
+            HostLifecycle[宿主生命周期与运行空缺]
             Backup[密钥与备份管理器]
         end
     end
@@ -85,6 +86,7 @@ flowchart LR
     Memory --> SelfBundle
     Identity --> SelfBundle
     Commands --> Orchestrator
+    Commands --> HostLifecycle
     Orchestrator --> SelfBundle
     Orchestrator --> Context
     Orchestrator --> Understanding
@@ -97,6 +99,7 @@ flowchart LR
     Policy --> Orchestrator
     RuntimeGateway --> LocalModel
     RuntimeGateway --> CloudModel
+    HostLifecycle --> Vault
     Orchestrator --> Commands
     Vault --> Backup
     Ledgers --> Backup
@@ -420,10 +423,14 @@ WindowsLogon
   -> HKDF-SHA256 派生 DbKey；以 SQLCipher raw key 打开 self.db
   -> 验证 SQLCipher 版本、schema 可读性和逐页 HMAC
   -> 在事务内应用版本化 migration；恢复 WAL
+  -> begin_host_session(now, launch_mode)
+       上次会话未闭合：从 last_seen_at 至 now 记录 CRASH 空缺
+       上次会话已闭合：从 ended_at 至 now 记录 EXIT/UPDATE 空缺
   -> 恢复暂存对象和待处理任务
   -> 遗留 MarkdownParseAttempt(STARTED)：
        标记 INTERRUPTED，Evidence -> ARCHIVED_UNPARSED(PARSER_INTERRUPTED)，不自动重试
   -> 启动采集器
+  -> 每 30 秒提交 host_session.last_seen_at 心跳
   -> BACKGROUND_RUNNING
 
 WindowCloseRequested
@@ -437,10 +444,17 @@ AppIconActivated | TrayOpen
 
 PauseCapture -> CAPTURE_PAUSED
 ResumeCapture -> BACKGROUND_RUNNING | FOREGROUND_RUNNING
-ExitApplication -> checkpoint WAL -> close SQLCipher -> zeroize Vault Key -> release lock -> STOPPED
+ExitApplication
+  -> finish_host_session(reason=EXPLICIT_EXIT)
+  -> checkpoint WAL -> close SQLCipher -> zeroize Vault Key -> release lock -> STOPPED
+
+InstallSignedUpdate
+  -> finish_host_session(reason=UPDATE)
+  -> checkpoint WAL -> close SQLCipher -> zeroize Vault Key -> release lock
+  -> install + relaunch；下次启动记录 UPDATE 空缺
 ```
 
-窗口可见性不决定 Core 运行状态。Windows 会话锁定时采集器暂停，Core 关闭保险库并清除解锁后密钥；会话解锁后重新解封、执行恢复检查并继续采集。
+窗口可见性不决定 Core 运行状态。宿主意外终止时，下一次启动只从最后一次已提交心跳起记录运行空缺，不猜测期间活动；系统时钟回退产生带异常标记的零长度空缺。Windows 会话锁定时采集器暂停，Core 关闭保险库并清除解锁后密钥；会话解锁后重新解封、执行恢复检查并继续采集。
 
 ### 5.2 文件与 Obsidian 增量导入
 
@@ -812,6 +826,7 @@ self.db + objects + deletion state
 - `bundle.meta` 只能包含格式版本、随机密码参数和认证密文；恢复解锁不得读取或依赖 DPAPI 字段，错误密钥与恢复密文篡改不得形成可区分错误。
 - 显式退出必须先 checkpoint 并关闭 SQLCipher，再清零进程持有的 Vault Key；任一步失败仍须继续后续清理。
 - React 界面必须通过白名单 Tauri command 使用领域能力，不能获得数据库句柄、密钥或通用文件访问能力。
+- 宿主会话、心跳和运行空缺只能写入加密保险库；不得用明文哨兵文件暴露运行时间或恢复状态。
 - 本地文件以及未来新增的任何 IPC 必须显式限制到当前登录会话并拒绝远程访问，不能依赖操作系统默认权限。
 - 磁盘上的对象名、目录结构和明文引导元数据不得暴露个人内容或普通内容哈希。
 - 外部模型和浏览器扩展不能直接读取保险库。
@@ -844,7 +859,7 @@ self.db + objects + deletion state
 | 数据库引用的密文对象缺失 | 隔离受影响证据并报告完整性错误，不向检索返回半成品。 |
 | 块谱系无法唯一确定 | 记录 `AMBIGUOUS`，保留历史引用，禁止自动前移并触发相关记忆复核。 |
 | 原生定位器缺失或失效 | 保留规范文本引用，返回 `NATIVE_NAVIGATION_UNAVAILABLE`，不得猜测最近位置。 |
-| 托盘宿主意外退出 | 下次启动先执行存储恢复并显式标记采集空缺，不伪造缺失活动。 |
+| 托盘宿主意外退出 | 下次启动先执行存储恢复，从最后一次加密心跳起显式标记崩溃空缺，不伪造缺失活动。 |
 | 模型不可用 | 继续采集和索引；对话明确显示运行时不可用。 |
 | 单个索引损坏 | 从保险库和账本重建，不修改权威数据。 |
 | 记忆维护失败 | 保留待处理事件；不回滚已写入证据。 |
@@ -1104,3 +1119,25 @@ OpenAiResponsesRuntime::respond(RuntimeRequest)
 ```
 
 Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 对同一固定夹具产生等价领域输出；具体 HTTP 传输强制 Cloud HTTPS + bearer 与无凭据 Local 端点，S07 只注入端点和秘密，不能取得保险库或改变 [G03 Runtime Contract v1](runtime-contract-v1.md)。结构化输出错误失败关闭，只有超时和不可用进入本地档案。SQLCipher 集成测试证明运行时不可用不会回滚已提交的本人证据。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0048](adr/0048-openai-responses-runtime-family.md)。
+
+### 9.7 S07 thin 桌面宿主当前实现边界
+
+```text
+apps/desktop/src-tauri/src/
+  lib.rs                # 单实例优先、当前用户自启动、托盘、条件式 updater 与事件循环
+  state.rs              # Vault/Core/运行时装配、30 秒心跳和失败仍继续的安全退出
+apps/desktop/src/
+  App.tsx               # 仅验证宿主渲染的静态占位界面
+crates/desktop-host/src/
+  lifecycle.rs          # 无 Tauri 依赖的宿主状态机
+crates/vault/src/
+  repository.rs         # 加密宿主会话、心跳与运行空缺适配器
+```
+
+```text
+first process -> single-instance plugin -> unlock Vault -> begin_host_session -> tray event loop
+second process -> activate_existing_window(first process) -> exit
+explicit exit -> finish_host_session -> close Vault -> zeroize key -> release lock -> process exit
+```
+
+主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动和 updater 只能经宿主白名单 command 使用。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。当前 React 只提供静态宿主占位，不实现持续对话、采集或 Personal Library；该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md) 和 [ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)。
