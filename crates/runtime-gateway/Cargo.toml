@@ -1,0 +1,25 @@
+[package]
+name = "runtime-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "eam_runtime_gateway"
+
+[dependencies]
+eam_core = { package = "core", path = "../core" }
+reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "native-tls"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+zeroize = "=1.9.0"
+
+[dev-dependencies]
+eam_vault = { package = "vault", path = "../vault" }
+tempfile = "=3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

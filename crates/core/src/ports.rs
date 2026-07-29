@@ -27,8 +27,17 @@ impl fmt::Display for RepositoryError {
 
 impl Error for RepositoryError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeErrorKind {
+    Timeout,
+    Unavailable,
+    InvalidResponse,
+    Other,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeError {
+    kind: RuntimeErrorKind,
     message: String,
 }
 
@@ -36,8 +45,38 @@ impl RuntimeError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            kind: RuntimeErrorKind::Other,
             message: message.into(),
         }
+    }
+
+    #[must_use]
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            kind: RuntimeErrorKind::Timeout,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: RuntimeErrorKind::Unavailable,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_response(message: impl Into<String>) -> Self {
+        Self {
+            kind: RuntimeErrorKind::InvalidResponse,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RuntimeErrorKind {
+        self.kind
     }
 }
 

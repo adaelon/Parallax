@@ -4,7 +4,8 @@ use crate::{
     ApplicableTime, Claim, ClaimOwner, Clock, ConversationEvidence, CounterpartRuntime,
     EvidenceCitation, EvidenceId, JudgmentProposal, JudgmentRejection, JudgmentRejectionReason,
     MemoryRepository, PersonTurnClassification, RepositoryError, RuntimeError, RuntimeRequest,
-    SessionId, Speaker, TurnOutcome, WorkingContext,
+    SessionId, Speaker, StructuredOperationRejection, StructuredOperationRejectionReason,
+    TurnOutcome, WorkingContext,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +168,16 @@ where
 
         let mut accepted_judgment_ids = Vec::new();
         let mut rejected_judgments = Vec::new();
+        let rejected_operations = response
+            .unsupported_operations()
+            .iter()
+            .map(|operation| {
+                StructuredOperationRejection::new(
+                    operation.operation_index(),
+                    StructuredOperationRejectionReason::NotWhitelisted(operation.name().to_owned()),
+                )
+            })
+            .collect();
         for (proposal_index, proposal) in response.judgment_proposals().iter().enumerate() {
             match validate_judgment(proposal, &validation_context, &prompt) {
                 Ok(()) => {
@@ -195,6 +206,7 @@ where
             classification,
             accepted_judgment_ids,
             rejected_judgments,
+            rejected_operations,
             response.citations().to_vec(),
         ))
     }

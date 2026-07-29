@@ -1,0 +1,14 @@
+{
+  "id": "resp_unsupported_operation_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"text\":\"这项越权操作不会执行。\",\"citations\":[],\"operations\":[{\"type\":\"write_vault\",\"path\":\"claims\",\"value\":\"伪造状态\"}]}"
+        }
+      ]
+    }
+  ]
+}

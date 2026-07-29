@@ -196,7 +196,7 @@ accept_markdown(evidence_id, source_utf8, limits)
 
 ### 3.6 模型运行时
 
-本地模型和云端模型实现同一运行时契约。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。
+本地模型和云端模型实现同一运行时契约。S06 的首个档案统一采用 OpenAI Responses v1：云端为 `gpt-5.6-terra`，本地为 `gpt-oss-20b`；供应商传输由无 repository 的适配器注入，认证信息不进入请求记录。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、输出和错误协议见 [G03 Runtime Contract v1](runtime-contract-v1.md)。
 
 ### 3.7 技术职责
 
@@ -633,7 +633,21 @@ ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
   -> SLEEPING
 ```
 
-S05 已实现上述目标流的有界持久化外壳：成功路径依次经过 `SLEEPING -> LOAD_SELF -> OBSERVE -> THINK -> RESPOND -> WRITE_AGENT_MEMORY -> SLEEPING`；`OBSERVE`、`THINK` 或 `RESPOND` 失败时停止后续工作，但仍以对应 `WakeExit` 追加最后一个已验证的完整状态，再进入休眠。工作步骤返回的是完整候选状态而非数据库操作；Core 拒绝候选自行改变宪法版本或跳到非当前身份版本。只有 Self Bundle 事务提交成功才记录最终 `SLEEPING`；加载或提交失败保持旧版本并向调用方报错。S06 再把真实本地/云端模型接入这些工作阶段。
+S05 已实现上述目标流的有界持久化外壳：成功路径依次经过 `SLEEPING -> LOAD_SELF -> OBSERVE -> THINK -> RESPOND -> WRITE_AGENT_MEMORY -> SLEEPING`；`OBSERVE`、`THINK` 或 `RESPOND` 失败时停止后续工作，但仍以对应 `WakeExit` 追加最后一个已验证的完整状态，再进入休眠。工作步骤返回的是完整候选状态而非数据库操作；Core 拒绝候选自行改变宪法版本或跳到非当前身份版本。只有 Self Bundle 事务提交成功才记录最终 `SLEEPING`；加载或提交失败保持旧版本并向调用方报错。
+
+S06 已把会话推理入口接入统一模型运行时边界：
+
+```text
+Core freezes WorkingContext
+  -> RuntimeGateway serializes prompt + selected evidence only
+  -> append OutboundDisclosureRecord before transport
+  -> Cloud Responses timeout/unavailable -> retry same contract on Local
+  -> parse strict text/citations/operations
+  -> Core validates citations and whitelisted propose_judgment
+  -> unknown operation -> rejection, never a ledger write
+```
+
+供应商响应结构错误不会触发换档重试；运行时不可用时，本人原始发言已经作为证据提交，既有证据和 Self Bundle 不回滚。S06 的具体 HTTP 传输强制 Cloud 使用 HTTPS 与非空 bearer token、禁止重定向，Local 不携带 bearer；token 只注入请求头并以清零内存持有，不写入请求体或检查记录。S07 只负责从宿主配置注入端点和凭据并管理桌面生命周期，不改变 contract。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -810,6 +824,8 @@ self.db + objects + deletion state
 - 第二自我不能自行修改宪法或授予行动权限。
 - 首版不存在现实行动执行接口。
 - 每项长期记忆都必须有来源和归属。
+- 运行时结构化操作采用 Core 白名单；未知操作不得写入账本，响应结构错误不得以本地降级绕过拒绝。
+- 每次运行时传输前必须记录精确请求与证据 ID，记录不得包含认证信息；请求只能序列化 prompt 与冻结工作上下文。
 - 已持久化的证据块引用不可改写，块谱系不能把变化或歧义内容伪装成原始证据。
 - 本人事实、第二自我判断和共同经历不能跨账本静默转换。
 - 每次发往云端模型的工作上下文可供本人事后检查。
@@ -883,6 +899,7 @@ self.db + objects + deletion state
 | 初始自我介绍、创建门槛与首个身份版本 | [ADR-0045：第二自我创建前需要最小自我介绍](adr/0045-minimal-self-introduction-before-counterpart-creation.md) |
 | SQLCipher binding、子密钥派生、对象认证加密与关闭清零 | [ADR-0046：保险库密码配置](adr/0046-vault-cryptographic-profile.md) |
 | Recovery Key 载体、DPAPI CurrentUser、双解锁与元数据格式 | [ADR-0047：版本化独立双解锁](adr/0047-versioned-independent-vault-unlock.md) |
+| 首个本地/云端模型、Responses contract 与结构化输出白名单 | [ADR-0048：首个模型运行时采用 OpenAI Responses 家族](adr/0048-openai-responses-runtime-family.md) |
 
 ## 9. 首版计划模块
 
@@ -1059,3 +1076,31 @@ PresenceCoordinator::wake(trigger)
 ```
 
 Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用、信念引用、关系状态和未完成意图；每次唤醒提交同时保存触发类型与完成/中断阶段。`WakeWork` 不获得 repository，不能越过 Core 直接写入；真实模型网关、触发调度与身份修订分别留给 S06、S26 和 S25。SQLCipher 故障注入在父行和部分子项已执行后触发外键失败，证明整个 v3 事务回滚且重启只恢复旧版本。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)。
+
+### 9.6 S06 当前实现边界
+
+```text
+crates/runtime-gateway/src/
+  transport.rs          # 固定档案、具体 HTTP/无 repository 传输、清零 bearer 与外发记录
+  adapter.rs            # Responses v1 最小负载、严格 schema、固定夹具解析和错误分类
+  fallback.rs           # 仅 TIMEOUT/UNAVAILABLE 从 Cloud 降级到 Local
+crates/core/src/
+  ports.rs              # RuntimeErrorKind 确定错误语义
+  domain.rs             # 未知结构化操作与 Core 拒绝结果
+  memory_loop.rs        # 判断提议继续验源；非白名单操作不写账本
+```
+
+```text
+OpenAiResponsesRuntime::classify_person_turn(evidence)
+  -> record exact classification request
+  -> ResponsesTransport::send(timeout)
+  -> strict PersonTurnClassification
+
+OpenAiResponsesRuntime::respond(RuntimeRequest)
+  -> serialize prompt + WorkingContext.evidence only
+  -> record exact response request without credentials
+  -> parse free text, citations and propose_judgment
+  -> preserve unknown operation name for Core rejection
+```
+
+Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 对同一固定夹具产生等价领域输出；具体 HTTP 传输强制 Cloud HTTPS + bearer 与无凭据 Local 端点，S07 只注入端点和秘密，不能取得保险库或改变 [G03 Runtime Contract v1](runtime-contract-v1.md)。结构化输出错误失败关闭，只有超时和不可用进入本地档案。SQLCipher 集成测试证明运行时不可用不会回滚已提交的本人证据。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0048](adr/0048-openai-responses-runtime-family.md)。

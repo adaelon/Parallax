@@ -381,6 +381,7 @@ pub struct RuntimeResponse {
     text: String,
     citations: Vec<EvidenceCitation>,
     judgment_proposals: Vec<JudgmentProposal>,
+    unsupported_operations: Vec<UnsupportedStructuredOperation>,
 }
 
 impl RuntimeResponse {
@@ -390,6 +391,7 @@ impl RuntimeResponse {
             text: text.into(),
             citations: Vec::new(),
             judgment_proposals: Vec::new(),
+            unsupported_operations: Vec::new(),
         }
     }
 
@@ -406,6 +408,17 @@ impl RuntimeResponse {
     }
 
     #[must_use]
+    pub fn with_unsupported_operation(
+        mut self,
+        operation_index: usize,
+        name: impl Into<String>,
+    ) -> Self {
+        self.unsupported_operations
+            .push(UnsupportedStructuredOperation::new(operation_index, name));
+        self
+    }
+
+    #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -418,6 +431,37 @@ impl RuntimeResponse {
     #[must_use]
     pub fn judgment_proposals(&self) -> &[JudgmentProposal] {
         &self.judgment_proposals
+    }
+
+    #[must_use]
+    pub fn unsupported_operations(&self) -> &[UnsupportedStructuredOperation] {
+        &self.unsupported_operations
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedStructuredOperation {
+    operation_index: usize,
+    name: String,
+}
+
+impl UnsupportedStructuredOperation {
+    #[must_use]
+    pub fn new(operation_index: usize, name: impl Into<String>) -> Self {
+        Self {
+            operation_index,
+            name: name.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_index(&self) -> usize {
+        self.operation_index
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -482,12 +526,46 @@ impl JudgmentRejection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StructuredOperationRejectionReason {
+    NotWhitelisted(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructuredOperationRejection {
+    operation_index: usize,
+    reason: StructuredOperationRejectionReason,
+}
+
+impl StructuredOperationRejection {
+    pub(crate) const fn new(
+        operation_index: usize,
+        reason: StructuredOperationRejectionReason,
+    ) -> Self {
+        Self {
+            operation_index,
+            reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_index(&self) -> usize {
+        self.operation_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &StructuredOperationRejectionReason {
+        &self.reason
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnOutcome {
     person_evidence_id: EvidenceId,
     counterpart_evidence_id: EvidenceId,
     person_classification: PersonTurnClassification,
     accepted_judgment_ids: Vec<ClaimId>,
     rejected_judgments: Vec<JudgmentRejection>,
+    rejected_operations: Vec<StructuredOperationRejection>,
     validated_citations: Vec<EvidenceCitation>,
 }
 
@@ -498,6 +576,7 @@ impl TurnOutcome {
         person_classification: PersonTurnClassification,
         accepted_judgment_ids: Vec<ClaimId>,
         rejected_judgments: Vec<JudgmentRejection>,
+        rejected_operations: Vec<StructuredOperationRejection>,
         validated_citations: Vec<EvidenceCitation>,
     ) -> Self {
         Self {
@@ -506,6 +585,7 @@ impl TurnOutcome {
             person_classification,
             accepted_judgment_ids,
             rejected_judgments,
+            rejected_operations,
             validated_citations,
         }
     }
@@ -533,6 +613,11 @@ impl TurnOutcome {
     #[must_use]
     pub fn rejected_judgments(&self) -> &[JudgmentRejection] {
         &self.rejected_judgments
+    }
+
+    #[must_use]
+    pub fn rejected_operations(&self) -> &[StructuredOperationRejection] {
+        &self.rejected_operations
     }
 
     #[must_use]

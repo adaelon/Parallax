@@ -13,10 +13,13 @@ mod scripted_runtime;
 pub use domain::{
     ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, EvidenceCitation, EvidenceId,
     JudgmentProposal, JudgmentRejection, JudgmentRejectionReason, PersonTurnClassification,
-    RuntimeRequest, RuntimeResponse, SessionId, Speaker, Timestamp, TurnOutcome, Uncertainty,
-    WorkingContext,
+    RuntimeRequest, RuntimeResponse, SessionId, Speaker, StructuredOperationRejection,
+    StructuredOperationRejectionReason, Timestamp, TurnOutcome, Uncertainty,
+    UnsupportedStructuredOperation, WorkingContext,
 };
 pub use in_memory::InMemoryRepository;
 pub use memory_loop::{CoreError, MemoryCore};
-pub use ports::{Clock, CounterpartRuntime, MemoryRepository, RepositoryError, RuntimeError};
+pub use ports::{
+    Clock, CounterpartRuntime, MemoryRepository, RepositoryError, RuntimeError, RuntimeErrorKind,
+};
 pub use scripted_runtime::{IncrementingClock, ScriptedRuntime};
