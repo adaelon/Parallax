@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::{
     Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus,
-    ConversationEvidence, EvidenceId, MemoryRepository, RepositoryError,
+    ConversationEvidence, EvidenceId, ForgetReceipt, ForgetRepository, ForgetTarget,
+    MemoryRepository, RepositoryError, Timestamp,
 };
 
 #[derive(Debug)]
@@ -11,6 +12,8 @@ pub struct InMemoryRepository {
     next_claim_id: u64,
     evidence: BTreeMap<EvidenceId, ConversationEvidence>,
     claims: BTreeMap<ClaimId, Claim>,
+    deletion_intents: BTreeMap<ForgetTarget, ForgetReceipt>,
+    next_deletion_intent_id: u64,
 }
 
 impl Default for InMemoryRepository {
@@ -27,7 +30,71 @@ impl InMemoryRepository {
             next_claim_id: 1,
             evidence: BTreeMap::new(),
             claims: BTreeMap::new(),
+            deletion_intents: BTreeMap::new(),
+            next_deletion_intent_id: 1,
         }
+    }
+}
+
+impl ForgetRepository for InMemoryRepository {
+    fn commit_forget(
+        &mut self,
+        target: ForgetTarget,
+        _requested_at: Timestamp,
+    ) -> Result<Option<ForgetReceipt>, RepositoryError> {
+        if let Some(receipt) = self.deletion_intents.get(&target) {
+            return Ok(Some(*receipt));
+        }
+        let ForgetTarget::ConversationEvidence(evidence_id) = target else {
+            return Ok(None);
+        };
+        if !self.evidence.contains_key(&evidence_id) {
+            return Ok(None);
+        }
+
+        let mut affected_claims = self
+            .claims
+            .values()
+            .filter(|claim| {
+                claim
+                    .support()
+                    .iter()
+                    .any(|citation| citation.evidence_id() == evidence_id)
+            })
+            .map(Claim::id)
+            .collect::<Vec<_>>();
+        loop {
+            let previous_len = affected_claims.len();
+            for claim in self.claims.values() {
+                let linked = claim
+                    .supersedes()
+                    .is_some_and(|id| affected_claims.contains(&id))
+                    || claim
+                        .superseded_by()
+                        .is_some_and(|id| affected_claims.contains(&id));
+                if linked && !affected_claims.contains(&claim.id()) {
+                    affected_claims.push(claim.id());
+                }
+            }
+            if affected_claims.len() == previous_len {
+                break;
+            }
+        }
+        for claim_id in &affected_claims {
+            self.claims.remove(claim_id);
+        }
+        self.evidence.remove(&evidence_id);
+
+        let receipt = ForgetReceipt::new(
+            self.next_deletion_intent_id,
+            target,
+            1 + affected_claims.len(),
+            0,
+            0,
+        );
+        self.next_deletion_intent_id += 1;
+        self.deletion_intents.insert(target, receipt);
+        Ok(Some(receipt))
     }
 }
 

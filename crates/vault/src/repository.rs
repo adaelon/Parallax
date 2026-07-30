@@ -6,8 +6,9 @@ use std::{
 
 use eam_core::{
     ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
-    ClaimStatus, ConversationEvidence, DisputeState, EvidenceCitation, EvidenceId,
-    MemoryRepository, RepositoryError, SessionId, Speaker, Timestamp, Uncertainty,
+    ClaimStatus, ConversationEvidence, DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt,
+    ForgetRepository, ForgetTarget, MemoryRepository, RepositoryError, SessionId, Speaker,
+    Timestamp, Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -71,6 +72,8 @@ const MAX_TEMPORAL_NEIGHBORS: usize = 4;
 const MAX_RELATION_NEIGHBORS: usize = 8;
 const MAX_UNDERSTANDING_CANDIDATES: usize = 128;
 const MAX_LONG_TERM_MEMORY_CANDIDATES: usize = 128;
+const FORGET_TARGET_CONVERSATION_EVIDENCE: i64 = 0;
+const FORGET_TARGET_ARCHIVED_EVIDENCE: i64 = 1;
 
 pub struct VaultRepository {
     connection: Option<Connection>,
@@ -113,9 +116,17 @@ impl VaultRepository {
         let object_store = ObjectStore::open(vault_root, vault_key.objects_key()?)?;
         object_store.cleanup_unreferenced(&referenced_object_ids(&connection)?)?;
 
-        let next_evidence_id = next_identifier(&connection, "conversation_evidence")?;
+        let next_evidence_id = next_identifier_with_deletion_watermark(
+            &connection,
+            "conversation_evidence",
+            FORGET_TARGET_CONVERSATION_EVIDENCE,
+        )?;
         let next_claim_id = next_identifier(&connection, "claims")?;
-        let next_archive_id = next_identifier(&connection, "archived_evidence")?;
+        let next_archive_id = next_identifier_with_deletion_watermark(
+            &connection,
+            "archived_evidence",
+            FORGET_TARGET_ARCHIVED_EVIDENCE,
+        )?;
 
         Ok(Self {
             connection: Some(connection),
@@ -191,6 +202,71 @@ impl VaultRepository {
                 },
             )
             .collect()
+    }
+
+    /// Lists committed deletion intents in replay order for S30 recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encrypted intent state is malformed or unreadable.
+    pub fn deletion_intents(&self) -> Result<Vec<ForgetReceipt>, VaultError> {
+        load_deletion_intents(self.connection())
+    }
+
+    fn forget_with_hook<F>(
+        &mut self,
+        target: ForgetTarget,
+        requested_at: Timestamp,
+        before_commit: F,
+    ) -> Result<Option<ForgetReceipt>, VaultError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), VaultError>,
+    {
+        if let Some(receipt) = load_deletion_intent(self.connection(), target)? {
+            if matches!(target, ForgetTarget::ArchivedEvidence(_)) {
+                self.object_store
+                    .cleanup_unreferenced(&referenced_object_ids(self.connection())?)?;
+            }
+            return Ok(Some(receipt));
+        }
+        if !forget_target_exists(self.connection(), target)? {
+            return Ok(None);
+        }
+
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        if let Some(receipt) = load_deletion_intent(&transaction, target)? {
+            transaction.commit()?;
+            return Ok(Some(receipt));
+        }
+        let intent_id = next_identifier(&transaction, "deletion_intents")?;
+        let counts = match target {
+            ForgetTarget::ConversationEvidence(evidence_id) => {
+                delete_conversation_evidence_closure(&transaction, evidence_id)?
+            }
+            ForgetTarget::ArchivedEvidence(archive_id) => {
+                delete_archived_evidence_closure(&transaction, archive_id)?
+            }
+        };
+        let receipt = ForgetReceipt::new(
+            intent_id,
+            target,
+            counts.authority,
+            counts.derived,
+            counts.object_references,
+        );
+        insert_deletion_intent(&transaction, receipt, requested_at)?;
+        before_commit(&transaction)?;
+        transaction.commit()?;
+
+        if matches!(target, ForgetTarget::ArchivedEvidence(_)) {
+            self.object_store
+                .cleanup_unreferenced(&referenced_object_ids(self.connection())?)?;
+        }
+        Ok(Some(receipt))
     }
 
     /// Decrypts one archived original inside the trusted Core boundary.
@@ -2972,6 +3048,17 @@ impl ClaimCorrectionRepository for VaultRepository {
     }
 }
 
+impl ForgetRepository for VaultRepository {
+    fn commit_forget(
+        &mut self,
+        target: ForgetTarget,
+        requested_at: Timestamp,
+    ) -> Result<Option<ForgetReceipt>, RepositoryError> {
+        self.forget_with_hook(target, requested_at, |_| Ok(()))
+            .map_err(repository_error)
+    }
+}
+
 impl HostLifecycleRepository for VaultRepository {
     fn begin_host_session(
         &mut self,
@@ -4578,20 +4665,7 @@ fn rebuild_retrieval_index(
 }
 
 fn clear_retrieval_index(transaction: &rusqlite::Transaction<'_>) -> Result<(), VaultError> {
-    for table in [
-        "retrieval_index_metadata",
-        "retrieval_block_vectors",
-        "retrieval_relation_edges",
-        "retrieval_entity_terms",
-        "retrieval_claim_terms",
-        "retrieval_claim_documents",
-        "retrieval_block_terms",
-        "retrieval_block_documents",
-        "retrieval_evidence_availability",
-    ] {
-        transaction.execute(&format!("DELETE FROM {table}"), [])?;
-    }
-    Ok(())
+    clear_retrieval_index_counted(transaction).map(|_| ())
 }
 
 fn insert_retrieval_blocks(
@@ -7270,6 +7344,765 @@ const fn decode_lineage_status(value: i64) -> Result<BlockLineageStatus, VaultEr
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ForgetClosureCounts {
+    authority: usize,
+    derived: usize,
+    object_references: usize,
+}
+
+fn forget_target_code(target: ForgetTarget) -> (i64, u64) {
+    match target {
+        ForgetTarget::ConversationEvidence(id) => (FORGET_TARGET_CONVERSATION_EVIDENCE, id.get()),
+        ForgetTarget::ArchivedEvidence(id) => (FORGET_TARGET_ARCHIVED_EVIDENCE, id),
+    }
+}
+
+fn decode_forget_target(kind: i64, id: i64) -> Result<ForgetTarget, VaultError> {
+    let id = u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    if id == 0 {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    match kind {
+        FORGET_TARGET_CONVERSATION_EVIDENCE => {
+            Ok(ForgetTarget::ConversationEvidence(EvidenceId::from_raw(id)))
+        }
+        FORGET_TARGET_ARCHIVED_EVIDENCE => Ok(ForgetTarget::ArchivedEvidence(id)),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+fn load_deletion_intents(connection: &Connection) -> Result<Vec<ForgetReceipt>, VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT id, target_kind, target_id, removed_authority_records,
+                removed_derived_records, released_object_references
+         FROM deletion_intents ORDER BY id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(id, kind, target_id, authority, derived, object_references)| {
+                Ok(ForgetReceipt::new(
+                    u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    decode_forget_target(kind, target_id)?,
+                    usize::try_from(authority).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    usize::try_from(derived).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    usize::try_from(object_references)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                ))
+            },
+        )
+        .collect()
+}
+
+fn load_deletion_intent(
+    connection: &Connection,
+    target: ForgetTarget,
+) -> Result<Option<ForgetReceipt>, VaultError> {
+    let (kind, target_id) = forget_target_code(target);
+    connection
+        .query_row(
+            "SELECT id, removed_authority_records, removed_derived_records,
+                    released_object_references
+             FROM deletion_intents WHERE target_kind = ?1 AND target_id = ?2",
+            params![kind, to_vault_sql_id(target_id)?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(id, authority, derived, object_references)| {
+            Ok(ForgetReceipt::new(
+                u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                target,
+                usize::try_from(authority).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                usize::try_from(derived).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                usize::try_from(object_references).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            ))
+        })
+        .transpose()
+}
+
+fn insert_deletion_intent(
+    transaction: &rusqlite::Transaction<'_>,
+    receipt: ForgetReceipt,
+    requested_at: Timestamp,
+) -> Result<(), VaultError> {
+    let (kind, target_id) = forget_target_code(receipt.target());
+    transaction.execute(
+        "INSERT INTO deletion_intents
+         (id, target_kind, target_id, requested_at, removed_authority_records,
+          removed_derived_records, released_object_references)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            to_vault_sql_id(receipt.deletion_intent_id())?,
+            kind,
+            to_vault_sql_id(target_id)?,
+            requested_at.as_millis(),
+            i64::try_from(receipt.removed_authority_records())
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            i64::try_from(receipt.removed_derived_records())
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            i64::try_from(receipt.released_object_references())
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn forget_target_exists(connection: &Connection, target: ForgetTarget) -> Result<bool, VaultError> {
+    let (table, id) = match target {
+        ForgetTarget::ConversationEvidence(id) => ("conversation_evidence", id.get()),
+        ForgetTarget::ArchivedEvidence(id) => ("archived_evidence", id),
+    };
+    let query = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?1)");
+    connection
+        .query_row(&query, [to_vault_sql_id(id)?], |row| row.get(0))
+        .map_err(VaultError::from)
+}
+
+struct ConversationForgetPlan {
+    evidence_id_sql: i64,
+    claim_ids: BTreeSet<u64>,
+    memory_ids: BTreeSet<u64>,
+    initial_impacted: bool,
+    identity_from: Option<i64>,
+    bundle_from: Option<i64>,
+}
+
+fn delete_conversation_evidence_closure(
+    transaction: &rusqlite::Transaction<'_>,
+    evidence_id: EvidenceId,
+) -> Result<ForgetClosureCounts, VaultError> {
+    let plan = plan_conversation_forget(transaction, evidence_id)?;
+    let mut counts = ForgetClosureCounts::default();
+    counts.derived += clear_retrieval_index_counted(transaction)?;
+    delete_bundle_and_identity_closure(transaction, &plan, &mut counts)?;
+    delete_memory_closure(transaction, &plan, &mut counts)?;
+    delete_conversation_claim_closure(transaction, &plan, &mut counts)?;
+    counts.authority += transaction.execute(
+        "DELETE FROM conversation_evidence WHERE id = ?1",
+        [plan.evidence_id_sql],
+    )?;
+    Ok(counts)
+}
+
+fn plan_conversation_forget(
+    transaction: &rusqlite::Transaction<'_>,
+    evidence_id: EvidenceId,
+) -> Result<ConversationForgetPlan, VaultError> {
+    let evidence_id_sql = to_vault_sql_id(evidence_id.get())?;
+    let claim_ids = query_u64_ids(
+        transaction,
+        "WITH RECURSIVE affected(id) AS (
+             SELECT claim_id FROM claim_support WHERE evidence_id = ?1
+             UNION
+             SELECT child.id FROM claims child
+             JOIN affected parent ON child.supersedes_claim_id = parent.id
+             UNION
+             SELECT parent.supersedes_claim_id FROM claims parent
+             JOIN affected child ON parent.id = child.id
+             WHERE parent.supersedes_claim_id IS NOT NULL
+         ) SELECT id FROM affected ORDER BY id",
+        evidence_id_sql,
+    )?;
+    let claim_predicate = id_predicate("claim_id", &claim_ids);
+    let initial_impacted = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM initial_self_introduction
+             WHERE evidence_id = ?1 OR {claim_predicate})"
+        ),
+        [evidence_id_sql],
+        |row| row.get(0),
+    )?;
+    let identity_from = earliest_identity_version(transaction, evidence_id_sql, initial_impacted)?;
+    let memory_ids = query_u64_ids(
+        transaction,
+        &format!(
+            "SELECT memory_id FROM long_term_memory_sources WHERE {claim_predicate}
+             UNION SELECT d.memory_id FROM memory_disputes d
+               JOIN memory_dispute_counter_evidence e ON e.dispute_id = d.id
+               WHERE e.evidence_id = ?1
+             UNION SELECT d.memory_id FROM memory_disputes d
+               JOIN memory_dispute_review_evidence e ON e.dispute_id = d.id
+               WHERE e.evidence_id = ?1 ORDER BY memory_id"
+        ),
+        evidence_id_sql,
+    )?;
+    let bundle_from =
+        earliest_bundle_version(transaction, initial_impacted, identity_from, &claim_ids)?;
+    Ok(ConversationForgetPlan {
+        evidence_id_sql,
+        claim_ids,
+        memory_ids,
+        initial_impacted,
+        identity_from,
+        bundle_from,
+    })
+}
+
+fn earliest_identity_version(
+    transaction: &rusqlite::Transaction<'_>,
+    evidence_id: i64,
+    initial_impacted: bool,
+) -> Result<Option<i64>, VaultError> {
+    let (query, parameter) = if initial_impacted {
+        ("SELECT MIN(version) FROM identity_state_versions", None)
+    } else {
+        (
+            "SELECT MIN(identity_version) FROM identity_state_evidence WHERE evidence_id = ?1",
+            Some(evidence_id),
+        )
+    };
+    match parameter {
+        Some(value) => transaction.query_row(query, [value], |row| row.get(0)),
+        None => transaction.query_row(query, [], |row| row.get(0)),
+    }
+    .map_err(VaultError::from)
+}
+
+fn earliest_bundle_version(
+    transaction: &rusqlite::Transaction<'_>,
+    initial_impacted: bool,
+    identity_from: Option<i64>,
+    claim_ids: &BTreeSet<u64>,
+) -> Result<Option<i64>, VaultError> {
+    let mut earliest = if initial_impacted {
+        transaction.query_row("SELECT MIN(version) FROM self_bundle_versions", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+    } else {
+        None
+    };
+    if let Some(identity_from) = identity_from {
+        let candidate = transaction.query_row(
+            "SELECT MIN(version) FROM self_bundle_versions WHERE identity_state_version >= ?1",
+            [identity_from],
+            |row| row.get(0),
+        )?;
+        earliest = min_option(earliest, candidate);
+    }
+    if !claim_ids.is_empty() {
+        let candidate = transaction.query_row(
+            &format!(
+                "SELECT MIN(bundle_version) FROM self_bundle_beliefs WHERE {}",
+                id_predicate("claim_id", claim_ids)
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        earliest = min_option(earliest, candidate);
+    }
+    Ok(earliest)
+}
+
+fn delete_bundle_and_identity_closure(
+    transaction: &rusqlite::Transaction<'_>,
+    plan: &ConversationForgetPlan,
+    counts: &mut ForgetClosureCounts,
+) -> Result<(), VaultError> {
+    if let Some(from) = plan.bundle_from {
+        for table in [
+            "self_bundle_experiences",
+            "self_bundle_beliefs",
+            "self_bundle_pending_intentions",
+        ] {
+            counts.derived += transaction.execute(
+                &format!("DELETE FROM {table} WHERE bundle_version >= ?1"),
+                [from],
+            )?;
+        }
+        counts.derived +=
+            delete_versions_descending(transaction, "self_bundle_versions", "version", from)?;
+    }
+    if plan.initial_impacted {
+        counts.authority += transaction.execute("DELETE FROM initial_self_introduction", [])?;
+    }
+    if let Some(from) = plan.identity_from {
+        counts.derived += transaction.execute(
+            "DELETE FROM identity_state_evidence WHERE identity_version >= ?1",
+            [from],
+        )?;
+        counts.derived +=
+            delete_versions_descending(transaction, "identity_state_versions", "version", from)?;
+    }
+    Ok(())
+}
+
+fn delete_memory_closure(
+    transaction: &rusqlite::Transaction<'_>,
+    plan: &ConversationForgetPlan,
+    counts: &mut ForgetClosureCounts,
+) -> Result<(), VaultError> {
+    let memory_predicate = id_predicate("memory_id", &plan.memory_ids);
+    counts.derived += transaction.execute(
+        &format!(
+            "DELETE FROM claim_correction_memory_work_items WHERE {} OR {memory_predicate}",
+            id_predicate("correction_claim_id", &plan.claim_ids)
+        ),
+        [],
+    )?;
+    if plan.memory_ids.is_empty() {
+        return Ok(());
+    }
+    let dispute_ids = query_u64_ids_without_param(
+        transaction,
+        &format!("SELECT id FROM memory_disputes WHERE {memory_predicate}"),
+    )?;
+    for table in [
+        "memory_dispute_terms",
+        "memory_dispute_counter_evidence",
+        "memory_dispute_review_evidence",
+    ] {
+        counts.derived += transaction.execute(
+            &format!(
+                "DELETE FROM {table} WHERE {}",
+                id_predicate("dispute_id", &dispute_ids)
+            ),
+            [],
+        )?;
+    }
+    counts.derived += transaction.execute(
+        &format!("DELETE FROM memory_disputes WHERE {memory_predicate}"),
+        [],
+    )?;
+    for table in [
+        "long_term_memory_terms",
+        "long_term_memory_state_events",
+        "long_term_memory_sources",
+    ] {
+        counts.derived +=
+            transaction.execute(&format!("DELETE FROM {table} WHERE {memory_predicate}"), [])?;
+    }
+    counts.derived += delete_memory_versions_descending(transaction, &plan.memory_ids)?;
+    counts.derived += transaction.execute(
+        &format!(
+            "DELETE FROM long_term_memories WHERE {}",
+            id_predicate("id", &plan.memory_ids)
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+fn delete_conversation_claim_closure(
+    transaction: &rusqlite::Transaction<'_>,
+    plan: &ConversationForgetPlan,
+    counts: &mut ForgetClosureCounts,
+) -> Result<(), VaultError> {
+    for table in [
+        "memory_dispute_counter_evidence",
+        "memory_dispute_review_evidence",
+    ] {
+        counts.derived += transaction.execute(
+            &format!("DELETE FROM {table} WHERE evidence_id = ?1"),
+            [plan.evidence_id_sql],
+        )?;
+    }
+    if plan.claim_ids.is_empty() {
+        return Ok(());
+    }
+    let predicate = id_predicate("claim_id", &plan.claim_ids);
+    counts.derived += transaction.execute(
+        &format!("DELETE FROM claim_state_events WHERE {predicate}"),
+        [],
+    )?;
+    counts.authority +=
+        transaction.execute(&format!("DELETE FROM claim_support WHERE {predicate}"), [])?;
+    counts.authority += delete_claims_leaf_first(transaction, &plan.claim_ids)?;
+    Ok(())
+}
+
+struct ArchivedForgetPlan {
+    source_record_id: i64,
+    evidence_ids: BTreeSet<u64>,
+    projection_ids: BTreeSet<u64>,
+    batch_ids: BTreeSet<u64>,
+}
+
+fn delete_archived_evidence_closure(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: u64,
+) -> Result<ForgetClosureCounts, VaultError> {
+    let plan = plan_archived_forget(transaction, archive_id)?;
+    let mut counts = ForgetClosureCounts {
+        object_references: plan.evidence_ids.len(),
+        ..ForgetClosureCounts::default()
+    };
+    counts.derived += clear_retrieval_index_counted(transaction)?;
+    delete_archived_derivatives(transaction, &plan, &mut counts)?;
+    delete_archived_authority(transaction, &plan, &mut counts)?;
+    Ok(counts)
+}
+
+fn plan_archived_forget(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: u64,
+) -> Result<ArchivedForgetPlan, VaultError> {
+    let source_record_id = transaction
+        .query_row(
+            "SELECT source_record_id FROM source_record_versions WHERE evidence_id = ?1",
+            [to_vault_sql_id(archive_id)?],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let evidence_ids = query_u64_ids(
+        transaction,
+        "SELECT evidence_id FROM source_record_versions WHERE source_record_id = ?1",
+        source_record_id,
+    )?;
+    let evidence_predicate = id_predicate("evidence_id", &evidence_ids);
+    let revision_ids = query_u64_ids_without_param(
+        transaction,
+        &format!("SELECT id FROM extraction_revisions WHERE {evidence_predicate}"),
+    )?;
+    let projection_ids = query_u64_ids_without_param(
+        transaction,
+        &format!(
+            "SELECT projection_id FROM understanding_projection_sources WHERE {evidence_predicate}
+             UNION SELECT projection_id FROM understanding_projection_events WHERE {}",
+            id_predicate("reason_evidence_id", &evidence_ids)
+        ),
+    )?;
+    let batch_ids = query_u64_ids_without_param(
+        transaction,
+        &format!(
+            "SELECT id FROM block_lineage_batches WHERE source_record_id = {source_record_id}
+             OR {} OR {}",
+            id_predicate("from_revision_id", &revision_ids),
+            id_predicate("to_revision_id", &revision_ids)
+        ),
+    )?;
+    Ok(ArchivedForgetPlan {
+        source_record_id,
+        evidence_ids,
+        projection_ids,
+        batch_ids,
+    })
+}
+
+fn delete_archived_derivatives(
+    transaction: &rusqlite::Transaction<'_>,
+    plan: &ArchivedForgetPlan,
+    counts: &mut ForgetClosureCounts,
+) -> Result<(), VaultError> {
+    if !plan.projection_ids.is_empty() {
+        counts.derived += transaction.execute(
+            &format!(
+                "DELETE FROM understanding_projections WHERE {}",
+                id_predicate("id", &plan.projection_ids)
+            ),
+            [],
+        )?;
+    }
+    if !plan.batch_ids.is_empty() {
+        let predicate = id_predicate("batch_id", &plan.batch_ids);
+        for table in [
+            "incremental_work_items",
+            "block_lineage_candidates",
+            "block_lineages",
+        ] {
+            counts.derived +=
+                transaction.execute(&format!("DELETE FROM {table} WHERE {predicate}"), [])?;
+        }
+        counts.authority += transaction.execute(
+            &format!(
+                "DELETE FROM block_lineage_batches WHERE {}",
+                id_predicate("id", &plan.batch_ids)
+            ),
+            [],
+        )?;
+    }
+    counts.derived += transaction.execute(
+        &format!(
+            "DELETE FROM obsidian_relation_resolutions WHERE {} OR resolved_source_record_id = {}",
+            id_predicate("evidence_id", &plan.evidence_ids),
+            plan.source_record_id
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+fn delete_archived_authority(
+    transaction: &rusqlite::Transaction<'_>,
+    plan: &ArchivedForgetPlan,
+    counts: &mut ForgetClosureCounts,
+) -> Result<(), VaultError> {
+    let evidence_predicate = id_predicate("evidence_id", &plan.evidence_ids);
+    for table in [
+        "obsidian_properties",
+        "obsidian_tags",
+        "obsidian_aliases",
+        "obsidian_relations",
+    ] {
+        counts.authority += transaction.execute(
+            &format!("DELETE FROM {table} WHERE {evidence_predicate}"),
+            [],
+        )?;
+    }
+    counts.authority += delete_evidence_blocks_leaf_first(transaction, &plan.evidence_ids)?;
+    counts.authority += transaction.execute(
+        &format!("DELETE FROM extraction_revisions WHERE {evidence_predicate}"),
+        [],
+    )?;
+    let evidence_set = id_set(&plan.evidence_ids);
+    for table in ["markdown_parse_artifacts", "markdown_parse_attempts"] {
+        counts.authority += transaction.execute(
+            &format!("DELETE FROM {table} WHERE archive_id IN {evidence_set}"),
+            [],
+        )?;
+    }
+    counts.authority += transaction.execute(
+        &format!("DELETE FROM source_record_versions WHERE {evidence_predicate}"),
+        [],
+    )?;
+    counts.authority += transaction.execute(
+        &format!("DELETE FROM archived_evidence WHERE id IN {evidence_set}"),
+        [],
+    )?;
+    counts.authority += transaction.execute(
+        &format!(
+            "DELETE FROM source_record_state_events WHERE source_record_id = {}",
+            plan.source_record_id
+        ),
+        [],
+    )?;
+    counts.authority += transaction.execute(
+        &format!(
+            "DELETE FROM source_records WHERE id = {}",
+            plan.source_record_id
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+fn clear_retrieval_index_counted(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<usize, VaultError> {
+    let mut count = 0;
+    for table in [
+        "retrieval_index_metadata",
+        "retrieval_block_vectors",
+        "retrieval_relation_edges",
+        "retrieval_entity_terms",
+        "retrieval_claim_terms",
+        "retrieval_claim_documents",
+        "retrieval_block_terms",
+        "retrieval_block_documents",
+        "retrieval_evidence_availability",
+    ] {
+        count += transaction.execute(&format!("DELETE FROM {table}"), [])?;
+    }
+    Ok(count)
+}
+
+fn query_u64_ids(
+    connection: &Connection,
+    sql: &str,
+    parameter: i64,
+) -> Result<BTreeSet<u64>, VaultError> {
+    let mut statement = connection.prepare(sql)?;
+    statement
+        .query_map([parameter], |row| row.get::<_, i64>(0))?
+        .map(|value| {
+            let value = value?;
+            u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(VaultError::from)
+}
+
+fn query_u64_ids_without_param(
+    connection: &Connection,
+    sql: &str,
+) -> Result<BTreeSet<u64>, VaultError> {
+    let mut statement = connection.prepare(sql)?;
+    statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .map(|value| {
+            let value = value?;
+            u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(VaultError::from)
+}
+
+fn id_set(ids: &BTreeSet<u64>) -> String {
+    if ids.is_empty() {
+        return "(NULL)".to_owned();
+    }
+    format!(
+        "({})",
+        ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+    )
+}
+
+fn id_predicate(column: &str, ids: &BTreeSet<u64>) -> String {
+    if ids.is_empty() {
+        "0".to_owned()
+    } else {
+        format!("{column} IN {}", id_set(ids))
+    }
+}
+
+const fn min_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if left < right { left } else { right }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn delete_versions_descending(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    from: i64,
+) -> Result<usize, VaultError> {
+    let query = format!("SELECT {column} FROM {table} WHERE {column} >= ?1 ORDER BY {column} DESC");
+    let ids = transaction
+        .prepare(&query)?
+        .query_map([from], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut deleted = 0;
+    for id in ids {
+        deleted +=
+            transaction.execute(&format!("DELETE FROM {table} WHERE {column} = ?1"), [id])?;
+    }
+    Ok(deleted)
+}
+
+fn delete_memory_versions_descending(
+    transaction: &rusqlite::Transaction<'_>,
+    memory_ids: &BTreeSet<u64>,
+) -> Result<usize, VaultError> {
+    let predicate = id_predicate("memory_id", memory_ids);
+    let rows = transaction
+        .prepare(&format!(
+            "SELECT memory_id, version FROM long_term_memory_versions
+             WHERE {predicate} ORDER BY memory_id, version DESC"
+        ))?
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut deleted = 0;
+    for (memory_id, version) in rows {
+        deleted += transaction.execute(
+            "DELETE FROM long_term_memory_versions WHERE memory_id = ?1 AND version = ?2",
+            params![memory_id, version],
+        )?;
+    }
+    Ok(deleted)
+}
+
+fn delete_claims_leaf_first(
+    transaction: &rusqlite::Transaction<'_>,
+    claim_ids: &BTreeSet<u64>,
+) -> Result<usize, VaultError> {
+    let mut remaining = claim_ids.clone();
+    let mut deleted = 0;
+    while !remaining.is_empty() {
+        let remaining_predicate = id_predicate("id", &remaining);
+        let parents = transaction
+            .prepare(&format!(
+                "SELECT supersedes_claim_id FROM claims
+                 WHERE {remaining_predicate} AND supersedes_claim_id IS NOT NULL"
+            ))?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .map(|value| {
+                let value = value?;
+                u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let leaves = remaining
+            .iter()
+            .copied()
+            .filter(|id| !parents.contains(id))
+            .collect::<Vec<_>>();
+        if leaves.is_empty() {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        for id in leaves {
+            deleted +=
+                transaction.execute("DELETE FROM claims WHERE id = ?1", [to_vault_sql_id(id)?])?;
+            remaining.remove(&id);
+        }
+    }
+    Ok(deleted)
+}
+
+fn delete_evidence_blocks_leaf_first(
+    transaction: &rusqlite::Transaction<'_>,
+    evidence_ids: &BTreeSet<u64>,
+) -> Result<usize, VaultError> {
+    let predicate = id_predicate("evidence_id", evidence_ids);
+    let mut deleted = 0;
+    loop {
+        let changed = transaction.execute(
+            &format!(
+                "DELETE FROM evidence_blocks
+                 WHERE {predicate}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM evidence_blocks child
+                       WHERE child.parent_id = evidence_blocks.id
+                         AND child.extraction_revision_id = evidence_blocks.extraction_revision_id
+                   )"
+            ),
+            [],
+        )?;
+        deleted += changed;
+        let remaining: i64 = transaction.query_row(
+            &format!("SELECT COUNT(*) FROM evidence_blocks WHERE {predicate}"),
+            [],
+            |row| row.get(0),
+        )?;
+        if remaining == 0 {
+            return Ok(deleted);
+        }
+        if changed == 0 {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+    }
+}
+
+fn next_identifier_with_deletion_watermark(
+    connection: &Connection,
+    table: &str,
+    target_kind: i64,
+) -> Result<u64, VaultError> {
+    let query = format!(
+        "SELECT MAX(value) FROM (
+             SELECT COALESCE(MAX(id), 0) AS value FROM {table}
+             UNION ALL
+             SELECT COALESCE(MAX(target_id), 0) AS value
+             FROM deletion_intents WHERE target_kind = ?1
+         )"
+    );
+    let maximum: i64 = connection.query_row(&query, [target_kind], |row| row.get(0))?;
+    let maximum = u64::try_from(maximum).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    maximum
+        .checked_add(1)
+        .ok_or(VaultError::InvalidKeyOrCorrupt)
+}
+
 fn next_identifier(connection: &Connection, table: &str) -> Result<u64, VaultError> {
     let query = format!("SELECT COALESCE(MAX(id), 0) FROM {table}");
     let maximum: i64 = connection.query_row(&query, [], |row| row.get(0))?;
@@ -7950,6 +8783,74 @@ mod tests {
             VaultRepository::open(directory.path(), VaultKey::new([0x29; 32])).unwrap();
         assert!(repository.archived_evidence().unwrap().is_empty());
         assert_eq!(repository.object_store.object_file_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn forget_failure_rolls_back_intent_authority_and_retrieval_across_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let key = [0x39; 32];
+        let mut repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        let receipt = repository
+            .archive(ArchiveInput {
+                source_locator: "inbox/forget-interrupted.md",
+                content: b"# Atomic Forget\n\nStill searchable after rollback.\n",
+                status: ArchiveStatus::Archived,
+                archived_at_millis: 10,
+            })
+            .unwrap();
+        eam_ingestion::process_archived_markdown(
+            &mut repository,
+            receipt.archive_id,
+            eam_markdown::ParseLimits::default(),
+            20,
+            21,
+        )
+        .unwrap();
+        eam_ingestion::materialize_accepted_markdown(
+            &mut repository,
+            receipt.archive_id,
+            eam_markdown::CONTRACT_VERSION,
+        )
+        .unwrap();
+        let query = RetrievalQuery::lexical("searchable");
+        assert!(
+            !eam_retrieval::retrieve(&mut repository, &query)
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
+
+        let result = repository.forget_with_hook(
+            ForgetTarget::ArchivedEvidence(receipt.archive_id),
+            Timestamp::from_millis(30),
+            |_| Err(VaultError::ForgetInterrupted),
+        );
+
+        assert!(matches!(result, Err(VaultError::ForgetInterrupted)));
+        assert!(repository.deletion_intents().unwrap().is_empty());
+        assert_eq!(
+            repository
+                .read_archived_content(receipt.archive_id)
+                .unwrap(),
+            b"# Atomic Forget\n\nStill searchable after rollback.\n"
+        );
+        assert!(
+            !eam_retrieval::retrieve(&mut repository, &query)
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
+        repository.close().unwrap();
+
+        let mut repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        assert!(repository.deletion_intents().unwrap().is_empty());
+        assert!(
+            !eam_retrieval::retrieve(&mut repository, &query)
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
     }
 
     #[test]

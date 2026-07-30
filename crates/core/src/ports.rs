@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceId,
-    PersonTurnClassification, RuntimeRequest, RuntimeResponse, Timestamp,
+    Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceId, ForgetReceipt,
+    ForgetTarget, PersonTurnClassification, RuntimeRequest, RuntimeResponse, Timestamp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +151,21 @@ pub trait ClaimCorrectionRepository: MemoryRepository {
         evidence: ConversationEvidence,
         replacement: Claim,
     ) -> Result<ClaimCorrectionReceipt, RepositoryError>;
+}
+
+pub trait ForgetRepository: MemoryRepository {
+    /// Atomically persists a deletion intent and removes the complete active
+    /// authority/derived closure for its target. A repeated committed target
+    /// returns the original receipt; `None` means it never existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without exposing a partially forgotten target.
+    fn commit_forget(
+        &mut self,
+        target: ForgetTarget,
+        requested_at: Timestamp,
+    ) -> Result<Option<ForgetReceipt>, RepositoryError>;
 }
 
 /// Runtime implementations receive only typed values selected by the trusted

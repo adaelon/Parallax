@@ -3,9 +3,10 @@ use std::{collections::BTreeSet, error::Error, fmt};
 use crate::{
     ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
     ClaimStatus, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
-    JudgmentProposal, JudgmentRejection, JudgmentRejectionReason, MemoryRepository,
-    PersonTurnClassification, RepositoryError, RuntimeError, RuntimeRequest, SessionId, Speaker,
-    StructuredOperationRejection, StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
+    ForgetReceipt, ForgetRepository, ForgetRequest, JudgmentProposal, JudgmentRejection,
+    JudgmentRejectionReason, MemoryRepository, PersonTurnClassification, RepositoryError,
+    RuntimeError, RuntimeRequest, SessionId, Speaker, StructuredOperationRejection,
+    StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +18,8 @@ pub enum CoreError {
     ClaimNotFound(ClaimId),
     ClaimNotPerson(ClaimId),
     ClaimNotCurrent(ClaimId),
+    ForgetNotConfirmed,
+    ForgetTargetNotFound,
     MissingEvidence(EvidenceId),
     InvalidResponseCitation(JudgmentRejectionReason),
     Repository(RepositoryError),
@@ -37,6 +40,10 @@ impl fmt::Display for CoreError {
                 write!(formatter, "claim {} is not owned by the person", id.get())
             }
             Self::ClaimNotCurrent(id) => write!(formatter, "claim {} is not current", id.get()),
+            Self::ForgetNotConfirmed => {
+                formatter.write_str("forget requires explicit person confirmation")
+            }
+            Self::ForgetTargetNotFound => formatter.write_str("forget target does not exist"),
             Self::MissingEvidence(id) => write!(formatter, "evidence {} does not exist", id.get()),
             Self::InvalidResponseCitation(reason) => {
                 write!(
@@ -47,6 +54,29 @@ impl fmt::Display for CoreError {
             Self::Repository(error) => write!(formatter, "repository error: {error}"),
             Self::Runtime(error) => write!(formatter, "runtime error: {error}"),
         }
+    }
+}
+
+impl<R, T, C> MemoryCore<R, T, C>
+where
+    R: ForgetRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    /// Applies one explicitly confirmed forget command as an atomic deletion
+    /// intent plus target closure.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing person confirmation, unknown targets, or an adapter
+    /// failure without allocating a deletion intent in Core.
+    pub fn forget(&mut self, request: ForgetRequest) -> Result<ForgetReceipt, CoreError> {
+        if !request.confirmed_by_person() {
+            return Err(CoreError::ForgetNotConfirmed);
+        }
+        self.repository
+            .commit_forget(request.target(), self.clock.now())?
+            .ok_or(CoreError::ForgetTargetNotFound)
     }
 }
 

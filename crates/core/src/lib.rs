@@ -13,17 +13,17 @@ mod scripted_runtime;
 pub use domain::{
     ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimId, ClaimOwner, ClaimStatus,
     ConversationEvidence, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId,
-    FrozenEvidenceBlock, FrozenLedgerClaim, FrozenMemoryDispute, FrozenRetrievalWindow,
-    JudgmentProposal, JudgmentRejection, JudgmentRejectionReason, PersonTurnClassification,
-    RetrievalSnapshot, RetrievedContextItem, RuntimeRequest, RuntimeResponse, SessionId,
-    SourceCurrentness, Speaker, StructuredOperationRejection, StructuredOperationRejectionReason,
-    Timestamp, TurnOutcome, Uncertainty, UnsupportedStructuredOperation, WorkingContext,
-    WorkingContextError,
+    ForgetReceipt, ForgetRequest, ForgetTarget, FrozenEvidenceBlock, FrozenLedgerClaim,
+    FrozenMemoryDispute, FrozenRetrievalWindow, JudgmentProposal, JudgmentRejection,
+    JudgmentRejectionReason, PersonTurnClassification, RetrievalSnapshot, RetrievedContextItem,
+    RuntimeRequest, RuntimeResponse, SessionId, SourceCurrentness, Speaker,
+    StructuredOperationRejection, StructuredOperationRejectionReason, Timestamp, TurnOutcome,
+    Uncertainty, UnsupportedStructuredOperation, WorkingContext, WorkingContextError,
 };
 pub use in_memory::InMemoryRepository;
 pub use memory_loop::{CoreError, MemoryCore};
 pub use ports::{
-    ClaimCorrectionRepository, Clock, CounterpartRuntime, MemoryRepository, RepositoryError,
-    RuntimeError, RuntimeErrorKind, SystemClock,
+    ClaimCorrectionRepository, Clock, CounterpartRuntime, ForgetRepository, MemoryRepository,
+    RepositoryError, RuntimeError, RuntimeErrorKind, SystemClock,
 };
 pub use scripted_runtime::{IncrementingClock, ScriptedRuntime};

@@ -10,6 +10,7 @@ pub enum VaultError {
     EntropyUnavailable,
     ExistingVaultWithoutKeyMetadata,
     ExtractionInterrupted,
+    ForgetInterrupted,
     LineageInterrupted,
     InvalidKeyOrCorrupt,
     KeyProtectionFailed,
@@ -41,6 +42,9 @@ impl fmt::Display for VaultError {
             }
             Self::ExtractionInterrupted => {
                 formatter.write_str("extraction database commit was interrupted")
+            }
+            Self::ForgetInterrupted => {
+                formatter.write_str("forget database commit was interrupted")
             }
             Self::LineageInterrupted => {
                 formatter.write_str("block lineage database commit was interrupted")
@@ -88,6 +92,7 @@ impl Error for VaultError {
             | Self::EntropyUnavailable
             | Self::ExistingVaultWithoutKeyMetadata
             | Self::ExtractionInterrupted
+            | Self::ForgetInterrupted
             | Self::LineageInterrupted
             | Self::InvalidKeyOrCorrupt
             | Self::KeyProtectionFailed

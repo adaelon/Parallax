@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 15;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 16;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1027,6 +1027,25 @@ CREATE INDEX retrieval_claim_status_lookup
     ON retrieval_claim_documents(claim_status, claim_id);
 ";
 
+const MIGRATION_16: &str = r"
+CREATE TABLE deletion_intents (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    target_kind INTEGER NOT NULL CHECK (target_kind IN (0, 1)),
+    target_id INTEGER NOT NULL CHECK (target_id > 0),
+    requested_at INTEGER NOT NULL,
+    removed_authority_records INTEGER NOT NULL
+        CHECK (removed_authority_records >= 0),
+    removed_derived_records INTEGER NOT NULL
+        CHECK (removed_derived_records >= 0),
+    released_object_references INTEGER NOT NULL
+        CHECK (released_object_references >= 0),
+    UNIQUE (target_kind, target_id)
+) STRICT;
+
+CREATE INDEX deletion_intents_target
+    ON deletion_intents(target_kind, target_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1059,6 +1078,7 @@ where
             13 => transaction.execute_batch(MIGRATION_13)?,
             14 => transaction.execute_batch(MIGRATION_14)?,
             15 => transaction.execute_batch(MIGRATION_15)?,
+            16 => transaction.execute_batch(MIGRATION_16)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1873,5 +1893,61 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_forget_migration_keeps_claim_correction_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+            MIGRATION_12,
+            MIGRATION_13,
+            MIGRATION_14,
+            MIGRATION_15,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 15).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 16 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(16))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'deletion_intents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
     }
 }

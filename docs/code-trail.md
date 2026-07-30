@@ -1,5 +1,36 @@
 # 代码链路
 
+## 2026-07-30 S19-3 交叉回归加固与全仓门禁
+
+**触达**:
+- `crates/vault/src/repository.rs:plan_conversation_forget/plan_archived_forget` — 先按真实外键依赖收集对话 Claim/记忆/争议/身份闭包与稳定归档来源全版本闭包，再按依赖顺序删除。
+- `crates/vault/src/repository.rs:next_identifier_with_deletion_watermark` — 把已提交删除意图纳入对话证据与归档 ID 水位，阻止重启后复用遗忘目标 ID。
+- `crates/vault/tests/forget_persistence.rs` — 交叉覆盖理解投影、多版本来源、纠错 Claim 链、长期记忆、争议、current/historical 双关闭、共享对象与跨重启连续性。
+- `docs/architecture.md:§9.19` — 固化 S19 文件入口、事务删除流程、对象清理故障边界与 S30 非目标。
+
+**入口**：任一对话证据或归档版本被本人确认遗忘后，Core 只经 `ForgetRepository` 进入单事务闭包删除；陌生会话从架构 §9.19 回到精确符号与测试。
+**测试**：全仓 Rust 176/176、Vault 72/72、workspace clippy、fmt、desktop-app all-targets check、3 个变更 Markdown 的 101 个本地链接及 `git diff --check` 全部通过。
+
+## 2026-07-30 S19-2 schema v16 与 Vault 原子遗忘传播
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_16` — 持久化按目标唯一、可供 S30 顺序重放的 `deletion_intents`，迁移整体回滚。
+- `crates/vault/src/repository.rs:VaultRepository::forget_with_hook` — 在单一 SQLCipher 事务内删除对话或稳定归档来源闭包、清空可重建索引，并在提交后清理零引用密文。
+- `crates/vault/src/repository.rs:delete_conversation_evidence_closure/delete_archived_evidence_closure` — 处理 Claim 取代链、记忆/争议、身份派生、块谱系、理解投影与对象引用依赖顺序。
+
+**入口**：`ForgetRepository::commit_forget` 由 Core 确认门禁调用；`VaultRepository::deletion_intents` 提供恢复重放顺序。
+**测试**：`cargo test -p vault --test forget_persistence --no-fail-fast` 5/5，通过 current/historical 双关闭、理解投影、多版本来源、纠错/记忆/争议链、跨重启删除状态和共享对象零引用清理；`cargo test -p vault forget --no-fail-fast` 通过 schema v16 与故障回滚单测。
+
+## 2026-07-30 S19-1 显式遗忘领域契约
+
+**触达**:
+- `crates/core/src/domain.rs:ForgetTarget/ForgetRequest/ForgetReceipt` — 区分对话证据与已归档证据目标，并携带本人确认和删除意图回执。
+- `crates/core/src/ports.rs:ForgetRepository::commit_forget`、`crates/core/src/memory_loop.rs:MemoryCore::forget` — 冻结幂等原子删除仓储契约与 Core 本人确认门禁。
+- `crates/core/src/in_memory.rs:ForgetRepository` — 以内存适配器验证对话证据及其 Claim 版本链删除闭包。
+
+**入口**：本人提交 `ForgetRequest`；Core 拒绝未确认或不存在目标，确认后只通过 `ForgetRepository` 原子提交。
+**测试**：`cargo test -p core --test forget --no-fail-fast` 覆盖未确认零写入、确认删除、重复幂等和不存在目标拒绝。
+
 ## 2026-07-30 S18-3 交叉回归加固与全仓门禁
 
 **触达**:

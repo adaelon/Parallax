@@ -36,6 +36,101 @@ impl ClaimId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ForgetTarget {
+    ConversationEvidence(EvidenceId),
+    ArchivedEvidence(u64),
+}
+
+impl ForgetTarget {
+    #[must_use]
+    pub const fn identifier(self) -> u64 {
+        match self {
+            Self::ConversationEvidence(id) => id.get(),
+            Self::ArchivedEvidence(id) => id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForgetRequest {
+    target: ForgetTarget,
+    confirmed_by_person: bool,
+}
+
+impl ForgetRequest {
+    #[must_use]
+    pub const fn new(target: ForgetTarget, confirmed_by_person: bool) -> Self {
+        Self {
+            target,
+            confirmed_by_person,
+        }
+    }
+
+    #[must_use]
+    pub const fn target(self) -> ForgetTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn confirmed_by_person(self) -> bool {
+        self.confirmed_by_person
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForgetReceipt {
+    deletion_intent_id: u64,
+    target: ForgetTarget,
+    removed_authority_records: usize,
+    removed_derived_records: usize,
+    released_object_references: usize,
+}
+
+impl ForgetReceipt {
+    #[must_use]
+    pub const fn new(
+        deletion_intent_id: u64,
+        target: ForgetTarget,
+        removed_authority_records: usize,
+        removed_derived_records: usize,
+        released_object_references: usize,
+    ) -> Self {
+        Self {
+            deletion_intent_id,
+            target,
+            removed_authority_records,
+            removed_derived_records,
+            released_object_references,
+        }
+    }
+
+    #[must_use]
+    pub const fn deletion_intent_id(self) -> u64 {
+        self.deletion_intent_id
+    }
+
+    #[must_use]
+    pub const fn target(self) -> ForgetTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn removed_authority_records(self) -> usize {
+        self.removed_authority_records
+    }
+
+    #[must_use]
+    pub const fn removed_derived_records(self) -> usize {
+        self.removed_derived_records
+    }
+
+    #[must_use]
+    pub const fn released_object_references(self) -> usize {
+        self.released_object_references
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(i64);
 
 impl Timestamp {
