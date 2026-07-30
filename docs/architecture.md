@@ -255,6 +255,8 @@ S09 将 `self.db` schema 升至 v6：`markdown_parse_attempts` 以归档版本�
 
 S10 将 `self.db` schema 升至 v7：`extraction_revisions` 通过复合外键绑定一个 S09 已接受产物及其规范摘要，`evidence_blocks` 保存 Core-owned 块 ID、父子顺序、唯一 UTF-8 范围、结构元数据和可选 `eam-markdown-locator-v1`。修订与全部块在一个 SQLCipher 事务内提交并由数据库拒绝原地更新；重复物化只恢复同一修订和块引用，不生成新身份。正文不重复持久化，读取引用时认证解密同一归档 Markdown、复核摘要并临时投影 UTF-16 UI 范围。
 
+S11 将 `self.db` schema 升至 v8：`source_records/source_record_versions` 把同一收件箱定位器的不可变证据版本绑定到稳定来源；`block_lineage_batches/block_lineages` 保存相邻提取修订的规则版本、连续性状态和确定性依据，歧义候选单独有序保存。`incremental_work_items` 持久化当前投影、索引复用/重建和记忆复核计划；谱系、候选与全部工作项在一个事务内提交并拒绝原地更新。旧 `EvidenceBlockRef` 仍只解析原证据和原块，不被当前来源投影改写。
+
 ### 4.2 逻辑数据模型
 
 以下是架构契约，不是最终数据库模式：
@@ -531,7 +533,7 @@ new block without predecessor
   -> 作为新证据索引并进入正常记忆触发规则
 ```
 
-已持久化的 `EvidenceBlockRef` 永不改写。块谱系只产生当前视图投影和增量工作计划，不把新文本伪装成旧引用曾经支持的内容；`basis` 保存确定性匹配依据，具体算法与阈值留待真实格式基准决定。
+已持久化的 `EvidenceBlockRef` 永不改写。块谱系只产生当前视图投影和增量工作计划，不把新文本伪装成旧引用曾经支持的内容；`basis` 保存确定性匹配依据。G06 已在 [Block Lineage Contract v1](block-lineage-contract-v1.md) 冻结唯一定位器、唯一精确指纹、Unicode trigram Dice `7000/1500 bp` 阈值、ordinal `±2` 窗口与双向唯一门禁；重复或近似候选不唯一时稳定进入 `AMBIGUOUS`。
 
 密文对象必须先于数据库引用持久化；若数据库提交失败，启动时清理没有引用的密文对象，从而避免数据库指向缺失原件。对象已经存在时可以复用密文，但仍需保留新来源的溯源关系；只有同一来源的同一版本已经记录时才停止处理。
 
@@ -1270,3 +1272,34 @@ open_evidence_block(EvidenceBlockRef)
 ```
 
 S10 不持久化第二套 UTF-16 坐标或块正文，不实现固定 token 切片、块谱系、检索索引、`AVAILABLE` 推进、Obsidian 文件跳转或 WebView command。跨修订 `UNCHANGED/MOVED/MODIFIED/REMOVED/AMBIGUOUS` 映射仍属于 S11。
+
+### 9.11 S11 增量修订与显式块谱系当前实现边界
+
+```text
+crates/ingestion/src/
+  lineage.rs           # G06 确定性匹配、显式谱系与增量工作计划
+crates/ingestion/tests/
+  lineage_contract.rs  # 插入、移动、修改、删除和重复歧义固定基准
+crates/vault/src/
+  schema.rs            # schema v8 稳定来源、不可变谱系、候选与工作项
+  repository.rs        # 相邻规范修订认证读取与谱系计划原子提交
+crates/vault/tests/
+  evidence_persistence.rs  # 歧义、幂等、跨重启与历史引用不变
+```
+
+```text
+compute_block_lineage(previous, current)
+  -> 唯一原生定位器
+  -> 唯一 kind + metadata + canonical quote 精确指纹
+  -> 父块兼容、ordinal ±2、7000/1500 bp 双向唯一修改候选
+  -> 重复或近似竞争：AMBIGUOUS；无候选：REMOVED
+  -> 仅 UNCHANGED/MOVED 生成当前投影和索引复用
+
+materialize_incremental_markdown(evidence_id, contract_version)
+  -> 原子物化当前 ExtractionRevision + EvidenceBlock[]
+  -> 从稳定 SourceRecord 读取相邻前驱修订与两份认证规范文本
+  -> 已有同规则批次：恢复同一谱系与工作计划
+  -> 否则计算并原子提交谱系、歧义候选与全部工作项
+```
+
+S11 不实现真实全文索引、记忆维护、`AVAILABLE` 推进、Obsidian 来源移除或人工消歧 UI；这些消费者只接收 schema v8 中可重放的确定性工作计划。只有 `UNCHANGED/MOVED` 工作项允许前移当前投影，`MODIFIED/REMOVED/AMBIGUOUS` 均保留历史并触发后续复核。

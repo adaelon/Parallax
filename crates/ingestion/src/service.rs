@@ -8,11 +8,13 @@ use std::{
 };
 
 use crate::{
-    ArchiveInput, ArchiveRepository, ArchiveStatus, CandidateKind, EvidenceBlockQueryRepository,
-    EvidenceBlockRef, EvidenceBlockView, EvidenceError, EvidenceExtractionRepository,
-    FileObservation, ImportOutcome, ImportPolicy, IntakeDecision, MarkdownArchiveRepository,
-    MarkdownParseStart, MarkdownParseState, MaterializedExtraction, UnparsedReason,
-    evaluate_observations, validate_accepted_markdown,
+    ArchiveInput, ArchiveRepository, ArchiveStatus, BLOCK_LINEAGE_RULE_VERSION,
+    BlockLineageRepository, CandidateKind, EvidenceBlockQueryRepository, EvidenceBlockRef,
+    EvidenceBlockView, EvidenceError, EvidenceExtractionRepository, FileObservation, ImportOutcome,
+    ImportPolicy, IncrementalWorkItem, IncrementalWorkPlan, IntakeDecision, LineageBatch,
+    LineageError, MarkdownArchiveRepository, MarkdownParseStart, MarkdownParseState,
+    MaterializedExtraction, UnparsedReason, compute_block_lineage, evaluate_observations,
+    validate_accepted_markdown,
 };
 use eam_markdown::{
     CONTRACT_VERSION, MarkdownParseError, ParseLimits, ParsedMarkdownV1, parse_markdown,
@@ -51,6 +53,57 @@ pub enum MarkdownProcessError<E> {
 pub enum ExtractionProcessError<E> {
     Repository(E),
     Evidence(EvidenceError),
+}
+
+#[derive(Debug)]
+pub enum IncrementalProcessError<E> {
+    Repository(E),
+    Evidence(EvidenceError),
+    Lineage(LineageError),
+}
+
+impl<E: fmt::Display> fmt::Display for IncrementalProcessError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Repository(error) => write!(formatter, "incremental persistence failed: {error}"),
+            Self::Evidence(error) => write!(formatter, "accepted Markdown is invalid: {error}"),
+            Self::Lineage(error) => write!(formatter, "block lineage is invalid: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for IncrementalProcessError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Repository(error) => Some(error),
+            Self::Evidence(error) => Some(error),
+            Self::Lineage(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncrementalMaterialization {
+    extraction: MaterializedExtraction,
+    lineage: Option<LineageBatch>,
+    work_plan: IncrementalWorkPlan,
+}
+
+impl IncrementalMaterialization {
+    #[must_use]
+    pub const fn extraction(&self) -> &MaterializedExtraction {
+        &self.extraction
+    }
+
+    #[must_use]
+    pub const fn lineage(&self) -> Option<&LineageBatch> {
+        self.lineage.as_ref()
+    }
+
+    #[must_use]
+    pub const fn work_plan(&self) -> &IncrementalWorkPlan {
+        &self.work_plan
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for ExtractionProcessError<E> {
@@ -288,6 +341,93 @@ pub fn materialize_accepted_markdown<R: EvidenceExtractionRepository>(
     repository
         .commit_extraction(&extraction)
         .map_err(ExtractionProcessError::Repository)
+}
+
+/// Materializes one accepted revision, compares it with the adjacent revision
+/// of the same source, and atomically persists the resulting lineage plan.
+///
+/// The first revision has no predecessor and therefore returns an in-memory
+/// plan containing only `RebuildIndex` items. Later revisions persist the full
+/// lineage batch before returning.
+///
+/// # Errors
+///
+/// Returns the shared repository error for encrypted storage failures, an
+/// evidence error for invalid accepted Markdown, or a lineage error for an
+/// invalid adjacent revision pair.
+pub fn materialize_incremental_markdown<R>(
+    repository: &mut R,
+    evidence_id: u64,
+    contract_version: &str,
+    decided_at_millis: i64,
+) -> Result<
+    IncrementalMaterialization,
+    IncrementalProcessError<<R as EvidenceExtractionRepository>::Error>,
+>
+where
+    R: EvidenceExtractionRepository
+        + BlockLineageRepository<Error = <R as EvidenceExtractionRepository>::Error>,
+{
+    let extraction = materialize_accepted_markdown(repository, evidence_id, contract_version)
+        .map_err(|error| match error {
+            ExtractionProcessError::Repository(error) => IncrementalProcessError::Repository(error),
+            ExtractionProcessError::Evidence(error) => IncrementalProcessError::Evidence(error),
+        })?;
+    if let Some(batch) = BlockLineageRepository::load_lineage_batch(
+        repository,
+        extraction.revision().id(),
+        BLOCK_LINEAGE_RULE_VERSION,
+    )
+    .map_err(IncrementalProcessError::Repository)?
+    {
+        let work_plan = batch.work_plan().clone();
+        return Ok(IncrementalMaterialization {
+            extraction,
+            lineage: Some(batch),
+            work_plan,
+        });
+    }
+    let pair = BlockLineageRepository::load_lineage_pair(repository, extraction.revision().id())
+        .map_err(IncrementalProcessError::Repository)?;
+    let Some(pair) = pair else {
+        let work_plan = IncrementalWorkPlan::new(
+            extraction
+                .blocks()
+                .iter()
+                .map(|block| IncrementalWorkItem::RebuildIndex {
+                    to_ref: block.reference(),
+                })
+                .collect(),
+        );
+        return Ok(IncrementalMaterialization {
+            extraction,
+            lineage: None,
+            work_plan,
+        });
+    };
+    if pair.current().extraction().revision().id() != extraction.revision().id() {
+        return Err(IncrementalProcessError::Lineage(
+            LineageError::InvalidRevisionPair,
+        ));
+    }
+    let batch = compute_block_lineage(
+        pair.source_record_id(),
+        pair.previous().extraction(),
+        pair.previous().canonical_text(),
+        pair.current().extraction(),
+        pair.current().canonical_text(),
+        decided_at_millis,
+    )
+    .map_err(IncrementalProcessError::Lineage)?;
+    debug_assert_eq!(batch.rule_version(), BLOCK_LINEAGE_RULE_VERSION);
+    let batch = BlockLineageRepository::commit_lineage_batch(repository, &batch)
+        .map_err(IncrementalProcessError::Repository)?;
+    let work_plan = batch.work_plan().clone();
+    Ok(IncrementalMaterialization {
+        extraction,
+        lineage: Some(batch),
+        work_plan,
+    })
 }
 
 /// Opens one permanent block reference as an exact quote plus ephemeral UI range.

@@ -1,5 +1,28 @@
 # 代码链路
 
+## 2026-07-30 S11-2 谱系持久化与相邻修订编排
+
+**触达**:
+- `crates/ingestion/src/lineage.rs:BlockLineageRepository` — 定义相邻规范修订读取、原子谱系提交和跨重启恢复 port。
+- `crates/ingestion/src/service.rs:materialize_incremental_markdown` — 串联当前修订物化、相邻来源比较、幂等谱系提交与首版工作计划。
+- `crates/vault/src/schema.rs:MIGRATION_8` — 新增稳定来源记录/版本、不可变谱系批次、歧义候选和显式增量工作项。
+- `crates/vault/src/repository.rs:BlockLineageRepository` — 认证读取相邻规范文本，原子持久化谱系与计划并拒绝部分或冲突重放。
+- `crates/vault/tests/evidence_persistence.rs:ambiguous_lineage_and_work_plan_survive_reopen_without_rewriting_history` — 覆盖歧义、幂等重放、跨重启恢复和历史引用不变。
+
+**入口**：可信 Core 在 S09 接受产物上调用 `materialize_incremental_markdown(repository, evidence_id, contract_version, decided_at)`。
+**测试**：`cargo test -p ingestion -p vault --no-fail-fast` 全绿；schema v8 中断与谱系提交故障注入均验证完整回滚，目标 clippy 通过。
+
+## 2026-07-30 S11-1 G06 确定性块谱系与增量计划
+
+**触达**:
+- `docs/block-lineage-contract-v1.md:确定性匹配` — 冻结唯一定位器/精确指纹、Unicode trigram Dice `7000/1500 bp` 阈值和失败关闭顺序。
+- `crates/ingestion/src/lineage.rs:compute_block_lineage` — 生成 `UNCHANGED/MOVED/MODIFIED/REMOVED/AMBIGUOUS` 显式谱系，绝不改写旧引用。
+- `crates/ingestion/src/lineage.rs:build_work_plan` — 只为 `UNCHANGED/MOVED` 生成当前投影与索引复用，其余块重建或触发记忆复核。
+- `crates/ingestion/tests/lineage_contract.rs` — 固定插入、移动、修改、删除和重复段落歧义基准。
+
+**入口**：可信 Core 以同一 `SourceRecord` 的相邻 `MaterializedExtraction` 和各自规范文本调用 `compute_block_lineage`。
+**测试**：`cargo test -p ingestion --no-fail-fast` 18/18 通过；`cargo clippy -p ingestion --all-targets -- -D warnings` 通过。
+
 ## 2026-07-30 S10-3 不可变引用读取与原生导航降级
 
 **触达**:

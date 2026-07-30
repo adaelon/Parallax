@@ -2,6 +2,7 @@
 
 mod domain;
 mod evidence;
+mod lineage;
 mod service;
 
 pub use domain::{
@@ -19,8 +20,14 @@ pub use evidence::{
     ValidatedExtraction, project_utf8_span_to_utf16, resolve_native_navigation,
     validate_accepted_markdown,
 };
+pub use lineage::{
+    BLOCK_LINEAGE_RULE_VERSION, BlockLineage, BlockLineageRepository, BlockLineageStatus,
+    CanonicalLineageRevision, IncrementalWorkItem, IncrementalWorkPlan, LineageBasis, LineageBatch,
+    LineageError, LineagePair, compute_block_lineage,
+};
 pub use service::{
-    EvidenceQueryError, ExtractionProcessError, ImportError, MarkdownProcessError,
-    MarkdownProcessingOutcome, ingest_inbox_file, materialize_accepted_markdown,
-    open_evidence_block, process_archived_markdown,
+    EvidenceQueryError, ExtractionProcessError, ImportError, IncrementalMaterialization,
+    IncrementalProcessError, MarkdownProcessError, MarkdownProcessingOutcome, ingest_inbox_file,
+    materialize_accepted_markdown, materialize_incremental_markdown, open_evidence_block,
+    process_archived_markdown,
 };

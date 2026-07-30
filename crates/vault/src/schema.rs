@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 7;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 8;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -296,6 +296,165 @@ BEGIN
 END;
 ";
 
+const MIGRATION_8: &str = r"
+CREATE TABLE source_records (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    source_kind INTEGER NOT NULL CHECK (source_kind = 0),
+    source_locator TEXT NOT NULL CHECK (length(source_locator) > 0),
+    UNIQUE (source_kind, source_locator)
+) STRICT;
+
+INSERT INTO source_records (id, source_kind, source_locator)
+SELECT MIN(id), source_kind, source_locator
+FROM archived_evidence
+GROUP BY source_kind, source_locator;
+
+CREATE TABLE source_record_versions (
+    source_record_id INTEGER NOT NULL
+        REFERENCES source_records(id) ON DELETE RESTRICT,
+    evidence_id INTEGER NOT NULL UNIQUE
+        REFERENCES archived_evidence(id) ON DELETE RESTRICT,
+    version_ordinal INTEGER NOT NULL CHECK (version_ordinal >= 0),
+    PRIMARY KEY (source_record_id, version_ordinal)
+) STRICT;
+
+INSERT INTO source_record_versions (source_record_id, evidence_id, version_ordinal)
+SELECT s.id,
+       a.id,
+       (
+           SELECT COUNT(*) - 1
+           FROM archived_evidence older
+           WHERE older.source_kind = a.source_kind
+             AND older.source_locator = a.source_locator
+             AND (
+                 older.archived_at < a.archived_at
+                 OR (older.archived_at = a.archived_at AND older.id <= a.id)
+             )
+       )
+FROM archived_evidence a
+JOIN source_records s
+  ON s.source_kind = a.source_kind
+ AND s.source_locator = a.source_locator;
+
+CREATE UNIQUE INDEX evidence_blocks_id_evidence_unique
+    ON evidence_blocks(id, evidence_id);
+
+CREATE TABLE block_lineage_batches (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    source_record_id INTEGER NOT NULL
+        REFERENCES source_records(id) ON DELETE RESTRICT,
+    from_revision_id INTEGER NOT NULL
+        REFERENCES extraction_revisions(id) ON DELETE RESTRICT,
+    to_revision_id INTEGER NOT NULL
+        REFERENCES extraction_revisions(id) ON DELETE RESTRICT,
+    decided_at INTEGER NOT NULL,
+    rule_version TEXT NOT NULL CHECK (length(trim(rule_version)) > 0),
+    CHECK (from_revision_id != to_revision_id),
+    UNIQUE (to_revision_id, rule_version),
+    UNIQUE (id, to_revision_id)
+) STRICT;
+
+CREATE TABLE block_lineages (
+    batch_id INTEGER NOT NULL
+        REFERENCES block_lineage_batches(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    from_evidence_id INTEGER NOT NULL,
+    from_block_id INTEGER NOT NULL,
+    to_evidence_id INTEGER,
+    to_block_id INTEGER,
+    status INTEGER NOT NULL CHECK (status BETWEEN 0 AND 4),
+    basis_kind INTEGER NOT NULL CHECK (basis_kind BETWEEN 0 AND 4),
+    similarity_basis_points INTEGER CHECK (
+        similarity_basis_points IS NULL
+        OR similarity_basis_points BETWEEN 0 AND 10000
+    ),
+    PRIMARY KEY (batch_id, ordinal),
+    UNIQUE (batch_id, from_evidence_id, from_block_id),
+    FOREIGN KEY (from_block_id, from_evidence_id)
+        REFERENCES evidence_blocks(id, evidence_id) ON DELETE RESTRICT,
+    FOREIGN KEY (to_block_id, to_evidence_id)
+        REFERENCES evidence_blocks(id, evidence_id) ON DELETE RESTRICT,
+    CHECK ((to_evidence_id IS NULL) = (to_block_id IS NULL)),
+    CHECK (
+        (status IN (0, 1) AND to_block_id IS NOT NULL
+         AND basis_kind IN (0, 1) AND similarity_basis_points IS NULL)
+        OR (status = 2 AND to_block_id IS NOT NULL
+            AND basis_kind IN (0, 2)
+            AND ((basis_kind = 0 AND similarity_basis_points IS NULL)
+                 OR (basis_kind = 2 AND similarity_basis_points IS NOT NULL)))
+        OR (status = 3 AND to_block_id IS NULL
+            AND basis_kind = 3 AND similarity_basis_points IS NULL)
+        OR (status = 4 AND to_block_id IS NULL
+            AND basis_kind = 4 AND similarity_basis_points IS NULL)
+    )
+) STRICT;
+
+CREATE TABLE block_lineage_candidates (
+    batch_id INTEGER NOT NULL,
+    lineage_ordinal INTEGER NOT NULL,
+    candidate_ordinal INTEGER NOT NULL CHECK (candidate_ordinal >= 0),
+    candidate_evidence_id INTEGER NOT NULL,
+    candidate_block_id INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, lineage_ordinal, candidate_ordinal),
+    UNIQUE (batch_id, lineage_ordinal, candidate_evidence_id, candidate_block_id),
+    FOREIGN KEY (batch_id, lineage_ordinal)
+        REFERENCES block_lineages(batch_id, ordinal) ON DELETE RESTRICT,
+    FOREIGN KEY (candidate_block_id, candidate_evidence_id)
+        REFERENCES evidence_blocks(id, evidence_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE incremental_work_items (
+    batch_id INTEGER NOT NULL
+        REFERENCES block_lineage_batches(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    action INTEGER NOT NULL CHECK (action BETWEEN 0 AND 3),
+    from_evidence_id INTEGER,
+    from_block_id INTEGER,
+    to_evidence_id INTEGER,
+    to_block_id INTEGER,
+    review_reason INTEGER CHECK (review_reason IS NULL OR review_reason BETWEEN 2 AND 4),
+    PRIMARY KEY (batch_id, ordinal),
+    FOREIGN KEY (from_block_id, from_evidence_id)
+        REFERENCES evidence_blocks(id, evidence_id) ON DELETE RESTRICT,
+    FOREIGN KEY (to_block_id, to_evidence_id)
+        REFERENCES evidence_blocks(id, evidence_id) ON DELETE RESTRICT,
+    CHECK ((from_evidence_id IS NULL) = (from_block_id IS NULL)),
+    CHECK ((to_evidence_id IS NULL) = (to_block_id IS NULL)),
+    CHECK (
+        (action IN (0, 1) AND from_block_id IS NOT NULL
+         AND to_block_id IS NOT NULL AND review_reason IS NULL)
+        OR (action = 2 AND from_block_id IS NULL
+            AND to_block_id IS NOT NULL AND review_reason IS NULL)
+        OR (action = 3 AND from_block_id IS NOT NULL
+            AND to_block_id IS NULL AND review_reason IS NOT NULL)
+    )
+) STRICT;
+
+CREATE TRIGGER block_lineage_batches_immutable
+BEFORE UPDATE ON block_lineage_batches
+BEGIN
+    SELECT RAISE(ABORT, 'block lineage batches are immutable');
+END;
+
+CREATE TRIGGER block_lineages_immutable
+BEFORE UPDATE ON block_lineages
+BEGIN
+    SELECT RAISE(ABORT, 'block lineages are immutable');
+END;
+
+CREATE TRIGGER block_lineage_candidates_immutable
+BEFORE UPDATE ON block_lineage_candidates
+BEGIN
+    SELECT RAISE(ABORT, 'block lineage candidates are immutable');
+END;
+
+CREATE TRIGGER incremental_work_items_immutable
+BEFORE UPDATE ON incremental_work_items
+BEGIN
+    SELECT RAISE(ABORT, 'incremental work items are immutable');
+END;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -320,6 +479,7 @@ where
             5 => transaction.execute_batch(MIGRATION_5)?,
             6 => transaction.execute_batch(MIGRATION_6)?,
             7 => transaction.execute_batch(MIGRATION_7)?,
+            8 => transaction.execute_batch(MIGRATION_8)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -601,5 +761,97 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_lineage_migration_keeps_extraction_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.execute_batch(MIGRATION_3).unwrap();
+        connection.execute_batch(MIGRATION_4).unwrap();
+        connection.execute_batch(MIGRATION_5).unwrap();
+        connection.execute_batch(MIGRATION_6).unwrap();
+        connection.execute_batch(MIGRATION_7).unwrap();
+        connection.pragma_update(None, "user_version", 7).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 8 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(8))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+        let lineage_table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'block_lineages'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lineage_table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn lineage_migration_backfills_stable_sources_and_version_order() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.execute_batch(MIGRATION_3).unwrap();
+        connection.execute_batch(MIGRATION_4).unwrap();
+        connection.execute_batch(MIGRATION_5).unwrap();
+        connection.execute_batch(MIGRATION_6).unwrap();
+        connection.execute_batch(MIGRATION_7).unwrap();
+        connection
+            .execute(
+                "INSERT INTO archived_evidence
+                 (id, source_kind, source_locator, object_id, content_length,
+                  status, unparsed_reason, archived_at)
+                 VALUES (1, 0, 'inbox/same.md', ?1, 1, 0, NULL, 10),
+                        (2, 0, 'inbox/same.md', ?2, 1, 0, NULL, 20),
+                        (3, 0, 'inbox/other.md', ?3, 1, 0, NULL, 15)",
+                [
+                    format!("{:064x}", 1),
+                    format!("{:064x}", 2),
+                    format!("{:064x}", 3),
+                ],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 7).unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        let source_count: i64 = connection
+            .query_row("SELECT count(*) FROM source_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_count, 2);
+        let versions = connection
+            .prepare(
+                "SELECT v.evidence_id, v.version_ordinal
+                 FROM source_record_versions v
+                 JOIN source_records s ON s.id = v.source_record_id
+                 WHERE s.source_locator = 'inbox/same.md'
+                 ORDER BY v.version_ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(versions, vec![(1, 0), (2, 1)]);
     }
 }

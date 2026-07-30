@@ -19,12 +19,14 @@ use eam_identity::{
 };
 use eam_ingestion::{
     AcceptedMarkdownSource, ArchiveInput, ArchiveReceipt, ArchiveRepository, ArchiveStatus,
-    ArchivedEvidence, CanonicalEvidenceBlockSource, EvidenceBlock, EvidenceBlockDraft,
+    ArchivedEvidence, BlockLineage, BlockLineageRepository, BlockLineageStatus,
+    CanonicalEvidenceBlockSource, CanonicalLineageRevision, EvidenceBlock, EvidenceBlockDraft,
     EvidenceBlockId, EvidenceBlockMetadata, EvidenceBlockQueryRepository, EvidenceBlockRef,
-    EvidenceExtractionRepository, ExtractionRevision, ExtractionRevisionId,
-    MARKDOWN_LOCATOR_VERSION, MarkdownArchiveRepository, MarkdownLocator, MarkdownLocatorValue,
-    MarkdownParseAttempt, MarkdownParseStart, MarkdownParseState, MaterializedExtraction,
-    SourceAnchor, UnparsedReason, ValidatedExtraction,
+    EvidenceExtractionRepository, ExtractionRevision, ExtractionRevisionId, IncrementalWorkItem,
+    IncrementalWorkPlan, LineageBasis, LineageBatch, LineagePair, MARKDOWN_LOCATOR_VERSION,
+    MarkdownArchiveRepository, MarkdownLocator, MarkdownLocatorValue, MarkdownParseAttempt,
+    MarkdownParseStart, MarkdownParseState, MaterializedExtraction, SourceAnchor, UnparsedReason,
+    ValidatedExtraction,
 };
 use eam_markdown::{MarkdownBlockKind, ParseResource, ParsedMarkdownV1};
 use fs4::{FileExt, TryLockError};
@@ -377,6 +379,11 @@ impl VaultRepository {
                 input.archived_at_millis,
             ],
         )?;
+        ensure_source_record_version(
+            &transaction,
+            input.source_locator,
+            to_vault_sql_id(archive_id)?,
+        )?;
         before_commit(&transaction)?;
         transaction.commit()?;
         self.next_archive_id = archive_id
@@ -480,6 +487,62 @@ impl VaultRepository {
         transaction.commit()?;
         MaterializedExtraction::new(revision, blocks, false)
             .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+    }
+
+    fn commit_lineage_batch_with_hook<F>(
+        &mut self,
+        batch: &LineageBatch,
+        before_commit: F,
+    ) -> Result<LineageBatch, VaultError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), VaultError>,
+    {
+        if let Some(existing) =
+            self.load_lineage_batch(batch.to_revision_id(), batch.rule_version())?
+        {
+            if existing == *batch {
+                return Ok(existing);
+            }
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let pair = self
+            .load_lineage_pair(batch.to_revision_id())?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        if pair.source_record_id() != batch.source_record_id()
+            || pair.previous().extraction().revision().id() != batch.from_revision_id()
+        {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        let batch_id = next_identifier(&transaction, "block_lineage_batches")?;
+        transaction.execute(
+            "INSERT INTO block_lineage_batches
+             (id, source_record_id, from_revision_id, to_revision_id,
+              decided_at, rule_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                to_vault_sql_id(batch_id)?,
+                to_vault_sql_id(batch.source_record_id())?,
+                to_vault_sql_id(batch.from_revision_id().get())?,
+                to_vault_sql_id(batch.to_revision_id().get())?,
+                batch.decided_at_millis(),
+                batch.rule_version(),
+            ],
+        )?;
+        for (ordinal, lineage) in batch.lineages().iter().enumerate() {
+            insert_block_lineage(&transaction, batch_id, ordinal, lineage)?;
+        }
+        for (ordinal, item) in batch.work_plan().items().iter().enumerate() {
+            insert_incremental_work_item(&transaction, batch_id, ordinal, item)?;
+        }
+        before_commit(&transaction)?;
+        transaction.commit()?;
+        Ok(batch.clone())
     }
 
     fn close_inner(&mut self) -> Result<(), VaultError> {
@@ -747,6 +810,76 @@ impl EvidenceBlockQueryRepository for VaultRepository {
             block,
             self.read_archived_content(reference.evidence_id())?,
         )))
+    }
+}
+
+impl BlockLineageRepository for VaultRepository {
+    type Error = VaultError;
+
+    fn load_lineage_pair(
+        &self,
+        to_revision_id: ExtractionRevisionId,
+    ) -> Result<Option<LineagePair>, Self::Error> {
+        let current = self
+            .connection()
+            .query_row(
+                "SELECT v.source_record_id, v.version_ordinal
+                 FROM extraction_revisions r
+                 JOIN source_record_versions v ON v.evidence_id = r.evidence_id
+                 WHERE r.id = ?1",
+                [to_vault_sql_id(to_revision_id.get())?],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        let source_record_id =
+            u64::try_from(current.0).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let previous_revision_id = self
+            .connection()
+            .query_row(
+                "SELECT r.id
+                 FROM extraction_revisions r
+                 JOIN source_record_versions v ON v.evidence_id = r.evidence_id
+                 WHERE v.source_record_id = ?1
+                   AND r.id != ?2
+                   AND (
+                       v.version_ordinal < ?3
+                       OR (v.version_ordinal = ?3 AND r.id < ?2)
+                   )
+                 ORDER BY v.version_ordinal DESC, r.id DESC
+                 LIMIT 1",
+                params![
+                    to_vault_sql_id(source_record_id)?,
+                    to_vault_sql_id(to_revision_id.get())?,
+                    current.1,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(previous_revision_id) = previous_revision_id else {
+            return Ok(None);
+        };
+        let previous_revision_id = ExtractionRevisionId::new(
+            u64::try_from(previous_revision_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        )
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let previous = load_canonical_lineage_revision(self, previous_revision_id)?;
+        let current = load_canonical_lineage_revision(self, to_revision_id)?;
+        LineagePair::new(source_record_id, previous, current)
+            .map(Some)
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+    }
+
+    fn commit_lineage_batch(&mut self, batch: &LineageBatch) -> Result<LineageBatch, Self::Error> {
+        self.commit_lineage_batch_with_hook(batch, |_| Ok(()))
+    }
+
+    fn load_lineage_batch(
+        &self,
+        to_revision_id: ExtractionRevisionId,
+        rule_version: &str,
+    ) -> Result<Option<LineageBatch>, Self::Error> {
+        load_lineage_batch(self.connection(), to_revision_id, rule_version)
     }
 }
 
@@ -1651,6 +1784,47 @@ fn referenced_object_ids(connection: &Connection) -> Result<HashSet<String>, Vau
         .map_err(VaultError::from)
 }
 
+fn ensure_source_record_version(
+    transaction: &rusqlite::Transaction<'_>,
+    source_locator: &str,
+    evidence_id: i64,
+) -> Result<u64, VaultError> {
+    let existing = transaction
+        .query_row(
+            "SELECT id FROM source_records WHERE source_kind = 0 AND source_locator = ?1",
+            [source_locator],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let source_record_id = if let Some(id) = existing {
+        u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?
+    } else {
+        let id = next_identifier(transaction, "source_records")?;
+        transaction.execute(
+            "INSERT INTO source_records (id, source_kind, source_locator)
+             VALUES (?1, 0, ?2)",
+            params![to_vault_sql_id(id)?, source_locator],
+        )?;
+        id
+    };
+    let version_ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(version_ordinal), -1) + 1
+         FROM source_record_versions WHERE source_record_id = ?1",
+        [to_vault_sql_id(source_record_id)?],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO source_record_versions
+         (source_record_id, evidence_id, version_ordinal) VALUES (?1, ?2, ?3)",
+        params![
+            to_vault_sql_id(source_record_id)?,
+            evidence_id,
+            version_ordinal
+        ],
+    )?;
+    Ok(source_record_id)
+}
+
 const fn encode_archive_status(status: ArchiveStatus) -> (i64, Option<i64>) {
     match status {
         ArchiveStatus::Archived => (0, None),
@@ -1979,6 +2153,354 @@ fn load_evidence_blocks(
             },
         )
         .collect()
+}
+
+fn load_canonical_lineage_revision(
+    repository: &VaultRepository,
+    revision_id: ExtractionRevisionId,
+) -> Result<CanonicalLineageRevision, VaultError> {
+    let (evidence_id, contract_version) = repository
+        .connection()
+        .query_row(
+            "SELECT evidence_id, contract_version FROM extraction_revisions WHERE id = ?1",
+            [to_vault_sql_id(revision_id.get())?],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let evidence_id = u64::try_from(evidence_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let extraction = repository
+        .materialized_extraction(evidence_id, &contract_version)?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    if extraction.revision().id() != revision_id {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    let canonical_text = String::from_utf8(repository.read_archived_content(evidence_id)?)
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    CanonicalLineageRevision::new(extraction, canonical_text)
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+}
+
+fn insert_block_lineage(
+    transaction: &rusqlite::Transaction<'_>,
+    batch_id: u64,
+    ordinal: usize,
+    lineage: &BlockLineage,
+) -> Result<(), VaultError> {
+    let from = lineage.from_ref();
+    let to = lineage.to_ref();
+    let (basis_kind, similarity_basis_points, candidates) = match lineage.basis() {
+        LineageBasis::UniqueNativeLocator => (0, None, &[][..]),
+        LineageBasis::UniqueExactFingerprint => (1, None, &[][..]),
+        LineageBasis::ModifiedSimilarity { score_basis_points } => {
+            (2, Some(i64::from(*score_basis_points)), &[][..])
+        }
+        LineageBasis::NoCandidate => (3, None, &[][..]),
+        LineageBasis::AmbiguousCandidates { candidates } => (4, None, candidates.as_slice()),
+    };
+    transaction.execute(
+        "INSERT INTO block_lineages
+         (batch_id, ordinal, from_evidence_id, from_block_id,
+          to_evidence_id, to_block_id, status, basis_kind, similarity_basis_points)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            to_vault_sql_id(batch_id)?,
+            i64::try_from(ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            to_vault_sql_id(from.evidence_id())?,
+            to_vault_sql_id(from.block_id().get())?,
+            to.map(|reference| to_vault_sql_id(reference.evidence_id()))
+                .transpose()?,
+            to.map(|reference| to_vault_sql_id(reference.block_id().get()))
+                .transpose()?,
+            encode_lineage_status(lineage.status()),
+            basis_kind,
+            similarity_basis_points,
+        ],
+    )?;
+    for (candidate_ordinal, candidate) in candidates.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO block_lineage_candidates
+             (batch_id, lineage_ordinal, candidate_ordinal,
+              candidate_evidence_id, candidate_block_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_vault_sql_id(batch_id)?,
+                i64::try_from(ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                i64::try_from(candidate_ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                to_vault_sql_id(candidate.evidence_id())?,
+                to_vault_sql_id(candidate.block_id().get())?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_incremental_work_item(
+    transaction: &rusqlite::Transaction<'_>,
+    batch_id: u64,
+    ordinal: usize,
+    item: &IncrementalWorkItem,
+) -> Result<(), VaultError> {
+    let (action, from, to, review_reason) = match item {
+        IncrementalWorkItem::AdvanceCurrentProjection { from_ref, to_ref } => {
+            (0, Some(*from_ref), Some(*to_ref), None)
+        }
+        IncrementalWorkItem::ReuseIndexPayload { from_ref, to_ref } => {
+            (1, Some(*from_ref), Some(*to_ref), None)
+        }
+        IncrementalWorkItem::RebuildIndex { to_ref } => (2, None, Some(*to_ref), None),
+        IncrementalWorkItem::ReviewMemory { from_ref, reason } => (
+            3,
+            Some(*from_ref),
+            None,
+            Some(encode_lineage_status(*reason)),
+        ),
+    };
+    transaction.execute(
+        "INSERT INTO incremental_work_items
+         (batch_id, ordinal, action, from_evidence_id, from_block_id,
+          to_evidence_id, to_block_id, review_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            to_vault_sql_id(batch_id)?,
+            i64::try_from(ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            action,
+            from.map(|reference| to_vault_sql_id(reference.evidence_id()))
+                .transpose()?,
+            from.map(|reference| to_vault_sql_id(reference.block_id().get()))
+                .transpose()?,
+            to.map(|reference| to_vault_sql_id(reference.evidence_id()))
+                .transpose()?,
+            to.map(|reference| to_vault_sql_id(reference.block_id().get()))
+                .transpose()?,
+            review_reason,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_lineage_batch(
+    connection: &Connection,
+    to_revision_id: ExtractionRevisionId,
+    rule_version: &str,
+) -> Result<Option<LineageBatch>, VaultError> {
+    let stored = connection
+        .query_row(
+            "SELECT id, source_record_id, from_revision_id, decided_at
+             FROM block_lineage_batches
+             WHERE to_revision_id = ?1 AND rule_version = ?2",
+            params![to_vault_sql_id(to_revision_id.get())?, rule_version],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((batch_id, source_record_id, from_revision_id, decided_at_millis)) = stored else {
+        return Ok(None);
+    };
+    let lineages = load_block_lineages(connection, batch_id)?;
+    let work_plan = IncrementalWorkPlan::new(load_incremental_work_items(connection, batch_id)?);
+    LineageBatch::new(
+        u64::try_from(source_record_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        ExtractionRevisionId::new(
+            u64::try_from(from_revision_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        )
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        to_revision_id,
+        decided_at_millis,
+        rule_version.to_owned(),
+        lineages,
+        work_plan,
+    )
+    .map(Some)
+    .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+}
+
+fn load_block_lineages(
+    connection: &Connection,
+    batch_id: i64,
+) -> Result<Vec<BlockLineage>, VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT ordinal, from_evidence_id, from_block_id,
+                to_evidence_id, to_block_id, status, basis_kind,
+                similarity_basis_points
+         FROM block_lineages WHERE batch_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement
+        .query_map([batch_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                ordinal,
+                from_evidence_id,
+                from_block_id,
+                to_evidence_id,
+                to_block_id,
+                status,
+                basis_kind,
+                similarity_basis_points,
+            )| {
+                let from_ref = decode_evidence_block_ref(from_evidence_id, from_block_id)?;
+                let to_ref = match (to_evidence_id, to_block_id) {
+                    (Some(evidence_id), Some(block_id)) => {
+                        Some(decode_evidence_block_ref(evidence_id, block_id)?)
+                    }
+                    (None, None) => None,
+                    _ => return Err(VaultError::InvalidKeyOrCorrupt),
+                };
+                let basis = match basis_kind {
+                    0 if similarity_basis_points.is_none() => LineageBasis::UniqueNativeLocator,
+                    1 if similarity_basis_points.is_none() => LineageBasis::UniqueExactFingerprint,
+                    2 => LineageBasis::ModifiedSimilarity {
+                        score_basis_points: u16::try_from(
+                            similarity_basis_points.ok_or(VaultError::InvalidKeyOrCorrupt)?,
+                        )
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    },
+                    3 if similarity_basis_points.is_none() => LineageBasis::NoCandidate,
+                    4 if similarity_basis_points.is_none() => LineageBasis::AmbiguousCandidates {
+                        candidates: load_lineage_candidates(connection, batch_id, ordinal)?,
+                    },
+                    _ => return Err(VaultError::InvalidKeyOrCorrupt),
+                };
+                BlockLineage::new(from_ref, to_ref, decode_lineage_status(status)?, basis)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+            },
+        )
+        .collect()
+}
+
+fn load_lineage_candidates(
+    connection: &Connection,
+    batch_id: i64,
+    lineage_ordinal: i64,
+) -> Result<Vec<EvidenceBlockRef>, VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT candidate_evidence_id, candidate_block_id
+         FROM block_lineage_candidates
+         WHERE batch_id = ?1 AND lineage_ordinal = ?2
+         ORDER BY candidate_ordinal",
+    )?;
+    statement
+        .query_map(params![batch_id, lineage_ordinal], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(evidence_id, block_id)| decode_evidence_block_ref(evidence_id, block_id))
+        .collect()
+}
+
+fn load_incremental_work_items(
+    connection: &Connection,
+    batch_id: i64,
+) -> Result<Vec<IncrementalWorkItem>, VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT action, from_evidence_id, from_block_id,
+                to_evidence_id, to_block_id, review_reason
+         FROM incremental_work_items WHERE batch_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement
+        .query_map([batch_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(action, from_evidence_id, from_block_id, to_evidence_id, to_block_id, reason)| {
+                let from = decode_optional_evidence_block_ref(from_evidence_id, from_block_id)?;
+                let to = decode_optional_evidence_block_ref(to_evidence_id, to_block_id)?;
+                match (action, from, to, reason) {
+                    (0, Some(from_ref), Some(to_ref), None) => {
+                        Ok(IncrementalWorkItem::AdvanceCurrentProjection { from_ref, to_ref })
+                    }
+                    (1, Some(from_ref), Some(to_ref), None) => {
+                        Ok(IncrementalWorkItem::ReuseIndexPayload { from_ref, to_ref })
+                    }
+                    (2, None, Some(to_ref), None) => {
+                        Ok(IncrementalWorkItem::RebuildIndex { to_ref })
+                    }
+                    (3, Some(from_ref), None, Some(reason)) => {
+                        Ok(IncrementalWorkItem::ReviewMemory {
+                            from_ref,
+                            reason: decode_lineage_status(reason)?,
+                        })
+                    }
+                    _ => Err(VaultError::InvalidKeyOrCorrupt),
+                }
+            },
+        )
+        .collect()
+}
+
+fn decode_optional_evidence_block_ref(
+    evidence_id: Option<i64>,
+    block_id: Option<i64>,
+) -> Result<Option<EvidenceBlockRef>, VaultError> {
+    match (evidence_id, block_id) {
+        (Some(evidence_id), Some(block_id)) => {
+            decode_evidence_block_ref(evidence_id, block_id).map(Some)
+        }
+        (None, None) => Ok(None),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+fn decode_evidence_block_ref(
+    evidence_id: i64,
+    block_id: i64,
+) -> Result<EvidenceBlockRef, VaultError> {
+    EvidenceBlockRef::new(
+        u64::try_from(evidence_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        EvidenceBlockId::new(u64::try_from(block_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?)
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+    )
+    .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+}
+
+const fn encode_lineage_status(status: BlockLineageStatus) -> i64 {
+    match status {
+        BlockLineageStatus::Unchanged => 0,
+        BlockLineageStatus::Moved => 1,
+        BlockLineageStatus::Modified => 2,
+        BlockLineageStatus::Removed => 3,
+        BlockLineageStatus::Ambiguous => 4,
+    }
+}
+
+const fn decode_lineage_status(value: i64) -> Result<BlockLineageStatus, VaultError> {
+    match value {
+        0 => Ok(BlockLineageStatus::Unchanged),
+        1 => Ok(BlockLineageStatus::Moved),
+        2 => Ok(BlockLineageStatus::Modified),
+        3 => Ok(BlockLineageStatus::Removed),
+        4 => Ok(BlockLineageStatus::Ambiguous),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
 }
 
 fn next_identifier(connection: &Connection, table: &str) -> Result<u64, VaultError> {
@@ -2567,6 +3089,96 @@ mod tests {
         assert!(
             repository
                 .materialized_extraction(receipt.archive_id, eam_markdown::CONTRACT_VERSION)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lineage_failure_rolls_back_edges_candidates_and_work_plan_across_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let key = [0x71; 32];
+        let previous_source = "# 谱系\n\nRepeated evidence.\n\nRepeated evidence.\n";
+        let current_source =
+            "# 谱系\n\nNew separator.\n\nRepeated evidence.\n\nRepeated evidence.\n";
+        let mut repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+
+        let previous_receipt = repository
+            .archive(ArchiveInput {
+                source_locator: "inbox/lineage.md",
+                content: previous_source.as_bytes(),
+                status: ArchiveStatus::Archived,
+                archived_at_millis: 10,
+            })
+            .unwrap();
+        eam_ingestion::process_archived_markdown(
+            &mut repository,
+            previous_receipt.archive_id,
+            eam_markdown::ParseLimits::default(),
+            20,
+            30,
+        )
+        .unwrap();
+        eam_ingestion::materialize_accepted_markdown(
+            &mut repository,
+            previous_receipt.archive_id,
+            eam_markdown::CONTRACT_VERSION,
+        )
+        .unwrap();
+
+        let current_receipt = repository
+            .archive(ArchiveInput {
+                source_locator: "inbox/lineage.md",
+                content: current_source.as_bytes(),
+                status: ArchiveStatus::Archived,
+                archived_at_millis: 40,
+            })
+            .unwrap();
+        eam_ingestion::process_archived_markdown(
+            &mut repository,
+            current_receipt.archive_id,
+            eam_markdown::ParseLimits::default(),
+            50,
+            60,
+        )
+        .unwrap();
+        let current = eam_ingestion::materialize_accepted_markdown(
+            &mut repository,
+            current_receipt.archive_id,
+            eam_markdown::CONTRACT_VERSION,
+        )
+        .unwrap();
+        let pair = repository
+            .load_lineage_pair(current.revision().id())
+            .unwrap()
+            .unwrap();
+        let batch = eam_ingestion::compute_block_lineage(
+            pair.source_record_id(),
+            pair.previous().extraction(),
+            pair.previous().canonical_text(),
+            pair.current().extraction(),
+            pair.current().canonical_text(),
+            70,
+        )
+        .unwrap();
+
+        let result = repository
+            .commit_lineage_batch_with_hook(&batch, |_| Err(VaultError::LineageInterrupted));
+
+        assert!(matches!(result, Err(VaultError::LineageInterrupted)));
+        assert!(
+            repository
+                .load_lineage_batch(current.revision().id(), batch.rule_version())
+                .unwrap()
+                .is_none()
+        );
+        repository.close().unwrap();
+
+        let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        assert!(
+            repository
+                .load_lineage_batch(current.revision().id(), batch.rule_version())
                 .unwrap()
                 .is_none()
         );
