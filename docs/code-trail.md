@@ -1,5 +1,36 @@
 # 代码链路
 
+## 2026-07-30 S16-3 架构对齐与全仓门禁
+
+**触达**:
+- `docs/architecture.md:§2/§4.1/§5.5/§5.6/§8/§9.16` — 对齐 memory 组件、schema v13、显式提议门禁、版本取代与权威 Claim 召回边界。
+- `docs/code-trail.md:S16-1..S16-3` — 保留领域契约、持久化召回和最终验收三个可独立接手的实现切片。
+
+**入口**：陌生会话从架构 §9.16 定位 `crates/memory`、Vault 和 retrieval 的完整路径，再按 S16-1/S16-2 回到精确符号与测试。
+**测试**：全仓 Rust 145/145、fmt、workspace clippy、desktop check、release build、前端 2/2、typecheck、production build、2 个变更 Markdown 的 94 个本地链接及 `git diff --check` 全部通过。
+
+## 2026-07-30 S16-2 schema v13 记忆版本持久化与权威召回
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_13` — 保存稳定记忆 ID、不可变版本、三账本来源、追加式状态事件和当前版本路由词。
+- `crates/vault/src/repository.rs:LongTermMemoryRepository` — 在单事务内提交初版或显式后继版本，并从 SQLCipher 跨重启恢复完整版本链。
+- `crates/vault/src/repository.rs:recall_long_term_memory_candidates` — 只由当前非取代版本的记忆词命中三账本 Claim，随后沿既有权威解析路径进入工作上下文。
+- `crates/vault/tests/memory_persistence.rs` — 覆盖跨重启、原子取代、旧版本停止召回、暂定记忆召回与无提议零状态。
+
+**入口**：`MemoryMaintenance::propose` 校验后调用 Vault 版本追加；`retrieve` 合并长期记忆来源 Claim 与其他通道，再统一 `resolve_authoritative`。
+**测试**：Vault 58 项测试、memory 4/4 及 memory/retrieval/vault 目标 clippy 通过；schema v13 中断迁移保持 v12 可重开。
+
+## 2026-07-30 S16-1 长期记忆显式提议领域契约
+
+**触达**:
+- `crates/memory/src/domain.rs:MemoryProposal/MemoryVersion` — 固定必填字段、三类提议依据、初始状态和显式修订版本目标。
+- `crates/memory/src/service.rs:MemoryMaintenance::propose` — 校验来源存在、三账本归属、适用时间、可信度和跨任务保留理由，拒绝静默晋升。
+- `crates/memory/src/in_memory.rs:InMemoryLongTermMemoryRepository` — 以稳定记忆 ID、不可变后继版本和前版 `SUPERSEDED` 状态提供最小测试仓储。
+- `crates/memory/tests/memory_proposals.rs` — 覆盖直接证据、解释性推断、缺字段、跨账本、无提议零记忆和显式取代。
+
+**入口**：可信 Core 只在第二自我提交完整 `MemoryProposal` 时调用 `MemoryMaintenance::propose`；账本与理解投影没有自动创建长期记忆的入口。
+**测试**：`cargo test -p memory --no-fail-fast` 4/4 与 `cargo clippy -p memory --all-targets -- -D warnings` 通过。
+
 ## 2026-07-30 S15-4 架构对齐与全仓门禁
 
 **触达**:

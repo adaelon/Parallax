@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 12;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 13;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -803,6 +803,86 @@ CREATE INDEX understanding_projection_sources_lookup
     ON understanding_projection_sources(evidence_id, block_id);
 ";
 
+const MIGRATION_13: &str = r"
+CREATE TABLE long_term_memories (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE long_term_memory_versions (
+    memory_id INTEGER NOT NULL
+        REFERENCES long_term_memories(id) ON DELETE RESTRICT,
+    version INTEGER NOT NULL CHECK (version > 0),
+    predecessor_version INTEGER,
+    subject INTEGER NOT NULL CHECK (subject BETWEEN 0 AND 2),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 0 AND 4),
+    statement TEXT NOT NULL CHECK (length(trim(statement)) > 0),
+    confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 2),
+    applicable_kind INTEGER NOT NULL CHECK (applicable_kind BETWEEN 0 AND 3),
+    applicable_start INTEGER,
+    applicable_end INTEGER,
+    salience_reason TEXT NOT NULL CHECK (length(trim(salience_reason)) > 0),
+    basis INTEGER NOT NULL CHECK (basis BETWEEN 0 AND 2),
+    formed_at INTEGER NOT NULL,
+    PRIMARY KEY (memory_id, version),
+    FOREIGN KEY (memory_id, predecessor_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    CHECK (
+        (version = 1 AND predecessor_version IS NULL)
+        OR
+        (version > 1 AND predecessor_version = version - 1)
+    ),
+    CHECK (
+        (applicable_kind = 0 AND applicable_start IS NOT NULL
+         AND applicable_end IS NULL)
+        OR
+        (applicable_kind = 1 AND applicable_start IS NOT NULL
+         AND applicable_end IS NULL)
+        OR
+        (applicable_kind = 2 AND applicable_start IS NOT NULL
+         AND applicable_end IS NOT NULL AND applicable_end >= applicable_start)
+        OR
+        (applicable_kind = 3 AND applicable_start IS NULL
+         AND applicable_end IS NULL)
+    )
+) STRICT;
+
+CREATE TABLE long_term_memory_sources (
+    memory_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE RESTRICT,
+    PRIMARY KEY (memory_id, version, ordinal),
+    UNIQUE (memory_id, version, claim_id),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE long_term_memory_state_events (
+    memory_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    status INTEGER NOT NULL CHECK (status BETWEEN 0 AND 3),
+    occurred_at INTEGER NOT NULL,
+    PRIMARY KEY (memory_id, version, ordinal),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE long_term_memory_terms (
+    memory_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    term TEXT NOT NULL CHECK (length(term) > 0),
+    PRIMARY KEY (memory_id, version, term),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX long_term_memory_terms_lookup ON long_term_memory_terms(term);
+CREATE INDEX long_term_memory_sources_claim
+    ON long_term_memory_sources(claim_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -832,6 +912,7 @@ where
             10 => transaction.execute_batch(MIGRATION_10)?,
             11 => transaction.execute_batch(MIGRATION_11)?,
             12 => transaction.execute_batch(MIGRATION_12)?,
+            13 => transaction.execute_batch(MIGRATION_13)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1388,6 +1469,57 @@ mod tests {
         let table_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'understanding_projections'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_memory_migration_keeps_understanding_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+            MIGRATION_12,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 12).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 13 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(13))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'long_term_memories'",
                 [],
                 |row| row.get(0),
             )

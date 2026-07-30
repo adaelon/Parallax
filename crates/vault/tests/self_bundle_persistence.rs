@@ -153,7 +153,7 @@ fn initial_bundle() -> SelfBundleState {
 fn reopens_one_complete_self_bundle_with_identity_relationship_beliefs_and_intentions() {
     let directory = tempdir().unwrap();
     let (repository, belief_ref) = repository_with_identity(directory.path());
-    assert_eq!(repository.schema_version().unwrap(), 12);
+    assert_eq!(repository.schema_version().unwrap(), 13);
     let work = PersistenceWakeWork {
         mode: WorkMode::PersistValid(belief_ref),
     };

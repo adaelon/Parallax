@@ -29,6 +29,10 @@ use eam_ingestion::{
     SourceAnchor, UnparsedReason, ValidatedExtraction,
 };
 use eam_markdown::{MarkdownBlockKind, MarkdownRelationKind, ParseResource, ParsedMarkdownV1};
+use eam_memory::{
+    LongTermMemoryRepository, MAX_MEMORY_SOURCES, MemoryBasis, MemoryConfidence, MemoryId,
+    MemoryKind, MemoryStatus, MemorySubject, MemoryTarget, MemoryVersion, ValidatedMemoryProposal,
+};
 use eam_retrieval::{
     AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, EMBEDDING_MODEL_VERSION,
     IndexBuildReceipt, IndexDisposition, RETRIEVAL_INDEX_VERSION, RecallChannels, RecallHit,
@@ -61,6 +65,7 @@ const TEMPORAL_NEIGHBOR_RADIUS_MILLIS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_TEMPORAL_NEIGHBORS: usize = 4;
 const MAX_RELATION_NEIGHBORS: usize = 8;
 const MAX_UNDERSTANDING_CANDIDATES: usize = 128;
+const MAX_LONG_TERM_MEMORY_CANDIDATES: usize = 128;
 
 pub struct VaultRepository {
     connection: Option<Connection>,
@@ -1316,6 +1321,13 @@ impl RetrievalRepository for VaultRepository {
         recall_retrieval_neighbors(self.connection(), reference)
     }
 
+    fn recall_long_term_memory_candidates(
+        &self,
+        query: &RetrievalQuery,
+    ) -> Result<Vec<RecallHit>, Self::Error> {
+        recall_long_term_memory_candidates(self.connection(), query)
+    }
+
     fn recall_understanding_candidates(
         &self,
         query: &RetrievalQuery,
@@ -1402,6 +1414,418 @@ impl UnderstandingRepository for VaultRepository {
             build.material_digest(),
         )
     }
+}
+
+impl LongTermMemoryRepository for VaultRepository {
+    fn claim(&self, id: ClaimId) -> Result<Option<Claim>, RepositoryError> {
+        load_claim(self.connection(), id)
+    }
+
+    fn append_memory(
+        &mut self,
+        proposal: ValidatedMemoryProposal,
+        formed_at: Timestamp,
+    ) -> Result<MemoryVersion, RepositoryError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        validate_persisted_memory_sources(&transaction, &proposal)?;
+        let (memory_id, version, predecessor_version) = match proposal.target() {
+            MemoryTarget::New => {
+                let id = next_identifier(&transaction, "long_term_memories")
+                    .map_err(repository_error)?;
+                transaction
+                    .execute(
+                        "INSERT INTO long_term_memories (id, created_at) VALUES (?1, ?2)",
+                        params![to_sql_id(id)?, formed_at.as_millis()],
+                    )
+                    .map_err(repository_error)?;
+                (id, 1, None)
+            }
+            MemoryTarget::Revise {
+                memory_id,
+                expected_version,
+            } => {
+                let current = load_current_memory(&transaction, memory_id)?
+                    .ok_or_else(|| RepositoryError::new("memory does not exist"))?;
+                if current.version() != expected_version {
+                    return Err(RepositoryError::new("stale memory version"));
+                }
+                if current.subject() != proposal.subject() {
+                    return Err(RepositoryError::new(
+                        "memory revision cannot change ledger attribution",
+                    ));
+                }
+                insert_memory_state_event(
+                    &transaction,
+                    memory_id,
+                    expected_version,
+                    MemoryStatus::Superseded,
+                    formed_at,
+                )?;
+                let version = expected_version
+                    .checked_add(1)
+                    .ok_or_else(|| RepositoryError::new("memory version space exhausted"))?;
+                (memory_id.get(), version, Some(expected_version))
+            }
+        };
+        let memory_id =
+            MemoryId::new(memory_id).ok_or_else(|| RepositoryError::new("invalid memory id"))?;
+        insert_memory_version(
+            &transaction,
+            memory_id,
+            version,
+            predecessor_version,
+            &proposal,
+            formed_at,
+        )?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(MemoryVersion::restore(
+            memory_id,
+            version,
+            predecessor_version,
+            proposal.statement().to_owned(),
+            proposal.subject(),
+            proposal.kind(),
+            proposal.source_claim_ids().to_vec(),
+            proposal.applicable_time(),
+            proposal.confidence(),
+            proposal.salience_reason().to_owned(),
+            proposal.basis(),
+            proposal.initial_status(),
+            formed_at,
+        ))
+    }
+
+    fn current_memory(&self, id: MemoryId) -> Result<Option<MemoryVersion>, RepositoryError> {
+        load_current_memory(self.connection(), id)
+    }
+
+    fn memory_versions(&self, id: MemoryId) -> Result<Vec<MemoryVersion>, RepositoryError> {
+        load_memory_versions(self.connection(), Some(id))
+    }
+
+    fn all_memory_versions(&self) -> Result<Vec<MemoryVersion>, RepositoryError> {
+        load_memory_versions(self.connection(), None)
+    }
+}
+
+fn validate_persisted_memory_sources(
+    connection: &Connection,
+    proposal: &ValidatedMemoryProposal,
+) -> Result<(), RepositoryError> {
+    let expected_owner = match proposal.subject() {
+        MemorySubject::Person => ClaimOwner::Person,
+        MemorySubject::Counterpart => ClaimOwner::Counterpart,
+        MemorySubject::Shared => ClaimOwner::Shared,
+    };
+    for claim_id in proposal.source_claim_ids() {
+        let owner = connection
+            .query_row(
+                "SELECT owner FROM claims WHERE id = ?1",
+                [to_sql_id(claim_id.get())?],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(repository_error)?
+            .ok_or_else(|| RepositoryError::new("memory source claim does not exist"))?;
+        if decode_owner(owner)? != expected_owner {
+            return Err(RepositoryError::new(
+                "memory source claim changed ledger attribution",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn insert_memory_version(
+    transaction: &rusqlite::Transaction<'_>,
+    memory_id: MemoryId,
+    version: u64,
+    predecessor_version: Option<u64>,
+    proposal: &ValidatedMemoryProposal,
+    formed_at: Timestamp,
+) -> Result<(), RepositoryError> {
+    if proposal.initial_status() == MemoryStatus::Superseded {
+        return Err(RepositoryError::new(
+            "a new memory version cannot start superseded",
+        ));
+    }
+    let (applicable_kind, applicable_start, applicable_end) =
+        encode_applicable_time(proposal.applicable_time());
+    transaction
+        .execute(
+            "INSERT INTO long_term_memory_versions
+             (memory_id, version, predecessor_version, subject, kind, statement,
+              confidence, applicable_kind, applicable_start, applicable_end,
+              salience_reason, basis, formed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                to_sql_id(memory_id.get())?,
+                to_sql_id(version)?,
+                predecessor_version.map(to_sql_id).transpose()?,
+                encode_memory_subject(proposal.subject()),
+                encode_memory_kind(proposal.kind()),
+                proposal.statement(),
+                encode_memory_confidence(proposal.confidence()),
+                applicable_kind,
+                applicable_start,
+                applicable_end,
+                proposal.salience_reason(),
+                encode_memory_basis(proposal.basis()),
+                formed_at.as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    for (ordinal, claim_id) in proposal.source_claim_ids().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO long_term_memory_sources
+                 (memory_id, version, ordinal, claim_id) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    to_sql_id(memory_id.get())?,
+                    to_sql_id(version)?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(claim_id.get())?,
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    let mut terms = BTreeSet::new();
+    terms.extend(search_terms(proposal.statement()));
+    terms.extend(search_terms(proposal.salience_reason()));
+    for term in terms {
+        transaction
+            .execute(
+                "INSERT INTO long_term_memory_terms (memory_id, version, term)
+                 VALUES (?1, ?2, ?3)",
+                params![to_sql_id(memory_id.get())?, to_sql_id(version)?, term],
+            )
+            .map_err(repository_error)?;
+    }
+    insert_memory_state_event(
+        transaction,
+        memory_id,
+        version,
+        proposal.initial_status(),
+        formed_at,
+    )
+}
+
+fn insert_memory_state_event(
+    connection: &Connection,
+    memory_id: MemoryId,
+    version: u64,
+    status: MemoryStatus,
+    occurred_at: Timestamp,
+) -> Result<(), RepositoryError> {
+    let ordinal: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0)
+             FROM long_term_memory_state_events
+             WHERE memory_id = ?1 AND version = ?2",
+            params![to_sql_id(memory_id.get())?, to_sql_id(version)?],
+            |row| row.get(0),
+        )
+        .map_err(repository_error)?;
+    connection
+        .execute(
+            "INSERT INTO long_term_memory_state_events
+             (memory_id, version, ordinal, status, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_sql_id(memory_id.get())?,
+                to_sql_id(version)?,
+                ordinal,
+                encode_memory_status(status),
+                occurred_at.as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    Ok(())
+}
+
+fn load_claim(connection: &Connection, id: ClaimId) -> Result<Option<Claim>, RepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT id, owner, statement, uncertainty, applicable_kind,
+                    applicable_start, applicable_end, recorded_at
+             FROM claims WHERE id = ?1",
+            [to_sql_id(id.get())?],
+            stored_claim_from_row,
+        )
+        .optional()
+        .map_err(repository_error)?;
+    stored.map(|stored| stored.decode(connection)).transpose()
+}
+
+fn load_current_memory(
+    connection: &Connection,
+    id: MemoryId,
+) -> Result<Option<MemoryVersion>, RepositoryError> {
+    let version = connection
+        .query_row(
+            "SELECT MAX(version) FROM long_term_memory_versions WHERE memory_id = ?1",
+            [to_sql_id(id.get())?],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(repository_error)?;
+    let Some(version) = version else {
+        return Ok(None);
+    };
+    let version = u64::try_from(version).map_err(repository_error)?;
+    load_memory_version(connection, id, version).map(Some)
+}
+
+fn load_memory_versions(
+    connection: &Connection,
+    only_id: Option<MemoryId>,
+) -> Result<Vec<MemoryVersion>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT memory_id, version FROM long_term_memory_versions
+             WHERE (?1 IS NULL OR memory_id = ?1)
+             ORDER BY memory_id, version",
+        )
+        .map_err(repository_error)?;
+    let rows = statement
+        .query_map(
+            [only_id.map(|id| to_sql_id(id.get())).transpose()?],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)?;
+    drop(statement);
+    rows.into_iter()
+        .map(|(memory_id, version)| {
+            let memory_id = u64::try_from(memory_id).map_err(repository_error)?;
+            let memory_id = MemoryId::new(memory_id)
+                .ok_or_else(|| RepositoryError::new("invalid persisted memory id"))?;
+            let version = u64::try_from(version).map_err(repository_error)?;
+            load_memory_version(connection, memory_id, version)
+        })
+        .collect()
+}
+
+fn load_memory_version(
+    connection: &Connection,
+    memory_id: MemoryId,
+    version: u64,
+) -> Result<MemoryVersion, RepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT predecessor_version, statement, subject, kind, confidence,
+                    applicable_kind, applicable_start, applicable_end,
+                    salience_reason, basis, formed_at,
+                    (SELECT status FROM long_term_memory_state_events e
+                     WHERE e.memory_id = v.memory_id AND e.version = v.version
+                     ORDER BY ordinal DESC LIMIT 1)
+             FROM long_term_memory_versions v
+             WHERE memory_id = ?1 AND version = ?2",
+            params![to_sql_id(memory_id.get())?, to_sql_id(version)?],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(repository_error)?
+        .ok_or_else(|| RepositoryError::new("memory version does not exist"))?;
+    let (
+        predecessor_version,
+        statement,
+        subject,
+        kind,
+        confidence,
+        applicable_kind,
+        applicable_start,
+        applicable_end,
+        salience_reason,
+        basis,
+        formed_at,
+        status,
+    ) = stored;
+    let predecessor_version = predecessor_version
+        .map(u64::try_from)
+        .transpose()
+        .map_err(repository_error)?;
+    if (version == 1 && predecessor_version.is_some())
+        || (version > 1 && predecessor_version != Some(version - 1))
+    {
+        return Err(RepositoryError::new(
+            "invalid persisted memory version chain",
+        ));
+    }
+    let status = status.ok_or_else(|| RepositoryError::new("memory version has no state event"))?;
+    Ok(MemoryVersion::restore(
+        memory_id,
+        version,
+        predecessor_version,
+        statement,
+        decode_memory_subject(subject)?,
+        decode_memory_kind(kind)?,
+        load_memory_sources(connection, memory_id, version)?,
+        decode_applicable_time(applicable_kind, applicable_start, applicable_end)?,
+        decode_memory_confidence(confidence)?,
+        salience_reason,
+        decode_memory_basis(basis)?,
+        decode_memory_status(status)?,
+        Timestamp::from_millis(formed_at),
+    ))
+}
+
+fn load_memory_sources(
+    connection: &Connection,
+    memory_id: MemoryId,
+    version: u64,
+) -> Result<Vec<ClaimId>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT ordinal, claim_id FROM long_term_memory_sources
+             WHERE memory_id = ?1 AND version = ?2 ORDER BY ordinal",
+        )
+        .map_err(repository_error)?;
+    let rows = statement
+        .query_map(
+            params![to_sql_id(memory_id.get())?, to_sql_id(version)?],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)?;
+    if rows.is_empty() || rows.len() > MAX_MEMORY_SOURCES {
+        return Err(RepositoryError::new(
+            "invalid persisted memory source count",
+        ));
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(expected_ordinal, (ordinal, claim_id))| {
+            if usize::try_from(ordinal).ok() != Some(expected_ordinal) {
+                return Err(RepositoryError::new(
+                    "invalid persisted memory source order",
+                ));
+            }
+            let claim_id = u64::try_from(claim_id).map_err(repository_error)?;
+            Ok(ClaimId::from_raw(claim_id))
+        })
+        .collect()
 }
 
 impl MemoryRepository for VaultRepository {
@@ -3504,6 +3928,102 @@ fn hash_retrieval_graph_index(
         }
     }
     Ok(())
+}
+
+fn recall_long_term_memory_candidates(
+    connection: &Connection,
+    query: &RetrievalQuery,
+) -> Result<Vec<RecallHit>, VaultError> {
+    let mut terms = BTreeSet::new();
+    if let Some(text) = query.text() {
+        terms.extend(search_terms(text));
+    }
+    for entity in query.entities() {
+        terms.extend(search_terms(entity));
+    }
+    let start = query.time().map(eam_retrieval::TimeRange::start_millis);
+    let end = query.time().map(eam_retrieval::TimeRange::end_millis);
+    let mut claim_ids = BTreeSet::new();
+    if terms.is_empty() {
+        let mut statement = connection.prepare(
+            "SELECT s.claim_id
+             FROM long_term_memory_versions v
+             JOIN long_term_memory_sources s
+               ON s.memory_id = v.memory_id AND s.version = v.version
+             WHERE v.version = (
+                       SELECT MAX(latest.version) FROM long_term_memory_versions latest
+                       WHERE latest.memory_id = v.memory_id
+                   )
+               AND (SELECT e.status FROM long_term_memory_state_events e
+                    WHERE e.memory_id = v.memory_id AND e.version = v.version
+                    ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2)
+               AND (?1 IS NULL OR (
+                    v.applicable_start IS NOT NULL
+                    AND v.applicable_start <= ?2
+                    AND (v.applicable_kind = 1
+                         OR COALESCE(v.applicable_end, v.applicable_start) >= ?1)
+               ))
+             ORDER BY v.memory_id, s.ordinal",
+        )?;
+        for claim_id in statement
+            .query_map(params![start, end], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            claim_ids.insert(u64::try_from(claim_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?);
+            if claim_ids.len() == MAX_LONG_TERM_MEMORY_CANDIDATES {
+                break;
+            }
+        }
+    } else {
+        for term in terms {
+            let mut statement = connection.prepare(
+                "SELECT s.claim_id
+                 FROM long_term_memory_terms t
+                 JOIN long_term_memory_versions v
+                   ON v.memory_id = t.memory_id AND v.version = t.version
+                 JOIN long_term_memory_sources s
+                   ON s.memory_id = v.memory_id AND s.version = v.version
+                 WHERE t.term = ?1
+                   AND v.version = (
+                       SELECT MAX(latest.version) FROM long_term_memory_versions latest
+                       WHERE latest.memory_id = v.memory_id
+                   )
+                   AND (SELECT e.status FROM long_term_memory_state_events e
+                        WHERE e.memory_id = v.memory_id AND e.version = v.version
+                        ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2)
+                   AND (?2 IS NULL OR (
+                        v.applicable_start IS NOT NULL
+                        AND v.applicable_start <= ?3
+                        AND (v.applicable_kind = 1
+                             OR COALESCE(v.applicable_end, v.applicable_start) >= ?2)
+                   ))
+                 ORDER BY v.memory_id, s.ordinal",
+            )?;
+            for claim_id in statement
+                .query_map(params![term, start, end], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                claim_ids
+                    .insert(u64::try_from(claim_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?);
+                if claim_ids.len() == MAX_LONG_TERM_MEMORY_CANDIDATES {
+                    break;
+                }
+            }
+            if claim_ids.len() == MAX_LONG_TERM_MEMORY_CANDIDATES {
+                break;
+            }
+        }
+    }
+    Ok(claim_ids
+        .into_iter()
+        .map(|claim_id| {
+            RecallHit::new(
+                CandidateRef::ledger(ClaimId::from_raw(claim_id)),
+                RecallChannels::long_term_memory(),
+                0,
+            )
+        })
+        .collect())
 }
 
 fn recall_understanding_candidates(
@@ -5807,6 +6327,97 @@ fn decode_owner(value: i64) -> Result<ClaimOwner, RepositoryError> {
         1 => Ok(ClaimOwner::Counterpart),
         2 => Ok(ClaimOwner::Shared),
         _ => Err(RepositoryError::new("invalid persisted claim owner")),
+    }
+}
+
+const fn encode_memory_subject(value: MemorySubject) -> i64 {
+    match value {
+        MemorySubject::Person => 0,
+        MemorySubject::Counterpart => 1,
+        MemorySubject::Shared => 2,
+    }
+}
+
+fn decode_memory_subject(value: i64) -> Result<MemorySubject, RepositoryError> {
+    match value {
+        0 => Ok(MemorySubject::Person),
+        1 => Ok(MemorySubject::Counterpart),
+        2 => Ok(MemorySubject::Shared),
+        _ => Err(RepositoryError::new("invalid persisted memory subject")),
+    }
+}
+
+const fn encode_memory_kind(value: MemoryKind) -> i64 {
+    match value {
+        MemoryKind::Fact => 0,
+        MemoryKind::Preference => 1,
+        MemoryKind::Goal => 2,
+        MemoryKind::Relationship => 3,
+        MemoryKind::Hypothesis => 4,
+    }
+}
+
+fn decode_memory_kind(value: i64) -> Result<MemoryKind, RepositoryError> {
+    match value {
+        0 => Ok(MemoryKind::Fact),
+        1 => Ok(MemoryKind::Preference),
+        2 => Ok(MemoryKind::Goal),
+        3 => Ok(MemoryKind::Relationship),
+        4 => Ok(MemoryKind::Hypothesis),
+        _ => Err(RepositoryError::new("invalid persisted memory kind")),
+    }
+}
+
+const fn encode_memory_confidence(value: MemoryConfidence) -> i64 {
+    match value {
+        MemoryConfidence::Low => 0,
+        MemoryConfidence::Medium => 1,
+        MemoryConfidence::High => 2,
+    }
+}
+
+fn decode_memory_confidence(value: i64) -> Result<MemoryConfidence, RepositoryError> {
+    match value {
+        0 => Ok(MemoryConfidence::Low),
+        1 => Ok(MemoryConfidence::Medium),
+        2 => Ok(MemoryConfidence::High),
+        _ => Err(RepositoryError::new("invalid persisted memory confidence")),
+    }
+}
+
+const fn encode_memory_basis(value: MemoryBasis) -> i64 {
+    match value {
+        MemoryBasis::DirectEvidence => 0,
+        MemoryBasis::InterpretiveInference => 1,
+        MemoryBasis::PatternCandidate => 2,
+    }
+}
+
+fn decode_memory_basis(value: i64) -> Result<MemoryBasis, RepositoryError> {
+    match value {
+        0 => Ok(MemoryBasis::DirectEvidence),
+        1 => Ok(MemoryBasis::InterpretiveInference),
+        2 => Ok(MemoryBasis::PatternCandidate),
+        _ => Err(RepositoryError::new("invalid persisted memory basis")),
+    }
+}
+
+const fn encode_memory_status(value: MemoryStatus) -> i64 {
+    match value {
+        MemoryStatus::Active => 0,
+        MemoryStatus::Provisional => 1,
+        MemoryStatus::ProvisionalPattern => 2,
+        MemoryStatus::Superseded => 3,
+    }
+}
+
+fn decode_memory_status(value: i64) -> Result<MemoryStatus, RepositoryError> {
+    match value {
+        0 => Ok(MemoryStatus::Active),
+        1 => Ok(MemoryStatus::Provisional),
+        2 => Ok(MemoryStatus::ProvisionalPattern),
+        3 => Ok(MemoryStatus::Superseded),
+        _ => Err(RepositoryError::new("invalid persisted memory status")),
     }
 }
 

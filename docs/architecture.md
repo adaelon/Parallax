@@ -40,7 +40,7 @@ flowchart LR
             Vault[Evidence Vault<br/>SQLCipher + 加密对象库]
             Ledgers[时间化三账本]
             Retrieval[检索领域契约与编排<br/>crates/retrieval]
-            Indexes[可重建检索与理解投影<br/>SQLCipher schema v12+]
+            Indexes[可重建检索、理解投影与记忆路由<br/>SQLCipher schema v13+]
             Understanding[选择性深度理解投影]
             SelfBundle[Self Bundle]
             Memory[长期记忆维护器]
@@ -270,6 +270,8 @@ S13 将 `self.db` schema 升至 v10：`retrieval_*` 表保存 `eam-retrieval-v1`
 S14 将 `self.db` schema 升至 v11：`retrieval_block_vectors` 保存 `eam-subword-hash-embedding-v1` 的 256 维定长派生向量，并由 `eam-retrieval-v2` 元数据摘要覆盖。向量表与全文、时间、关系索引在同一事务内重建；模型版本、维度、向量字节或摘要不一致均失败关闭并从规范证据重建，不修改证据块或账本。
 
 S15 将 `self.db` schema 升至 v12：`understanding_projections` 保存 `eam-understanding-v1` 的有限触发 recipe、投影类型、代次、状态与物化摘要，来源块和结构化语句分别保持精确引用；`understanding_projection_artifacts/terms` 是可删除、可重建的路由派生物。相邻修订只查询引用变化块的活动投影：`UNCHANGED/MOVED` 前移引用并提升代次后重建，`MODIFIED/REMOVED/AMBIGUOUS` 只使相关投影失效并移除路由 artifact。
+
+S16 将 `self.db` schema 升至 v13：`long_term_memories/versions` 保存稳定记忆 ID 与不可变后继版本，来源只引用三账本 Claim；`long_term_memory_state_events` 追加 `ACTIVE/PROVISIONAL/PROVISIONAL_PATTERN/SUPERSEDED` 状态，`long_term_memory_terms` 只为当前版本提供可重建路由。显式修订在同一事务追加前版 `SUPERSEDED` 事件和完整后继版本；账本入账与理解投影均无自动创建记忆的数据库路径。
 
 ### 4.2 逻辑数据模型
 
@@ -758,7 +760,7 @@ retrieve(intent):
 
 S13 当前实现由 `crates/retrieval` 固定查询、通道、范围和权威候选契约，由 `VaultRepository` 实现本地多路召回。全文词项兼容 ASCII 大小写与 Unicode/CJK 字符、双字和整词；显式时间范围是所有通道的交集门禁，账本按 `At/Since/Between` 有效期召回，证据按记录时间召回；实体关系从当前 locator、别名、标签、Properties 和已解析内部关系产生候选。索引只返回 `EvidenceBlockRef | ClaimId`，随后必须认证回读规范文本或校验账本逐字来源；索引片段本身没有事实资格。
 
-S14 以 [G07 Retrieval Contract v2](retrieval-contract-v2.md) 固定 256 维本地子词特征哈希模型、SQLCipher 精确余弦扫描、64 个向量初选、确定性跨通道重排和 128～32,768 estimated token budget。`freeze_working_context` 对种子执行前后各一块的结构邻域、7 天同来源时间邻域和一跳关系邻域，逐项权威回读后按预算保留完整块而不截断；最终冻结窗口、账本来源、归属、时间、当前性和 SHA-256 replay digest。长期记忆通道已有独立契约与排序位，但在 S16 写入显式长期记忆前，Vault 稳定返回空集，不把普通账本冒充记忆。桌面对话以本人当前消息调用该构造器，运行时与外发审计只接收冻结结果，不接收 repository、向量或未选候选。
+S14 以 [G07 Retrieval Contract v2](retrieval-contract-v2.md) 固定 256 维本地子词特征哈希模型、SQLCipher 精确余弦扫描、64 个向量初选、确定性跨通道重排和 128～32,768 estimated token budget。`freeze_working_context` 对种子执行前后各一块的结构邻域、7 天同来源时间邻域和一跳关系邻域，逐项权威回读后按预算保留完整块而不截断；最终冻结窗口、账本来源、归属、时间、当前性和 SHA-256 replay digest。S16 后长期记忆通道只搜索当前非取代版本的记忆路由词，并把命中解析为其三账本来源 Claim；无显式提议时稳定为空，不把普通账本或记忆文本本身冒充权威来源。桌面对话以本人当前消息调用该构造器，运行时与外发审计只接收冻结结果，不接收 repository、向量、记忆内部状态或未选候选。
 
 S15 以 `eam-understanding-v1` 固定本人指定、反复召回（至少两次）、重要变化和当前任务四类显式触发，以及事件链、人物/主题关系和阶段概括三类结构化投影。单个 recipe 最多引用 64 个权威证据块；活动且 artifact 摘要一致的投影只能用主题、触发说明和解释语句贡献候选块引用，随后与其他通道共同经过时间交集、来源范围、权威回读、邻域和预算门禁。投影 recipe、解释文本、代次和状态不进入 `WorkingContext` 或运行时请求，因此投影不能取得事实或长期记忆资格。
 
@@ -806,6 +808,8 @@ MemoryReviewRequested
 维护器不逐条为所有事件生成解释，也不重写完整身份。第二自我的判断只能写入第二自我账本。
 
 深度理解投影与长期记忆是两个独立层：前者是可重建的证据结构，后者是第二自我选择跨任务保留的认识。投影不能绕过记忆写入策略直接成为长期信念。
+
+S16 当前实现由 `crates/memory` 固定不完整提议表示、三账本来源校验、可信度上限、直接证据严格条件和显式版本目标。`MemoryMaintenance::propose` 是唯一领域入口：直接证据写 `ACTIVE`，解释性推断写 `PROVISIONAL`，模式候选只写 `PROVISIONAL_PATTERN`；Vault 在 schema v13 中原子追加版本与状态事件。S17 的争议状态、S18 的纠错传播和 S27 的三事件门槛/成熟提议仍不在本片入口内。
 
 ### 5.7 纠错与遗忘
 
@@ -957,7 +961,7 @@ self.db + objects + deletion state
 | 退出确认、解释义务与不可否决通知 | [ADR-0032：约定退出采用非对称仪式](adr/0032-asymmetric-ceremony-for-agreement-withdrawal.md) |
 | 约定范围、生效时间与显式持续有效 | [ADR-0033：共同约定签署明确边界](adr/0033-shared-agreements-sign-explicit-scope-and-validity.md) |
 | 约定冲突、显式取代与历史保留 | [ADR-0034：冲突约定必须显式取代](adr/0034-conflicting-agreements-require-explicit-supersession.md) |
-| 账本、记忆提议与长期记忆晋升 | [ADR-0035：长期记忆由第二自我显式提议](adr/0035-counterpart-explicitly-proposes-long-term-memory.md) |
+| `crates/memory`、schema v13 记忆版本、账本来源召回与长期记忆晋升 | [ADR-0035：长期记忆由第二自我显式提议](adr/0035-counterpart-explicitly-proposes-long-term-memory.md) |
 | 本人质疑、第二自我复核与争议判断 | [ADR-0036：记忆否定采用说服与争议](adr/0036-memory-challenges-require-persuasion.md) |
 | 争议召回、自然表达与高影响披露 | [ADR-0037：争议记忆采用自然分层披露](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) |
 | 共同经历定义、关系事件边界与普通互动 | [ADR-0038：共同经历采用狭义关系事件边界](adr/0038-shared-experience-uses-narrow-relational-event-boundary.md) |
@@ -1430,3 +1434,36 @@ adjacent lineage batch
 ```
 
 S15 不创建长期记忆、不把投影解释文本外发、不自动扫描非触发证据，也不自动复核失效的变化语义；S16 才定义长期记忆提议与版本维护。投影删除只移除可重建 artifact，durable recipe 和不可变证据引用仍留在加密边界内；来源语义变化则失败关闭，必须由后续合格触发形成新投影。
+
+### 9.16 S16 长期记忆显式提议与版本维护当前实现边界
+
+```text
+crates/memory/src/
+  domain.rs                         # MemoryProposal、状态、稳定 ID 与不可变版本
+  service.rs                        # 来源/归属/时间/可信度/保留理由门禁
+  ports.rs                          # 三账本点查、版本追加与读取契约
+crates/vault/src/
+  schema.rs                         # schema v13 版本、来源、状态事件与路由词
+  repository.rs                     # 原子取代、跨重启解码与当前记忆召回
+crates/retrieval/src/lib.rs
+  RecallChannels::long_term_memory  # 只返回记忆选中的权威 Claim 引用
+```
+
+```text
+ledger Claim alone ------------------------------------------> no Memory
+explicit MemoryProposal
+  -> resolve every Claim + validate one ledger attribution
+  -> validate applicable time + confidence ceiling + salience reason
+  -> DirectEvidence        -> ACTIVE
+  -> InterpretiveInference -> PROVISIONAL
+  -> PatternCandidate      -> PROVISIONAL_PATTERN
+  -> append immutable version + state event in one transaction
+
+explicit revision(memory_id, expected_version)
+  -> compare current version + preserve subject attribution
+  -> previous version += SUPERSEDED event
+  -> append complete successor version
+  -> recall routes only through latest non-superseded version
+```
+
+直接证据必须是一个无不确定性的同账本 Claim，提议陈述和适用时间与来源完全一致且可信度为高；否则不能获得 `ACTIVE`。解释性推断即使可信度较高也保持 `PROVISIONAL`。模式候选在 S16 只获得独立状态，不实现 S27 的三事件资格或 `SUPPORTED_COUNTERPART_VIEW` 成熟路径；账本和 S15 投影没有调用 `append_memory` 的自动入口。

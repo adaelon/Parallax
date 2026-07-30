@@ -6,6 +6,7 @@ members = [
     "crates/identity",
     "crates/ingestion",
     "crates/markdown",
+    "crates/memory",
     "crates/retrieval",
     "crates/runtime-gateway",
     "crates/source-obsidian",
