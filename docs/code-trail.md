@@ -1,5 +1,42 @@
 # 代码链路
 
+## 2026-07-30 S18-3 交叉回归加固与全仓门禁
+
+**触达**:
+- `crates/core/src/memory_loop.rs:MemoryCore::correct_person_fact` — 在分配证据和 Claim ID 前统一拒绝与旧陈述相同的伪纠错。
+- `crates/memory/src/service.rs:validate_dispute`、`crates/memory/src/in_memory.rs:append_memory_dispute` — 把 open 争议唯一性绑定到不可变记忆版本，保留旧争议而不阻塞后继版本。
+- `crates/vault/src/schema.rs:claim_correction_migration_backfills_existing_claim_and_retrieval_state` — 验证 schema v14 有数据升级后的 Claim 与检索状态回填。
+- `crates/vault/tests/claim_correction_persistence.rs:correction_preserves_an_old_open_dispute_without_blocking_the_successor_version` — 覆盖 S17 open 争议与 S18 自动后继记忆的交叉路径。
+- `docs/architecture.md:§9.18` — 固化 S18 文件入口、事务传播流程、当前/历史分流及不做边界。
+
+**入口**：伪纠错在 Core 领域门禁失败；真实纠错命中争议记忆时保留旧版本争议，后继记忆仍可通过 `MemoryMaintenance::raise_dispute` 独立进入新争议。
+**测试**：全仓 Rust 168/168、workspace clippy、fmt、desktop-app all-targets check、3 个变更 Markdown 的 97 个本地链接及 `git diff --check` 全部通过。
+
+## 2026-07-30 S18-2 schema v15 纠错持久化与局部传播
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_15` — 回填 Claim 当前状态，新增不可变取代事件、按记忆版本隔离的争议约束、记忆传播工作项和 Claim 检索状态。
+- `crates/vault/src/repository.rs:ClaimCorrectionRepository::commit_person_fact_correction` — 在一个 SQLCipher 事务内提交纠错证据、Claim 后继链、直接依赖记忆和旧/新两条 Claim 检索投影。
+- `crates/memory/src/service.rs:validate_proposal/validate_dispute` — 禁止旧 Claim 新晋升，并让旧版本未复核争议不阻塞后继记忆版本。
+- `crates/retrieval/src/context.rs:replay_digest`、`crates/runtime-gateway/src/adapter.rs:RetrievedClaimInput` — 把 Claim 状态和前后继关系纳入快照摘要及历史运行时出口。
+- `crates/vault/tests/claim_correction_persistence.rs`、`crates/vault/src/schema.rs:tests` — 覆盖相关/无关记忆、当前/历史召回、跨重启、v14 有数据回填、迁移中断及 S17×S18 跨版本争议。
+- `docs/architecture.md:§2/§4.1/§4.2/§5.6/§5.7/§8/§9.18` — 对齐 schema v15、局部传播数据流和 S18 当前边界。
+
+**入口**：`MemoryCore::correct_person_fact` 校验后调用 Vault 原子提交；`retrieve` 按 `SourceScope::Current/Historical` 解析当前 Claim 或完整历史取代链。
+**测试**：core 12/12、memory 9/9、Vault 67/67 与 core/memory/retrieval/runtime-gateway/vault 目标 clippy 通过。
+
+## 2026-07-30 S18-1 时间化 Claim 纠错领域契约
+
+**触达**:
+- `crates/core/src/domain.rs:Claim/ClaimStatus/ClaimCorrectionReceipt` — 为 Claim 增加当前/已取代状态、显式前驱和传播计数回执。
+- `crates/core/src/ports.rs:ClaimCorrectionRepository` — 固定逐字纠错证据、后继本人事实和派生传播必须原子提交的仓储契约。
+- `crates/core/src/memory_loop.rs:MemoryCore::correct_person_fact` — 拒绝空文本、无效时间、非本人或已取代 Claim，并构造时间化后继。
+- `crates/core/src/in_memory.rs:ClaimCorrectionRepository` — 提供不留部分证据的最小原子实现。
+- `crates/core/tests/claim_corrections.rs` — 覆盖合法取代链、历史保留、非本人/已取代/无效时间拒绝。
+
+**入口**：可信调用方以旧本人事实 Claim ID、逐字修正和适用时间调用 `MemoryCore::correct_person_fact`。
+**测试**：core 11/11 与 `cargo clippy -p core --all-targets -- -D warnings` 通过。
+
 ## 2026-07-30 S17-4 修订关联补全、架构对齐与全仓门禁
 
 **触达**:

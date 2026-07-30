@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    Claim, ClaimId, ConversationEvidence, EvidenceId, PersonTurnClassification, RuntimeRequest,
-    RuntimeResponse, Timestamp,
+    Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceId,
+    PersonTurnClassification, RuntimeRequest, RuntimeResponse, Timestamp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +130,27 @@ pub trait MemoryRepository {
     ///
     /// Returns an adapter error when the backing store cannot be queried.
     fn all_claims(&self) -> Result<Vec<Claim>, RepositoryError>;
+}
+
+pub trait ClaimCorrectionRepository: MemoryRepository {
+    /// Resolves one claim together with its current temporal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the ledger cannot be queried.
+    fn claim(&self, id: ClaimId) -> Result<Option<Claim>, RepositoryError>;
+
+    /// Atomically appends correction evidence and a successor person claim,
+    /// marks its predecessor superseded, and propagates affected derived state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without leaving a partial correction.
+    fn commit_person_fact_correction(
+        &mut self,
+        evidence: ConversationEvidence,
+        replacement: Claim,
+    ) -> Result<ClaimCorrectionReceipt, RepositoryError>;
 }
 
 /// Runtime implementations receive only typed values selected by the trusted

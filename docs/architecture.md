@@ -40,7 +40,7 @@ flowchart LR
             Vault[Evidence Vault<br/>SQLCipher + 加密对象库]
             Ledgers[时间化三账本]
             Retrieval[检索领域契约与编排<br/>crates/retrieval]
-            Indexes[可重建检索、理解投影与记忆路由<br/>SQLCipher schema v14+]
+            Indexes[可重建检索、理解投影与记忆路由<br/>SQLCipher schema v15+]
             Understanding[选择性深度理解投影]
             SelfBundle[Self Bundle]
             Memory[长期记忆维护器]
@@ -275,6 +275,8 @@ S16 将 `self.db` schema 升至 v13：`long_term_memories/versions` 保存稳定
 
 S17 将 `self.db` schema 升至 v14：状态事件扩展 `DISPUTED/RETRACTED`；`memory_disputes` 保存本人理由、目标记忆版本、`OPEN/RETRACTED/REVISED/MAINTAINED` 复核结果和可选后继版本，两个有序子表分别保存本人反证与第二自我复核依据。提出异议在一个事务内追加争议和 `DISPUTED`；撤回、保持或修订在一个事务内提交复核、状态事件及可选后继版本。`memory_dispute_terms` 只作直接相关路由，权威双方内容仍回读记忆来源 Claim 与逐字对话证据。
 
+S18 将 `self.db` schema 升至 v15：`claims.supersedes_claim_id` 与 `claim_state_events` 保存不可改写的 Claim 后继链和 `CURRENT/SUPERSEDED` 状态事件，旧 schema Claim 回填为当前；`claim_correction_memory_work_items` 记录受影响记忆版本是已重建还是等待复核，`retrieval_claim_documents.claim_status` 区分当前与历史候选。纠错在一个 SQLCipher 事务内追加本人逐字证据、后继 Claim、旧 Claim 取代事件，只重建直接证据记忆、使解释性记忆失效，并更新旧/新两条 Claim 检索投影；未受影响记忆、证据索引和理解投影不重建。未完成复核的旧争议继续绑定其不可变记忆版本，不阻塞后继版本独立进入争议。
+
 ### 4.2 逻辑数据模型
 
 以下是架构契约，不是最终数据库模式：
@@ -399,7 +401,7 @@ PatternMaturityProposal {
 }
 
 MemoryDispute {
-  memory_id, raised_by = person,
+  memory_id, memory_version, raised_by = person,
   reason, counter_evidence_refs[], raised_at,
   outcome = OPEN | RETRACTED | REVISED | MAINTAINED,
   review?: { rationale, evidence_refs[], reviewed_at },
@@ -819,7 +821,7 @@ MemoryReviewRequested
 
 深度理解投影与长期记忆是两个独立层：前者是可重建的证据结构，后者是第二自我选择跨任务保留的认识。投影不能绕过记忆写入策略直接成为长期信念。
 
-S16 当前实现由 `crates/memory` 固定不完整提议表示、三账本来源校验、可信度上限、直接证据严格条件和显式版本目标。`MemoryMaintenance::propose` 是唯一领域入口：直接证据写 `ACTIVE`，解释性推断写 `PROVISIONAL`，模式候选只写 `PROVISIONAL_PATTERN`；Vault 从 schema v13 起原子追加版本与状态事件。S18 的纠错传播和 S27 的三事件门槛/成熟提议仍不在本片入口内。
+S16 当前实现由 `crates/memory` 固定不完整提议表示、三账本来源校验、可信度上限、直接证据严格条件和显式版本目标。`MemoryMaintenance::propose` 是唯一初始晋升入口：直接证据写 `ACTIVE`，解释性推断写 `PROVISIONAL`，模式候选只写 `PROVISIONAL_PATTERN`；Vault 从 schema v13 起原子追加版本与状态事件。S18 只在既有来源 Claim 被本人纠正时传播版本或失效，不创建无既有记忆依据的长期记忆；S27 的三事件门槛/成熟提议仍不在本片入口内。
 
 S17 在长期记忆普通通道之外增加 `recall_disputed_memories`：查询必须有文本或实体词，并直接命中当前记忆、本人异议或复核依据；适用时间仍是交集门禁。Vault 只返回最新且状态为 `DISPUTED` 的 `OPEN/MAINTAINED` 争议，并在可信边界内回读记忆来源 Claim、本人逐字反证和第二自我复核依据。Context Builder 优先把整对作为单个预算项冻结；任何一方缺失、状态损坏或预算不足都不返回半对。`DecisionImpact` 同时进入 replay digest，确保普通与高影响上下文不可误当成同一快照。
 
@@ -854,6 +856,8 @@ S17 在长期记忆普通通道之外增加 `recall_disputed_memories`：查询�
 恢复流程必须在重新开放检索前应用最新删除意图，避免旧备份复活已经遗忘的上下文。首版的遗忘语义是从活动保险库及可用派生数据中移除，不声称能够从 SSD 未分配块或用户保留的历史备份中完成法证级物理擦除。
 
 S17 当前实现由 `MemoryMaintenance::raise_dispute/review_dispute` 固定本人只能提出带逐字反证的异议，复核结果只能由第二自我提交。`OPEN -> MAINTAINED` 保持 `DISPUTED`；`OPEN -> RETRACTED` 停止全部召回，且相同陈述没有新增来源 Claim 时不得重提；`OPEN -> REVISED` 原子取代争议版本。运行时只接收完整争议对：普通模式要求自然保留实质分歧且禁止内部状态名或固定模板，高影响模式要求主动说明不确定性并至少引用一个争议依据入口，否则响应失败关闭。
+
+S18 当前实现由 `MemoryCore::correct_person_fact` 固定空文本、无变化文本、无效时间、非本人 Claim 和非当前 Claim 的拒绝；`VaultRepository::commit_person_fact_correction` 先校验可重建检索权威，再在单一事务中提交纠错证据、Claim 取代链、受影响记忆和两条 Claim 检索投影。直接证据记忆以完整后继版本承接修正，解释性记忆只标记 `SUPERSEDED` 并留下复核工作项；理解投影只引用证据块，没有 Claim 依赖时不产生伪失效。`current` 召回和权威解析排除旧 Claim，`historical` 保留旧 Claim、状态与前后继 ID，运行时快照摘要覆盖这条版本链；schema v14 有数据升级、迁移中断和跨重启均有确定性用例。
 
 ### 5.8 备份与恢复
 
@@ -977,6 +981,7 @@ self.db + objects + deletion state
 | 约定冲突、显式取代与历史保留 | [ADR-0034：冲突约定必须显式取代](adr/0034-conflicting-agreements-require-explicit-supersession.md) |
 | `crates/memory`、schema v13 记忆版本、账本来源召回与长期记忆晋升 | [ADR-0035：长期记忆由第二自我显式提议](adr/0035-counterpart-explicitly-proposes-long-term-memory.md) |
 | `crates/memory`、schema v14 争议状态、本人质疑与第二自我复核 | [ADR-0036：记忆否定采用说服与争议](adr/0036-memory-challenges-require-persuasion.md) |
+| `MemoryCore::correct_person_fact`、schema v15 Claim 取代、记忆传播与当前/历史检索 | [ADR-0003：时间化三账本](adr/0003-temporal-three-ledger-model.md)、[ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md)、[ADR-0036：记忆否定采用说服与争议](adr/0036-memory-challenges-require-persuasion.md) |
 | `crates/retrieval`、运行时出口、争议成对召回、自然表达与高影响披露 | [ADR-0037：争议记忆采用自然分层披露](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) |
 | 共同经历定义、关系事件边界与普通互动 | [ADR-0038：共同经历采用狭义关系事件边界](adr/0038-shared-experience-uses-narrow-relational-event-boundary.md) |
 | 身份自我塑造、版本演化与反思使命 | [ADR-0039：身份自主演化受宪法反思使命约束](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) |
@@ -1518,3 +1523,35 @@ retrieve(query with lexical/entity intent)
 ```
 
 S17 不实现 S18 的一般事实纠错传播、S19 遗忘删除或 S27 模式成熟/强反例 `WEAKENED`；`DecisionImpact` 由可信调用方显式标注，不让模型自行把普通建议升级或降级以规避披露。
+
+### 9.18 S18 纠错传播与时间化取代当前实现边界
+
+```text
+crates/core/src/
+  domain.rs / ports.rs              # Claim 状态、显式前后继与原子纠错仓储契约
+  memory_loop.rs                    # 本人事实纠错门禁与后继 Claim 构造
+crates/memory/src/service.rs         # 旧 Claim 禁止新晋升、争议按记忆版本隔离
+crates/vault/src/
+  schema.rs                         # schema v15 Claim 事件、记忆工作项与检索状态
+  repository.rs                     # SQLCipher 原子传播、局部记忆版本与两条 Claim 投影
+crates/retrieval/src/context.rs      # Claim 状态和前后继进入 replay digest
+crates/runtime-gateway/src/adapter.rs # 历史查询向运行时暴露明确取代链
+```
+
+```text
+correct_person_fact(old_claim, corrected_statement, applicable_time)
+  -> validate current person Claim + changed text + valid time
+  -> append exact person conversation evidence
+  -> append replacement Claim(supersedes = old_claim)
+  -> append old Claim SUPERSEDED event(caused_by = replacement)
+  -> for current memories directly sourcing old_claim:
+       direct evidence -> SUPERSEDED old version + ACTIVE successor
+       interpretation  -> SUPERSEDED + persisted review work item
+  -> mark old retrieval Claim historical + index replacement Claim
+  -> commit all durable changes in one SQLCipher transaction
+
+retrieve(scope = current)    -> only ClaimStatus::Current
+retrieve(scope = historical) -> both Claims + supersedes/superseded_by chain
+```
+
+S18 不把纠错等同遗忘，不删除旧证据、Claim、记忆版本或争议；不重写解释性记忆，不重建无 Claim 依赖的证据块/向量/理解投影，也不实现 S19 的删除传播。

@@ -1,6 +1,6 @@
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, EvidenceCitation, EvidenceId, IncrementingClock,
-    Timestamp, Uncertainty,
+    ApplicableTime, Claim, ClaimId, ClaimOwner, ClaimStatus, EvidenceCitation, EvidenceId,
+    IncrementingClock, Timestamp, Uncertainty,
 };
 use eam_memory::{
     InMemoryLongTermMemoryRepository, LongTermMemoryRepository, MemoryBasis, MemoryConfidence,
@@ -182,6 +182,51 @@ fn missing_fields_and_cross_ledger_subjects_are_rejected_without_writes() {
             MemoryProposalRejectionReason::ConfidenceExceedsSource(id)
         )) if id == ClaimId::from_raw(2)
     ));
+    assert!(
+        maintenance
+            .repository()
+            .all_memory_versions()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn superseded_claim_cannot_seed_a_new_long_term_memory() {
+    let old = Claim::restore_versioned(
+        ClaimId::from_raw(1),
+        ClaimOwner::Person,
+        "I live in Shenzhen".to_owned(),
+        vec![EvidenceCitation::new(
+            EvidenceId::from_raw(1),
+            "I live in Shenzhen",
+        )],
+        None,
+        ApplicableTime::Since(Timestamp::from_millis(10)),
+        Timestamp::from_millis(10),
+        ClaimStatus::Superseded,
+        None,
+        Some(ClaimId::from_raw(2)),
+    );
+    let repository = InMemoryLongTermMemoryRepository::with_claims([old]).unwrap();
+    let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(1_000));
+
+    assert_eq!(
+        maintenance.propose(
+            &complete_proposal(
+                "I live in Shenzhen",
+                MemorySubject::Person,
+                ClaimId::from_raw(1),
+            )
+            .with_kind(MemoryKind::Fact)
+            .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(10)))
+            .with_confidence(MemoryConfidence::High)
+            .with_basis(MemoryBasis::DirectEvidence),
+        ),
+        Err(MemoryError::InvalidProposal(
+            MemoryProposalRejectionReason::SourceNotCurrent(ClaimId::from_raw(1))
+        ))
+    );
     assert!(
         maintenance
             .repository()

@@ -5,9 +5,9 @@ use std::{
 };
 
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, DisputeState,
-    EvidenceCitation, EvidenceId, MemoryRepository, RepositoryError, SessionId, Speaker, Timestamp,
-    Uncertainty,
+    ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
+    ClaimStatus, ConversationEvidence, DisputeState, EvidenceCitation, EvidenceId,
+    MemoryRepository, RepositoryError, SessionId, Speaker, Timestamp, Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -1733,6 +1733,307 @@ impl LongTermMemoryRepository for VaultRepository {
     }
 }
 
+fn validate_claim_correction(
+    previous: &Claim,
+    evidence: &ConversationEvidence,
+    replacement: &Claim,
+) -> Result<(), RepositoryError> {
+    if previous.owner() != ClaimOwner::Person || replacement.owner() != ClaimOwner::Person {
+        return Err(RepositoryError::new("only person claims can be corrected"));
+    }
+    if previous.status() != ClaimStatus::Current || previous.superseded_by().is_some() {
+        return Err(RepositoryError::new("claim is not current"));
+    }
+    if replacement.status() != ClaimStatus::Current
+        || replacement.supersedes() != Some(previous.id())
+        || replacement.superseded_by().is_some()
+    {
+        return Err(RepositoryError::new("invalid correction successor"));
+    }
+    if replacement.statement().trim().is_empty()
+        || replacement.statement().trim() == previous.statement().trim()
+    {
+        return Err(RepositoryError::new(
+            "correction must provide a changed statement",
+        ));
+    }
+    if !replacement.applicable_time().is_valid() {
+        return Err(RepositoryError::new("correction time is invalid"));
+    }
+    if evidence.speaker() != Speaker::Person
+        || evidence.verbatim() != replacement.statement()
+        || evidence.recorded_at() != replacement.recorded_at()
+    {
+        return Err(RepositoryError::new(
+            "correction evidence does not match its successor claim",
+        ));
+    }
+    let [citation] = replacement.support() else {
+        return Err(RepositoryError::new(
+            "correction successor requires exactly one citation",
+        ));
+    };
+    if citation.evidence_id() != evidence.id() || citation.quote() != evidence.verbatim() {
+        return Err(RepositoryError::new(
+            "correction citation does not match retained evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_correction_evidence(
+    connection: &Connection,
+    evidence: &ConversationEvidence,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO conversation_evidence
+             (id, session_id, speaker, verbatim, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_sql_id(evidence.id().get())?,
+                evidence.session_id().as_str(),
+                encode_speaker(evidence.speaker()),
+                evidence.verbatim(),
+                evidence.recorded_at().as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    Ok(())
+}
+
+fn insert_correction_claim(connection: &Connection, claim: &Claim) -> Result<(), RepositoryError> {
+    let supersedes = claim
+        .supersedes()
+        .ok_or_else(|| RepositoryError::new("correction successor has no predecessor"))?;
+    let (applicable_kind, applicable_start, applicable_end) =
+        encode_applicable_time(claim.applicable_time());
+    connection
+        .execute(
+            "INSERT INTO claims
+             (id, owner, statement, uncertainty, applicable_kind,
+              applicable_start, applicable_end, recorded_at, supersedes_claim_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                to_sql_id(claim.id().get())?,
+                encode_owner(claim.owner()),
+                claim.statement(),
+                claim.uncertainty().map(encode_uncertainty),
+                applicable_kind,
+                applicable_start,
+                applicable_end,
+                claim.recorded_at().as_millis(),
+                to_sql_id(supersedes.get())?,
+            ],
+        )
+        .map_err(repository_error)?;
+    for (ordinal, citation) in claim.support().iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO claim_support (claim_id, ordinal, evidence_id, quote)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    to_sql_id(claim.id().get())?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(citation.evidence_id().get())?,
+                    citation.quote(),
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
+fn propagate_claim_correction_to_memories(
+    connection: &Connection,
+    superseded_claim_id: ClaimId,
+    replacement: &Claim,
+) -> Result<(usize, usize), RepositoryError> {
+    let affected = {
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT v.memory_id, v.version
+                 FROM long_term_memory_versions v
+                 JOIN long_term_memory_sources s
+                   ON s.memory_id = v.memory_id AND s.version = v.version
+                 WHERE s.claim_id = ?1
+                   AND v.version = (
+                       SELECT MAX(latest.version) FROM long_term_memory_versions latest
+                       WHERE latest.memory_id = v.memory_id
+                   )
+                   AND (SELECT e.status FROM long_term_memory_state_events e
+                        WHERE e.memory_id = v.memory_id AND e.version = v.version
+                        ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2, 4)
+                 ORDER BY v.memory_id",
+            )
+            .map_err(repository_error)?;
+        statement
+            .query_map([to_sql_id(superseded_claim_id.get())?], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(repository_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_error)?
+    };
+
+    let mut rebuilt = 0_usize;
+    for (memory_id, version) in &affected {
+        let memory_id = MemoryId::new(u64::try_from(*memory_id).map_err(repository_error)?)
+            .ok_or_else(|| RepositoryError::new("invalid affected memory id"))?;
+        let version = u64::try_from(*version).map_err(repository_error)?;
+        let memory = load_memory_version(connection, memory_id, version)?;
+        insert_memory_state_event(
+            connection,
+            memory_id,
+            version,
+            MemoryStatus::Superseded,
+            replacement.recorded_at(),
+        )?;
+        let rebuilt_version = if memory.basis() == MemoryBasis::DirectEvidence {
+            if memory.source_claim_ids() != [superseded_claim_id] {
+                return Err(RepositoryError::new(
+                    "direct memory has an invalid correction source set",
+                ));
+            }
+            let next_version = version
+                .checked_add(1)
+                .ok_or_else(|| RepositoryError::new("memory version space exhausted"))?;
+            insert_corrected_direct_memory_version(connection, &memory, next_version, replacement)?;
+            rebuilt += 1;
+            Some(next_version)
+        } else {
+            None
+        };
+        connection
+            .execute(
+                "INSERT INTO claim_correction_memory_work_items
+                 (correction_claim_id, memory_id, affected_version, action,
+                  rebuilt_version, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    to_sql_id(replacement.id().get())?,
+                    to_sql_id(memory_id.get())?,
+                    to_sql_id(version)?,
+                    i64::from(rebuilt_version.is_none()),
+                    rebuilt_version.map(to_sql_id).transpose()?,
+                    replacement.recorded_at().as_millis(),
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok((affected.len(), rebuilt))
+}
+
+fn insert_corrected_direct_memory_version(
+    connection: &Connection,
+    previous: &MemoryVersion,
+    version: u64,
+    replacement: &Claim,
+) -> Result<(), RepositoryError> {
+    let (applicable_kind, applicable_start, applicable_end) =
+        encode_applicable_time(replacement.applicable_time());
+    connection
+        .execute(
+            "INSERT INTO long_term_memory_versions
+             (memory_id, version, predecessor_version, subject, kind, statement,
+              confidence, applicable_kind, applicable_start, applicable_end,
+              salience_reason, basis, formed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                to_sql_id(previous.id().get())?,
+                to_sql_id(version)?,
+                to_sql_id(previous.version())?,
+                encode_memory_subject(previous.subject()),
+                encode_memory_kind(previous.kind()),
+                replacement.statement(),
+                encode_memory_confidence(previous.confidence()),
+                applicable_kind,
+                applicable_start,
+                applicable_end,
+                previous.salience_reason(),
+                encode_memory_basis(previous.basis()),
+                replacement.recorded_at().as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    connection
+        .execute(
+            "INSERT INTO long_term_memory_sources
+             (memory_id, version, ordinal, claim_id) VALUES (?1, ?2, 0, ?3)",
+            params![
+                to_sql_id(previous.id().get())?,
+                to_sql_id(version)?,
+                to_sql_id(replacement.id().get())?,
+            ],
+        )
+        .map_err(repository_error)?;
+    let mut terms = BTreeSet::new();
+    terms.extend(search_terms(replacement.statement()));
+    terms.extend(search_terms(previous.salience_reason()));
+    for term in terms {
+        connection
+            .execute(
+                "INSERT INTO long_term_memory_terms (memory_id, version, term)
+                 VALUES (?1, ?2, ?3)",
+                params![to_sql_id(previous.id().get())?, to_sql_id(version)?, term],
+            )
+            .map_err(repository_error)?;
+    }
+    insert_memory_state_event(
+        connection,
+        previous.id(),
+        version,
+        MemoryStatus::Active,
+        replacement.recorded_at(),
+    )
+}
+
+fn update_retrieval_projection_for_correction(
+    transaction: &rusqlite::Transaction<'_>,
+    authority: &RetrievalAuthority,
+    superseded_id: ClaimId,
+    replacement: &Claim,
+) -> Result<(), RepositoryError> {
+    let changed = transaction
+        .execute(
+            "UPDATE retrieval_claim_documents SET claim_status = 1 WHERE claim_id = ?1",
+            [to_sql_id(superseded_id.get())?],
+        )
+        .map_err(repository_error)?;
+    if changed != 1 {
+        return Err(RepositoryError::new(
+            "superseded claim is missing from the current retrieval projection",
+        ));
+    }
+    insert_retrieval_claims(transaction, std::slice::from_ref(replacement))
+        .map_err(repository_error)?;
+    let index_digest = retrieval_index_digest(transaction).map_err(repository_error)?;
+    let metadata_changed = transaction
+        .execute(
+            "UPDATE retrieval_index_metadata
+             SET contract_version = ?1, authority_digest = ?2, index_digest = ?3,
+                 built_at = ?4, evidence_block_count = ?5,
+                 ledger_claim_count = ?6, relation_count = ?7
+             WHERE id = 1",
+            params![
+                RETRIEVAL_INDEX_VERSION,
+                authority.digest.as_slice(),
+                index_digest.as_slice(),
+                authority.built_at_millis,
+                i64::try_from(authority.blocks.len()).map_err(repository_error)?,
+                i64::try_from(authority.claims.len()).map_err(repository_error)?,
+                i64::try_from(authority.relations.len()).map_err(repository_error)?,
+            ],
+        )
+        .map_err(repository_error)?;
+    if metadata_changed != 1 {
+        return Err(RepositoryError::new(
+            "retrieval metadata disappeared during correction",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_persisted_memory_sources(
     connection: &Connection,
     proposal: &ValidatedMemoryProposal,
@@ -1743,16 +2044,14 @@ fn validate_persisted_memory_sources(
         MemorySubject::Shared => ClaimOwner::Shared,
     };
     for claim_id in proposal.source_claim_ids() {
-        let owner = connection
-            .query_row(
-                "SELECT owner FROM claims WHERE id = ?1",
-                [to_sql_id(claim_id.get())?],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(repository_error)?
+        let claim = load_claim(connection, *claim_id)?
             .ok_or_else(|| RepositoryError::new("memory source claim does not exist"))?;
-        if decode_owner(owner)? != expected_owner {
+        if claim.status() != ClaimStatus::Current {
+            return Err(RepositoryError::new(
+                "memory source claim is no longer current",
+            ));
+        }
+        if claim.owner() != expected_owner {
             return Err(RepositoryError::new(
                 "memory source claim changed ledger attribution",
             ));
@@ -1868,12 +2167,72 @@ fn insert_memory_state_event(
     Ok(())
 }
 
+fn insert_claim_state_event(
+    connection: &Connection,
+    claim_id: ClaimId,
+    status: ClaimStatus,
+    caused_by_claim_id: Option<ClaimId>,
+    occurred_at: Timestamp,
+) -> Result<(), RepositoryError> {
+    let valid_cause = match status {
+        ClaimStatus::Current => caused_by_claim_id.is_none(),
+        ClaimStatus::Superseded => caused_by_claim_id.is_some_and(|id| id != claim_id),
+    };
+    if !valid_cause {
+        return Err(RepositoryError::new("invalid claim state transition cause"));
+    }
+    let ordinal: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0)
+             FROM claim_state_events WHERE claim_id = ?1",
+            [to_sql_id(claim_id.get())?],
+            |row| row.get(0),
+        )
+        .map_err(repository_error)?;
+    connection
+        .execute(
+            "INSERT INTO claim_state_events
+             (claim_id, ordinal, status, caused_by_claim_id, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_sql_id(claim_id.get())?,
+                ordinal,
+                encode_claim_status(status),
+                caused_by_claim_id
+                    .map(|id| to_sql_id(id.get()))
+                    .transpose()?,
+                occurred_at.as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    Ok(())
+}
+
+fn insert_current_claim_state_event(
+    connection: &Connection,
+    claim_id: ClaimId,
+    recorded_at: Timestamp,
+) -> Result<(), RepositoryError> {
+    insert_claim_state_event(
+        connection,
+        claim_id,
+        ClaimStatus::Current,
+        None,
+        recorded_at,
+    )
+}
+
 fn load_claim(connection: &Connection, id: ClaimId) -> Result<Option<Claim>, RepositoryError> {
     let stored = connection
         .query_row(
-            "SELECT id, owner, statement, uncertainty, applicable_kind,
-                    applicable_start, applicable_end, recorded_at
-             FROM claims WHERE id = ?1",
+            "SELECT c.id, c.owner, c.statement, c.uncertainty, c.applicable_kind,
+                    c.applicable_start, c.applicable_end, c.recorded_at,
+                    c.supersedes_claim_id,
+                    (SELECT e.status FROM claim_state_events e
+                     WHERE e.claim_id = c.id ORDER BY e.ordinal DESC LIMIT 1),
+                    (SELECT successor.id FROM claims successor
+                     WHERE successor.supersedes_claim_id = c.id)
+             FROM claims c WHERE c.id = ?1",
             [to_sql_id(id.get())?],
             stored_claim_from_row,
         )
@@ -2407,6 +2766,14 @@ impl MemoryRepository for VaultRepository {
     }
 
     fn append_claim(&mut self, claim: Claim) -> Result<(), RepositoryError> {
+        if claim.status() != ClaimStatus::Current
+            || claim.supersedes().is_some()
+            || claim.superseded_by().is_some()
+        {
+            return Err(RepositoryError::new(
+                "versioned claim changes require the correction repository",
+            ));
+        }
         let (applicable_kind, applicable_start, applicable_end) =
             encode_applicable_time(claim.applicable_time());
         let transaction = self
@@ -2448,6 +2815,7 @@ impl MemoryRepository for VaultRepository {
                 )
                 .map_err(repository_error)?;
         }
+        insert_current_claim_state_event(&transaction, claim.id(), claim.recorded_at())?;
         transaction.commit().map_err(repository_error)?;
         Ok(())
     }
@@ -2487,9 +2855,14 @@ impl MemoryRepository for VaultRepository {
             let mut statement = self
                 .connection()
                 .prepare(
-                    "SELECT id, owner, statement, uncertainty, applicable_kind,
-                            applicable_start, applicable_end, recorded_at
-                     FROM claims ORDER BY id",
+                    "SELECT c.id, c.owner, c.statement, c.uncertainty, c.applicable_kind,
+                            c.applicable_start, c.applicable_end, c.recorded_at,
+                            c.supersedes_claim_id,
+                            (SELECT e.status FROM claim_state_events e
+                             WHERE e.claim_id = c.id ORDER BY e.ordinal DESC LIMIT 1),
+                            (SELECT successor.id FROM claims successor
+                             WHERE successor.supersedes_claim_id = c.id)
+                     FROM claims c ORDER BY c.id",
                 )
                 .map_err(repository_error)?;
             statement
@@ -2503,6 +2876,99 @@ impl MemoryRepository for VaultRepository {
             .into_iter()
             .map(|stored| stored.decode(self.connection()))
             .collect()
+    }
+}
+
+impl ClaimCorrectionRepository for VaultRepository {
+    fn claim(&self, id: ClaimId) -> Result<Option<Claim>, RepositoryError> {
+        load_claim(self.connection(), id)
+    }
+
+    fn commit_person_fact_correction(
+        &mut self,
+        evidence: ConversationEvidence,
+        replacement: Claim,
+    ) -> Result<ClaimCorrectionReceipt, RepositoryError> {
+        RetrievalRepository::ensure_retrieval_index(self).map_err(repository_error)?;
+        let mut authority = load_retrieval_authority(self).map_err(repository_error)?;
+        let superseded_id = replacement
+            .supersedes()
+            .ok_or_else(|| RepositoryError::new("correction claim has no predecessor"))?;
+        let previous = load_claim(self.connection(), superseded_id)?
+            .ok_or_else(|| RepositoryError::new("claim does not exist"))?;
+        validate_claim_correction(&previous, &evidence, &replacement)?;
+
+        let authority_previous = authority
+            .claims
+            .iter_mut()
+            .find(|claim| claim.id() == superseded_id)
+            .ok_or_else(|| RepositoryError::new("claim is missing from retrieval authority"))?;
+        *authority_previous = Claim::restore_versioned(
+            previous.id(),
+            previous.owner(),
+            previous.statement().to_owned(),
+            previous.support().to_vec(),
+            previous.uncertainty(),
+            previous.applicable_time(),
+            previous.recorded_at(),
+            ClaimStatus::Superseded,
+            previous.supersedes(),
+            Some(replacement.id()),
+        );
+        authority.claims.push(replacement.clone());
+        authority.claims.sort_by_key(Claim::id);
+        authority.built_at_millis = authority
+            .built_at_millis
+            .max(replacement.recorded_at().as_millis());
+        authority.digest = retrieval_authority_digest(
+            &authority.blocks,
+            &authority.claims,
+            &authority.entities,
+            &authority.relations,
+        );
+
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        let current = load_claim(&transaction, superseded_id)?
+            .ok_or_else(|| RepositoryError::new("claim does not exist"))?;
+        validate_claim_correction(&current, &evidence, &replacement)?;
+        insert_correction_evidence(&transaction, &evidence)?;
+        insert_correction_claim(&transaction, &replacement)?;
+        insert_current_claim_state_event(
+            &transaction,
+            replacement.id(),
+            replacement.recorded_at(),
+        )?;
+        insert_claim_state_event(
+            &transaction,
+            superseded_id,
+            ClaimStatus::Superseded,
+            Some(replacement.id()),
+            replacement.recorded_at(),
+        )?;
+        let (invalidated_memories, rebuilt_memories) =
+            propagate_claim_correction_to_memories(&transaction, superseded_id, &replacement)?;
+
+        update_retrieval_projection_for_correction(
+            &transaction,
+            &authority,
+            superseded_id,
+            &replacement,
+        )?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(ClaimCorrectionReceipt::new(
+            evidence.id(),
+            superseded_id,
+            replacement.id(),
+            invalidated_memories,
+            rebuilt_memories,
+            0,
+            2,
+        ))
     }
 }
 
@@ -2765,6 +3231,7 @@ impl IdentityRepository for VaultRepository {
                     ],
                 )
                 .map_err(repository_error)?;
+            insert_current_claim_state_event(&transaction, item.claim_id(), item.recorded_at())?;
             transaction
                 .execute(
                     "INSERT INTO claim_support (claim_id, ordinal, evidence_id, quote)
@@ -4042,6 +4509,19 @@ fn retrieval_authority_digest(
         hash_optional_i64(&mut hasher, start);
         hash_optional_i64(&mut hasher, end);
         hash_i64(&mut hasher, claim.recorded_at().as_millis());
+        hash_i64(&mut hasher, encode_claim_status(claim.status()));
+        hash_optional_i64(
+            &mut hasher,
+            claim
+                .supersedes()
+                .map(|id| i64::try_from(id.get()).unwrap_or(i64::MAX)),
+        );
+        hash_optional_i64(
+            &mut hasher,
+            claim
+                .superseded_by()
+                .map(|id| i64::try_from(id.get()).unwrap_or(i64::MAX)),
+        );
         for citation in claim.support() {
             hash_u64(&mut hasher, citation.evidence_id().get());
             hash_bytes(&mut hasher, citation.quote().as_bytes());
@@ -4181,8 +4661,8 @@ fn insert_retrieval_claims(
         transaction.execute(
             "INSERT INTO retrieval_claim_documents
              (claim_id, applicable_start, applicable_end, applicable_unknown,
-              recorded_at, statement_digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+              recorded_at, statement_digest, claim_status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 to_vault_sql_id(claim.id().get())?,
                 start,
@@ -4190,6 +4670,7 @@ fn insert_retrieval_claims(
                 i64::from(unknown),
                 claim.recorded_at().as_millis(),
                 statement_digest.as_slice(),
+                encode_claim_status(claim.status()),
             ],
         )?;
         for term in search_terms(claim.statement()) {
@@ -4390,10 +4871,10 @@ fn hash_retrieval_claim_index(
 ) -> Result<(), VaultError> {
     let mut statement = connection.prepare(
         "SELECT claim_id, applicable_start, applicable_end, applicable_unknown,
-                recorded_at, statement_digest
+                recorded_at, statement_digest, claim_status
          FROM retrieval_claim_documents ORDER BY claim_id",
     )?;
-    for (claim_id, start, end, unknown, recorded_at, digest) in statement
+    for (claim_id, start, end, unknown, recorded_at, digest, status) in statement
         .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -4402,6 +4883,7 @@ fn hash_retrieval_claim_index(
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -4412,6 +4894,7 @@ fn hash_retrieval_claim_index(
         hash_i64(hasher, unknown);
         hash_i64(hasher, recorded_at);
         hash_bytes(hasher, &digest);
+        hash_i64(hasher, status);
     }
 
     let mut statement = connection
@@ -4748,9 +5231,9 @@ fn recall_retrieval_candidates(
     query: &RetrievalQuery,
 ) -> Result<Vec<RecallHit>, VaultError> {
     let mut hits = Vec::new();
-    append_lexical_hits(connection, query.text(), &mut hits)?;
+    append_lexical_hits(connection, query.text(), query.source_scope(), &mut hits)?;
     append_vector_hits(connection, query.text(), &mut hits)?;
-    append_temporal_hits(connection, query.time(), &mut hits)?;
+    append_temporal_hits(connection, query.time(), query.source_scope(), &mut hits)?;
     append_entity_hits(connection, query.entities(), &mut hits)?;
     let has_non_temporal_filter = query
         .text()
@@ -4785,6 +5268,7 @@ fn recall_retrieval_candidates(
 fn append_lexical_hits(
     connection: &Connection,
     text: Option<&str>,
+    scope: SourceScope,
     hits: &mut Vec<RecallHit>,
 ) -> Result<(), VaultError> {
     if let Some(text) = text {
@@ -4810,9 +5294,18 @@ fn append_lexical_hits(
                     1,
                 ));
             }
-            let mut statement = connection.prepare(
-                "SELECT claim_id FROM retrieval_claim_terms WHERE term = ?1 ORDER BY claim_id",
-            )?;
+            let sql = match scope {
+                SourceScope::Current => {
+                    "SELECT t.claim_id FROM retrieval_claim_terms t
+                     JOIN retrieval_claim_documents d ON d.claim_id = t.claim_id
+                     WHERE t.term = ?1 AND d.claim_status = 0 ORDER BY t.claim_id"
+                }
+                SourceScope::Historical => {
+                    "SELECT claim_id FROM retrieval_claim_terms
+                     WHERE term = ?1 ORDER BY claim_id"
+                }
+            };
+            let mut statement = connection.prepare(sql)?;
             for claim_id in statement
                 .query_map([&term], |row| row.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -4891,6 +5384,7 @@ fn append_vector_hits(
 fn append_temporal_hits(
     connection: &Connection,
     time: Option<eam_retrieval::TimeRange>,
+    scope: SourceScope,
     hits: &mut Vec<RecallHit>,
 ) -> Result<(), VaultError> {
     if let Some(time) = time {
@@ -4915,13 +5409,24 @@ fn append_temporal_hits(
                 0,
             ));
         }
-        let mut statement = connection.prepare(
-            "SELECT claim_id FROM retrieval_claim_documents
-             WHERE applicable_unknown = 0
-               AND applicable_start <= ?2
-               AND (applicable_end IS NULL OR applicable_end >= ?1)
-             ORDER BY claim_id",
-        )?;
+        let claim_sql = match scope {
+            SourceScope::Current => {
+                "SELECT claim_id FROM retrieval_claim_documents
+                 WHERE claim_status = 0
+                   AND applicable_unknown = 0
+                   AND applicable_start <= ?2
+                   AND (applicable_end IS NULL OR applicable_end >= ?1)
+                 ORDER BY claim_id"
+            }
+            SourceScope::Historical => {
+                "SELECT claim_id FROM retrieval_claim_documents
+                 WHERE applicable_unknown = 0
+                   AND applicable_start <= ?2
+                   AND (applicable_end IS NULL OR applicable_end >= ?1)
+                 ORDER BY claim_id"
+            }
+        };
+        let mut statement = connection.prepare(claim_sql)?;
         for claim_id in statement
             .query_map(params![time.start_millis(), time.end_millis()], |row| {
                 row.get::<_, i64>(0)
@@ -5195,9 +5700,7 @@ fn resolve_retrieval_candidate(
             evidence_id,
             block_id,
         } => resolve_retrieval_evidence(repository, evidence_id, block_id, scope),
-        CandidateRef::Ledger { claim_id } => {
-            resolve_retrieval_claim(repository, claim_id).map(Some)
-        }
+        CandidateRef::Ledger { claim_id } => resolve_retrieval_claim(repository, claim_id, scope),
     }
 }
 
@@ -5289,12 +5792,14 @@ fn resolve_retrieval_evidence(
 fn resolve_retrieval_claim(
     repository: &VaultRepository,
     claim_id: u64,
-) -> Result<AuthoritativeCandidate, VaultError> {
-    let claim = MemoryRepository::all_claims(repository)
+    scope: SourceScope,
+) -> Result<Option<AuthoritativeCandidate>, VaultError> {
+    let claim = load_claim(repository.connection(), ClaimId::from_raw(claim_id))
         .map_err(|_| VaultError::InvalidKeyOrCorrupt)?
-        .into_iter()
-        .find(|claim| claim.id() == ClaimId::from_raw(claim_id))
         .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    if scope == SourceScope::Current && claim.status() != ClaimStatus::Current {
+        return Ok(None);
+    }
     if claim.support().is_empty() {
         return Err(VaultError::InvalidKeyOrCorrupt);
     }
@@ -5306,20 +5811,23 @@ fn resolve_retrieval_claim(
             return Err(VaultError::InvalidKeyOrCorrupt);
         }
     }
-    let indexed_digest = repository
+    let (indexed_digest, indexed_status) = repository
         .connection()
         .query_row(
-            "SELECT statement_digest FROM retrieval_claim_documents WHERE claim_id = ?1",
+            "SELECT statement_digest, claim_status
+             FROM retrieval_claim_documents WHERE claim_id = ?1",
             [to_vault_sql_id(claim_id)?],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?
         .ok_or(VaultError::InvalidKeyOrCorrupt)?;
     let authority_digest: [u8; 32] = Sha256::digest(claim.statement().as_bytes()).into();
-    if indexed_digest.as_slice() != authority_digest {
+    if indexed_digest.as_slice() != authority_digest
+        || indexed_status != encode_claim_status(claim.status())
+    {
         return Err(VaultError::InvalidKeyOrCorrupt);
     }
-    Ok(AuthoritativeCandidate::Ledger(claim))
+    Ok(Some(AuthoritativeCandidate::Ledger(claim)))
 }
 
 fn recover_interrupted_markdown_attempts(connection: &mut Connection) -> Result<(), VaultError> {
@@ -6989,6 +7497,21 @@ fn decode_owner(value: i64) -> Result<ClaimOwner, RepositoryError> {
     }
 }
 
+const fn encode_claim_status(status: ClaimStatus) -> i64 {
+    match status {
+        ClaimStatus::Current => 0,
+        ClaimStatus::Superseded => 1,
+    }
+}
+
+fn decode_claim_status(value: i64) -> Result<ClaimStatus, RepositoryError> {
+    match value {
+        0 => Ok(ClaimStatus::Current),
+        1 => Ok(ClaimStatus::Superseded),
+        _ => Err(RepositoryError::new("invalid persisted claim status")),
+    }
+}
+
 const fn encode_memory_subject(value: MemorySubject) -> i64 {
     match value {
         MemorySubject::Person => 0,
@@ -7190,6 +7713,9 @@ struct StoredClaim {
     applicable_start: Option<i64>,
     applicable_end: Option<i64>,
     recorded_at: i64,
+    supersedes_claim_id: Option<i64>,
+    status: i64,
+    superseded_by_claim_id: Option<i64>,
 }
 
 impl StoredClaim {
@@ -7197,7 +7723,7 @@ impl StoredClaim {
         let id = u64::try_from(self.id).map_err(repository_error)?;
         let claim_id = ClaimId::from_raw(id);
         let support = load_support(connection, claim_id)?;
-        Ok(Claim::restore(
+        Ok(Claim::restore_versioned(
             claim_id,
             decode_owner(self.owner)?,
             self.statement,
@@ -7209,6 +7735,15 @@ impl StoredClaim {
                 self.applicable_end,
             )?,
             Timestamp::from_millis(self.recorded_at),
+            decode_claim_status(self.status)?,
+            self.supersedes_claim_id
+                .map(|id| u64::try_from(id).map(ClaimId::from_raw))
+                .transpose()
+                .map_err(repository_error)?,
+            self.superseded_by_claim_id
+                .map(|id| u64::try_from(id).map(ClaimId::from_raw))
+                .transpose()
+                .map_err(repository_error)?,
         ))
     }
 }
@@ -7223,6 +7758,9 @@ fn stored_claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredClai
         applicable_start: row.get(5)?,
         applicable_end: row.get(6)?,
         recorded_at: row.get(7)?,
+        supersedes_claim_id: row.get(8)?,
+        status: row.get(9)?,
+        superseded_by_claim_id: row.get(10)?,
     })
 }
 

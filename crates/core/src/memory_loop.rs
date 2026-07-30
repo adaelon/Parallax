@@ -1,16 +1,22 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use crate::{
-    ApplicableTime, Claim, ClaimOwner, Clock, ConversationEvidence, CounterpartRuntime,
-    EvidenceCitation, EvidenceId, JudgmentProposal, JudgmentRejection, JudgmentRejectionReason,
-    MemoryRepository, PersonTurnClassification, RepositoryError, RuntimeError, RuntimeRequest,
-    SessionId, Speaker, StructuredOperationRejection, StructuredOperationRejectionReason,
-    TurnOutcome, WorkingContext,
+    ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
+    ClaimStatus, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
+    JudgmentProposal, JudgmentRejection, JudgmentRejectionReason, MemoryRepository,
+    PersonTurnClassification, RepositoryError, RuntimeError, RuntimeRequest, SessionId, Speaker,
+    StructuredOperationRejection, StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoreError {
     EmptyConversationTurn,
+    EmptyCorrection,
+    UnchangedCorrection,
+    InvalidCorrectionTime,
+    ClaimNotFound(ClaimId),
+    ClaimNotPerson(ClaimId),
+    ClaimNotCurrent(ClaimId),
     MissingEvidence(EvidenceId),
     InvalidResponseCitation(JudgmentRejectionReason),
     Repository(RepositoryError),
@@ -21,6 +27,16 @@ impl fmt::Display for CoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyConversationTurn => formatter.write_str("conversation turn cannot be empty"),
+            Self::EmptyCorrection => formatter.write_str("correction statement cannot be empty"),
+            Self::UnchangedCorrection => {
+                formatter.write_str("correction statement must change the claim")
+            }
+            Self::InvalidCorrectionTime => formatter.write_str("correction time is invalid"),
+            Self::ClaimNotFound(id) => write!(formatter, "claim {} does not exist", id.get()),
+            Self::ClaimNotPerson(id) => {
+                write!(formatter, "claim {} is not owned by the person", id.get())
+            }
+            Self::ClaimNotCurrent(id) => write!(formatter, "claim {} is not current", id.get()),
             Self::MissingEvidence(id) => write!(formatter, "evidence {} does not exist", id.get()),
             Self::InvalidResponseCitation(reason) => {
                 write!(
@@ -31,6 +47,71 @@ impl fmt::Display for CoreError {
             Self::Repository(error) => write!(formatter, "repository error: {error}"),
             Self::Runtime(error) => write!(formatter, "runtime error: {error}"),
         }
+    }
+}
+
+impl<R, T, C> MemoryCore<R, T, C>
+where
+    R: ClaimCorrectionRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    /// Appends a sourced person correction and supersedes exactly one current
+    /// person claim without erasing historical state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty text, invalid time, unknown/non-person/non-current claims,
+    /// or an adapter failure. Rejections persist neither evidence nor a claim.
+    pub fn correct_person_fact(
+        &mut self,
+        session_id: SessionId,
+        superseded_claim_id: ClaimId,
+        corrected_statement: impl Into<String>,
+        applicable_time: ApplicableTime,
+    ) -> Result<ClaimCorrectionReceipt, CoreError> {
+        let corrected_statement = corrected_statement.into();
+        if corrected_statement.trim().is_empty() {
+            return Err(CoreError::EmptyCorrection);
+        }
+        if !applicable_time.is_valid() {
+            return Err(CoreError::InvalidCorrectionTime);
+        }
+        let previous = self
+            .repository
+            .claim(superseded_claim_id)?
+            .ok_or(CoreError::ClaimNotFound(superseded_claim_id))?;
+        if previous.owner() != ClaimOwner::Person {
+            return Err(CoreError::ClaimNotPerson(superseded_claim_id));
+        }
+        if previous.status() != ClaimStatus::Current {
+            return Err(CoreError::ClaimNotCurrent(superseded_claim_id));
+        }
+        if corrected_statement.trim() == previous.statement().trim() {
+            return Err(CoreError::UnchangedCorrection);
+        }
+
+        let recorded_at = self.clock.now();
+        let evidence = ConversationEvidence::new(
+            self.repository.next_evidence_id(),
+            session_id,
+            Speaker::Person,
+            corrected_statement.clone(),
+            recorded_at,
+        );
+        let replacement = Claim::correction(
+            self.repository.next_claim_id(),
+            ClaimOwner::Person,
+            corrected_statement,
+            vec![EvidenceCitation::new(evidence.id(), evidence.verbatim())],
+            None,
+            applicable_time,
+            recorded_at,
+            superseded_claim_id,
+        );
+        self.repository
+            .commit_person_fact_correction(evidence, replacement)
+            .map_err(CoreError::from)
     }
 }
 

@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, Clock, EvidenceCitation, EvidenceId,
+    ApplicableTime, Claim, ClaimId, ClaimOwner, ClaimStatus, Clock, EvidenceCitation, EvidenceId,
     RepositoryError, Uncertainty,
 };
 
@@ -34,6 +34,7 @@ pub enum MemoryProposalRejectionReason {
     MissingConfidence,
     MissingBasis,
     SourceNotFound(ClaimId),
+    SourceNotCurrent(ClaimId),
     CrossLedgerSubject {
         claim_id: ClaimId,
         owner: ClaimOwner,
@@ -236,6 +237,11 @@ fn validate_proposal<R: LongTermMemoryRepository>(
             .ok_or(MemoryError::InvalidProposal(
                 MemoryProposalRejectionReason::SourceNotFound(*claim_id),
             ))?;
+        if claim.status() != ClaimStatus::Current {
+            return Err(MemoryError::InvalidProposal(
+                MemoryProposalRejectionReason::SourceNotCurrent(*claim_id),
+            ));
+        }
         validate_subject(&claim, subject)?;
         if confidence > supported_confidence(&claim) {
             return Err(MemoryError::InvalidProposal(
@@ -329,7 +335,10 @@ fn validate_dispute<R: LongTermMemoryRepository>(
     if let Some(open) = repository
         .memory_disputes(memory.id())?
         .into_iter()
-        .find(|dispute| dispute.outcome() == MemoryDisputeOutcome::Open)
+        .find(|dispute| {
+            dispute.memory_version() == memory.version()
+                && dispute.outcome() == MemoryDisputeOutcome::Open
+        })
     {
         return Err(MemoryError::InvalidDispute(
             MemoryDisputeRejectionReason::OpenDisputeExists(open.id()),

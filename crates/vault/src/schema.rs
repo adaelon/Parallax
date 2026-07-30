@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 14;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 15;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -964,6 +964,69 @@ CREATE INDEX memory_dispute_terms_lookup ON memory_dispute_terms(term);
 CREATE INDEX memory_disputes_memory ON memory_disputes(memory_id, memory_version);
 ";
 
+const MIGRATION_15: &str = r"
+ALTER TABLE claims ADD COLUMN supersedes_claim_id INTEGER
+    REFERENCES claims(id) ON DELETE RESTRICT;
+
+CREATE UNIQUE INDEX claims_single_successor
+    ON claims(supersedes_claim_id) WHERE supersedes_claim_id IS NOT NULL;
+
+DROP INDEX one_open_memory_dispute;
+CREATE UNIQUE INDEX one_open_memory_dispute
+    ON memory_disputes(memory_id, memory_version) WHERE outcome = 0;
+
+CREATE TABLE claim_state_events (
+    claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    status INTEGER NOT NULL CHECK (status IN (0, 1)),
+    caused_by_claim_id INTEGER REFERENCES claims(id) ON DELETE RESTRICT,
+    occurred_at INTEGER NOT NULL,
+    PRIMARY KEY (claim_id, ordinal),
+    CHECK (
+        (status = 0 AND caused_by_claim_id IS NULL)
+        OR
+        (status = 1 AND caused_by_claim_id IS NOT NULL
+                    AND caused_by_claim_id <> claim_id)
+    )
+) STRICT;
+
+INSERT INTO claim_state_events (claim_id, ordinal, status, caused_by_claim_id, occurred_at)
+SELECT id, 0, 0, NULL, recorded_at FROM claims;
+
+CREATE INDEX claim_state_events_status ON claim_state_events(status, claim_id);
+
+CREATE TRIGGER claim_state_events_immutable
+BEFORE UPDATE ON claim_state_events
+BEGIN
+    SELECT RAISE(ABORT, 'claim state events are immutable');
+END;
+
+CREATE TABLE claim_correction_memory_work_items (
+    correction_claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE RESTRICT,
+    memory_id INTEGER NOT NULL,
+    affected_version INTEGER NOT NULL CHECK (affected_version > 0),
+    action INTEGER NOT NULL CHECK (action IN (0, 1)),
+    rebuilt_version INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (correction_claim_id, memory_id, affected_version),
+    FOREIGN KEY (memory_id, affected_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    FOREIGN KEY (memory_id, rebuilt_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    CHECK (
+        (action = 0 AND rebuilt_version = affected_version + 1)
+        OR
+        (action = 1 AND rebuilt_version IS NULL)
+    )
+) STRICT;
+
+ALTER TABLE retrieval_claim_documents ADD COLUMN claim_status INTEGER
+    NOT NULL DEFAULT 0 CHECK (claim_status IN (0, 1));
+
+CREATE INDEX retrieval_claim_status_lookup
+    ON retrieval_claim_documents(claim_status, claim_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -995,6 +1058,7 @@ where
             12 => transaction.execute_batch(MIGRATION_12)?,
             13 => transaction.execute_batch(MIGRATION_13)?,
             14 => transaction.execute_batch(MIGRATION_14)?,
+            15 => transaction.execute_batch(MIGRATION_15)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1661,6 +1725,150 @@ mod tests {
         assert_eq!(table_count, 0);
 
         migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_claim_correction_migration_keeps_dispute_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+            MIGRATION_12,
+            MIGRATION_13,
+            MIGRATION_14,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 14).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 15 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(15))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 14);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'claim_state_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+        let claim_columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('claims')
+                 WHERE name = 'supersedes_claim_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_columns, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn claim_correction_migration_backfills_existing_claim_and_retrieval_state() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+            MIGRATION_12,
+            MIGRATION_13,
+            MIGRATION_14,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO conversation_evidence
+                 (id, session_id, speaker, verbatim, recorded_at)
+                 VALUES (1, 'migration', 0, 'I live in Shenzhen', 123)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claims
+                 (id, owner, statement, uncertainty, applicable_kind,
+                  applicable_start, applicable_end, recorded_at)
+                 VALUES (1, 0, 'I live in Shenzhen', NULL, 3, NULL, NULL, 123)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claim_support (claim_id, ordinal, evidence_id, quote)
+                 VALUES (1, 0, 1, 'I live in Shenzhen')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO retrieval_claim_documents
+                 (claim_id, applicable_start, applicable_end, applicable_unknown,
+                  recorded_at, statement_digest)
+                 VALUES (1, NULL, NULL, 1, 123, ?1)",
+                [vec![0_u8; 32]],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 14).unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        let claim_state: (i64, Option<i64>, i64) = connection
+            .query_row(
+                "SELECT status, caused_by_claim_id, occurred_at
+                 FROM claim_state_events WHERE claim_id = 1 AND ordinal = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(claim_state, (0, None, 123));
+        let retrieval_status: i64 = connection
+            .query_row(
+                "SELECT claim_status FROM retrieval_claim_documents WHERE claim_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retrieval_status, 0);
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();

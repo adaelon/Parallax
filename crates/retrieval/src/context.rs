@@ -413,6 +413,7 @@ fn replay_digest(
                 hash_bytes(&mut hasher, claim.statement().as_bytes());
                 hash_applicable_time(&mut hasher, claim.applicable_time());
                 hash_i64(&mut hasher, claim.recorded_at().as_millis());
+                hash_claim_version(&mut hasher, claim);
                 for citation in claim.support() {
                     hash_u64(&mut hasher, citation.evidence_id().get());
                     hash_bytes(&mut hasher, citation.quote().as_bytes());
@@ -427,6 +428,7 @@ fn replay_digest(
                 for claim in dispute.counterpart_sources() {
                     hash_u64(&mut hasher, claim.id().get());
                     hash_bytes(&mut hasher, claim.statement().as_bytes());
+                    hash_claim_version(&mut hasher, claim);
                     for citation in claim.support() {
                         hash_u64(&mut hasher, citation.evidence_id().get());
                         hash_bytes(&mut hasher, citation.quote().as_bytes());
@@ -450,6 +452,15 @@ fn replay_digest(
         }
     }
     hasher.finalize().into()
+}
+
+fn hash_claim_version(hasher: &mut Sha256, claim: &eam_core::Claim) {
+    hasher.update([match claim.status() {
+        eam_core::ClaimStatus::Current => 0,
+        eam_core::ClaimStatus::Superseded => 1,
+    }]);
+    hash_optional_u64(hasher, claim.supersedes().map(eam_core::ClaimId::get));
+    hash_optional_u64(hasher, claim.superseded_by().map(eam_core::ClaimId::get));
 }
 
 fn hash_applicable_time(hasher: &mut Sha256, value: ApplicableTime) {
@@ -487,6 +498,16 @@ fn hash_optional_i64(hasher: &mut Sha256, value: Option<i64>) {
     hasher.update([u8::from(value.is_some())]);
     if let Some(value) = value {
         hash_i64(hasher, value);
+    }
+}
+
+fn hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hash_u64(hasher, value);
+        }
+        None => hasher.update([0]),
     }
 }
 

@@ -376,6 +376,9 @@ impl<'a> From<&'a eam_core::FrozenEvidenceBlock> for RetrievedBlockInput<'a> {
 struct RetrievedClaimInput<'a> {
     claim_id: u64,
     owner: &'static str,
+    status: &'static str,
+    supersedes_claim_id: Option<u64>,
+    superseded_by_claim_id: Option<u64>,
     statement: &'a str,
     support: Vec<CitationInput<'a>>,
     uncertainty: Option<&'static str>,
@@ -392,6 +395,12 @@ impl<'a> From<&'a eam_core::Claim> for RetrievedClaimInput<'a> {
                 ClaimOwner::Counterpart => "counterpart",
                 ClaimOwner::Shared => "shared",
             },
+            status: match value.status() {
+                eam_core::ClaimStatus::Current => "current",
+                eam_core::ClaimStatus::Superseded => "superseded",
+            },
+            supersedes_claim_id: value.supersedes().map(eam_core::ClaimId::get),
+            superseded_by_claim_id: value.superseded_by().map(eam_core::ClaimId::get),
             statement: value.statement(),
             support: value.support().iter().map(CitationInput::from).collect(),
             uncertainty: value.uncertainty().map(|uncertainty| match uncertainty {

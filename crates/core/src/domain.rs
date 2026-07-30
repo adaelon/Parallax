@@ -182,6 +182,12 @@ pub enum Uncertainty {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimStatus {
+    Current,
+    Superseded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplicableTime {
     At(Timestamp),
     Since(Timestamp),
@@ -208,6 +214,9 @@ pub struct Claim {
     uncertainty: Option<Uncertainty>,
     applicable_time: ApplicableTime,
     recorded_at: Timestamp,
+    status: ClaimStatus,
+    supersedes: Option<ClaimId>,
+    superseded_by: Option<ClaimId>,
 }
 
 impl Claim {
@@ -220,6 +229,58 @@ impl Claim {
         applicable_time: ApplicableTime,
         recorded_at: Timestamp,
     ) -> Self {
+        Self::new_versioned(
+            id,
+            owner,
+            statement,
+            support,
+            uncertainty,
+            applicable_time,
+            recorded_at,
+            ClaimStatus::Current,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn correction(
+        id: ClaimId,
+        owner: ClaimOwner,
+        statement: String,
+        support: Vec<EvidenceCitation>,
+        uncertainty: Option<Uncertainty>,
+        applicable_time: ApplicableTime,
+        recorded_at: Timestamp,
+        supersedes: ClaimId,
+    ) -> Self {
+        Self::new_versioned(
+            id,
+            owner,
+            statement,
+            support,
+            uncertainty,
+            applicable_time,
+            recorded_at,
+            ClaimStatus::Current,
+            Some(supersedes),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_versioned(
+        id: ClaimId,
+        owner: ClaimOwner,
+        statement: String,
+        support: Vec<EvidenceCitation>,
+        uncertainty: Option<Uncertainty>,
+        applicable_time: ApplicableTime,
+        recorded_at: Timestamp,
+        status: ClaimStatus,
+        supersedes: Option<ClaimId>,
+        superseded_by: Option<ClaimId>,
+    ) -> Self {
         Self {
             id,
             owner,
@@ -228,6 +289,9 @@ impl Claim {
             uncertainty,
             applicable_time,
             recorded_at,
+            status,
+            supersedes,
+            superseded_by,
         }
     }
 
@@ -250,6 +314,36 @@ impl Claim {
             uncertainty,
             applicable_time,
             recorded_at,
+        )
+    }
+
+    /// Restores a temporal ledger entry and its current-state projection from
+    /// a trusted persistence adapter.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_versioned(
+        id: ClaimId,
+        owner: ClaimOwner,
+        statement: String,
+        support: Vec<EvidenceCitation>,
+        uncertainty: Option<Uncertainty>,
+        applicable_time: ApplicableTime,
+        recorded_at: Timestamp,
+        status: ClaimStatus,
+        supersedes: Option<ClaimId>,
+        superseded_by: Option<ClaimId>,
+    ) -> Self {
+        Self::new_versioned(
+            id,
+            owner,
+            statement,
+            support,
+            uncertainty,
+            applicable_time,
+            recorded_at,
+            status,
+            supersedes,
+            superseded_by,
         )
     }
 
@@ -286,6 +380,96 @@ impl Claim {
     #[must_use]
     pub const fn recorded_at(&self) -> Timestamp {
         self.recorded_at
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> ClaimStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn supersedes(&self) -> Option<ClaimId> {
+        self.supersedes
+    }
+
+    #[must_use]
+    pub const fn superseded_by(&self) -> Option<ClaimId> {
+        self.superseded_by
+    }
+
+    pub(crate) fn mark_superseded_by(&mut self, successor: ClaimId) {
+        self.status = ClaimStatus::Superseded;
+        self.superseded_by = Some(successor);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimCorrectionReceipt {
+    correction_evidence_id: EvidenceId,
+    superseded_claim_id: ClaimId,
+    replacement_claim_id: ClaimId,
+    invalidated_memories: usize,
+    rebuilt_memories: usize,
+    invalidated_projections: usize,
+    reindexed_claims: usize,
+}
+
+impl ClaimCorrectionReceipt {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        correction_evidence_id: EvidenceId,
+        superseded_claim_id: ClaimId,
+        replacement_claim_id: ClaimId,
+        invalidated_memories: usize,
+        rebuilt_memories: usize,
+        invalidated_projections: usize,
+        reindexed_claims: usize,
+    ) -> Self {
+        Self {
+            correction_evidence_id,
+            superseded_claim_id,
+            replacement_claim_id,
+            invalidated_memories,
+            rebuilt_memories,
+            invalidated_projections,
+            reindexed_claims,
+        }
+    }
+
+    #[must_use]
+    pub const fn correction_evidence_id(self) -> EvidenceId {
+        self.correction_evidence_id
+    }
+
+    #[must_use]
+    pub const fn superseded_claim_id(self) -> ClaimId {
+        self.superseded_claim_id
+    }
+
+    #[must_use]
+    pub const fn replacement_claim_id(self) -> ClaimId {
+        self.replacement_claim_id
+    }
+
+    #[must_use]
+    pub const fn invalidated_memories(self) -> usize {
+        self.invalidated_memories
+    }
+
+    #[must_use]
+    pub const fn rebuilt_memories(self) -> usize {
+        self.rebuilt_memories
+    }
+
+    #[must_use]
+    pub const fn invalidated_projections(self) -> usize {
+        self.invalidated_projections
+    }
+
+    #[must_use]
+    pub const fn reindexed_claims(self) -> usize {
+        self.reindexed_claims
     }
 }
 

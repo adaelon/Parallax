@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::{Claim, ClaimId, ConversationEvidence, EvidenceId, MemoryRepository, RepositoryError};
+use crate::{
+    Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus,
+    ConversationEvidence, EvidenceId, MemoryRepository, RepositoryError,
+};
 
 #[derive(Debug)]
 pub struct InMemoryRepository {
@@ -65,5 +68,51 @@ impl MemoryRepository for InMemoryRepository {
 
     fn all_claims(&self) -> Result<Vec<Claim>, RepositoryError> {
         Ok(self.claims.values().cloned().collect())
+    }
+}
+
+impl ClaimCorrectionRepository for InMemoryRepository {
+    fn claim(&self, id: ClaimId) -> Result<Option<Claim>, RepositoryError> {
+        Ok(self.claims.get(&id).cloned())
+    }
+
+    fn commit_person_fact_correction(
+        &mut self,
+        evidence: ConversationEvidence,
+        replacement: Claim,
+    ) -> Result<ClaimCorrectionReceipt, RepositoryError> {
+        let superseded_id = replacement
+            .supersedes()
+            .ok_or_else(|| RepositoryError::new("correction claim has no predecessor"))?;
+        let previous = self
+            .claims
+            .get(&superseded_id)
+            .ok_or_else(|| RepositoryError::new("claim does not exist"))?;
+        if previous.owner() != ClaimOwner::Person || replacement.owner() != ClaimOwner::Person {
+            return Err(RepositoryError::new("only person claims can be corrected"));
+        }
+        if previous.status() != ClaimStatus::Current {
+            return Err(RepositoryError::new("claim is not current"));
+        }
+        if self.evidence.contains_key(&evidence.id()) || self.claims.contains_key(&replacement.id())
+        {
+            return Err(RepositoryError::new("duplicate correction identifier"));
+        }
+
+        self.evidence.insert(evidence.id(), evidence.clone());
+        self.claims
+            .get_mut(&superseded_id)
+            .expect("validated predecessor remains present")
+            .mark_superseded_by(replacement.id());
+        self.claims.insert(replacement.id(), replacement.clone());
+        Ok(ClaimCorrectionReceipt::new(
+            evidence.id(),
+            superseded_id,
+            replacement.id(),
+            0,
+            0,
+            0,
+            0,
+        ))
     }
 }

@@ -166,9 +166,12 @@ impl LongTermMemoryRepository for InMemoryLongTermMemoryRepository {
         }
         if self.disputes.values().any(|stored| {
             stored.memory_id() == dispute.memory_id()
+                && stored.memory_version() == dispute.memory_version()
                 && stored.outcome() == MemoryDisputeOutcome::Open
         }) {
-            return Err(RepositoryError::new("memory already has an open dispute"));
+            return Err(RepositoryError::new(
+                "memory version already has an open dispute",
+            ));
         }
         current.set_status(MemoryStatus::Disputed);
         let id = MemoryDisputeId::new(self.next_dispute_id)
