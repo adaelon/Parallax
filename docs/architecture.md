@@ -39,7 +39,8 @@ flowchart LR
             MarkdownParser[纯 Rust Markdown 解析器]
             Vault[Evidence Vault<br/>SQLCipher + 加密对象库]
             Ledgers[时间化三账本]
-            Indexes[全文 / 向量 / 时间 / 关系索引]
+            Retrieval[检索领域契约与编排<br/>crates/retrieval]
+            Indexes[可重建检索索引<br/>SQLCipher schema v10+]
             Understanding[选择性深度理解投影]
             SelfBundle[Self Bundle]
             Memory[长期记忆维护器]
@@ -77,6 +78,9 @@ flowchart LR
     Intake --> Ledgers
     Vault --> Indexes
     Ledgers --> Indexes
+    Indexes --> Retrieval
+    Retrieval -->|权威证据回读| Vault
+    Retrieval -->|时间化账本回读| Ledgers
     Indexes -. 按需有限范围 .-> Understanding
     Ledgers -. 重要变化 .-> Understanding
     Ledgers --> Memory
@@ -90,7 +94,7 @@ flowchart LR
     Orchestrator --> SelfBundle
     Orchestrator --> Context
     Orchestrator --> Understanding
-    Context --> Indexes
+    Context --> Retrieval
     Context --> Understanding
     Context --> RuntimeGateway
     Identity <--> RuntimeGateway
@@ -260,6 +264,8 @@ S10 将 `self.db` schema 升至 v7：`extraction_revisions` 通过复合外键�
 S11 将 `self.db` schema 升至 v8：`source_records/source_record_versions` 把同一收件箱定位器的不可变证据版本绑定到稳定来源；`block_lineage_batches/block_lineages` 保存相邻提取修订的规则版本、连续性状态和确定性依据，歧义候选单独有序保存。`incremental_work_items` 持久化当前投影、索引复用/重建和记忆复核计划；谱系、候选与全部工作项在一个事务内提交并拒绝原地更新。旧 `EvidenceBlockRef` 仍只解析原证据和原块，不被当前来源投影改写。
 
 S12 将 `self.db` schema 升至 v9：`source_roots` 与不可变状态事件保存 `AVAILABLE/SOURCE_UNAVAILABLE`，稳定 `source_records` 增加 Obsidian 根、当前相对 locator、`PRESENT/SOURCE_REMOVED` 和时间边界；移动只更新当前 locator 并追加事件，证据版本继续挂在同一稳定记录。已接受 Obsidian Markdown 的 Properties、标签、别名和原始关系在解析接受事务内写入不可变表；内部目标解析单独保存为可重建投影，目标移除或重新出现后可刷新而不改写原关系文本。
+
+S13 将 `self.db` schema 升至 v10：`retrieval_*` 表保存 `eam-retrieval-v1` 的全文词项、账本有效期、实体词项、关系边和 `AVAILABLE` 派生投影。元数据同时保存权威输入摘要和索引摘要；缺失、过期或损坏时在一个事务内清空并从提取修订、证据块、三账本及 Obsidian 关系重建，绝不更新权威行。来源当前性不复制进索引，候选解析时实时读取 `source_records`，所以 `current` 只接受 `PRESENT` 的最新来源版本，`historical` 才返回旧版本或 `SOURCE_REMOVED`。
 
 ### 4.2 逻辑数据模型
 
@@ -746,6 +752,8 @@ retrieve(intent):
 
 当前检索解析历史块引用时只能沿 `UNCHANGED` 或 `MOVED` 谱系前进，并同时保留原始引用；`MODIFIED`、`REMOVED` 或 `AMBIGUOUS` 只能返回历史证据和状态，不得把后继块当作同一引用。历史检索始终直接解析原始证据版本，不依赖谱系推断。
 
+S13 当前实现由 `crates/retrieval` 固定查询、通道、范围和权威候选契约，由 `VaultRepository` 实现本地多路召回。全文词项兼容 ASCII 大小写与 Unicode/CJK 字符、双字和整词；显式时间范围是所有通道的交集门禁，账本按 `At/Since/Between` 有效期召回，证据按记录时间召回；实体关系从当前 locator、别名、标签、Properties 和已解析内部关系产生候选。索引只返回 `EvidenceBlockRef | ClaimId`，随后必须认证回读规范文本或校验账本逐字来源；索引片段本身没有事实资格。S14 的向量通道、检索窗口编排和工作上下文冻结仍未实现。
+
 ```text
 validate_citation(block_ref, quoted_text):
   revision = load_extraction_revision(block_ref)
@@ -923,6 +931,7 @@ self.db + objects + deletion state
 | Context Inbox 归档状态、延迟解析与重处理 | [ADR-0013：先归档后理解](adr/0013-archive-before-understanding.md) |
 | Obsidian 笔记库适配器、只读边界与结构提取 | [ADR-0015：只读 Obsidian 资料源](adr/0015-read-only-obsidian-source.md) |
 | Obsidian 来源当前性、历史保留与离线保护 | [ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md) |
+| `crates/retrieval`、schema v10 派生索引与权威候选回读 | [ADR-0003：时间化三账本](adr/0003-temporal-three-ledger-model.md)、[ADR-0004：核心访问边界](adr/0004-trusted-core-access-boundary.md)、[ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md)、[ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md)、[ADR-0019：稳定结构块与动态检索窗口](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md)、[ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md) |
 | Context Builder、多通道召回、深度理解投影与记忆边界 | [ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md) |
 | Core 解析输出、证据块身份、增量索引与永久引用 | [ADR-0019：稳定结构块与动态检索窗口](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md) |
 | 来源版本、历史块引用、当前投影与记忆复核 | [ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md) |
@@ -1325,3 +1334,30 @@ crates/vault/src/
 ```
 
 S12 不提供桌面选目录 UI、操作系统通知订阅、S13 的真实当前/历史检索消费者或长期记忆维护器；宿主可用启动/定期校准或未来文件通知调用同一协调入口。来源当前性已持久化为后续检索门禁，`SOURCE_REMOVED` 不删除任何 Evidence、提取修订、证据块或谱系；只有未来显式 Forget 链路可以执行删除传播。
+
+### 9.13 S13 权威全文、时间与关系检索当前实现边界
+
+```text
+crates/retrieval/src/lib.rs
+  RetrievalQuery / TimeRange       # 全文、时间、实体与 current|historical 契约
+  RetrievalRepository             # 索引校验、候选召回、权威解析 port
+  retrieve                         # 多通道合并、确定性排序与强制权威回读
+crates/vault/src/
+  schema.rs                        # schema v10 可重建全文/时间/关系索引
+  repository.rs                    # 摘要校验、原子重建、来源门禁与规范回读
+crates/vault/tests/retrieval_persistence.rs
+  authoritative_multi_channel_retrieval_survives_scope_changes_and_reopen
+```
+
+```text
+retrieve(query)
+  -> 校验 eam-retrieval-v1 派生索引与权威输入摘要
+  -> 缺失/过期/损坏：事务内从证据块、账本和关系重建
+  -> lexical | temporal | relation 只产生 EvidenceBlockRef | ClaimId
+  -> 时间条件与其他召回通道求交集
+  -> current：PRESENT + 最新来源版本；historical：允许旧版/已移除来源
+  -> 认证解密规范文本或校验账本逐字来源
+  -> 返回带通道、来源当前性、归属和有效时间的权威候选
+```
+
+S13 不实现向量候选、深度理解投影、相邻块检索窗口、token 预算或冻结工作上下文；这些仍属于 S14/S15。索引表可以删除和重建，不得被引用为事实或永久来源；`SOURCE_UNAVAILABLE` 不改写子来源状态，显式 Forget 的删除传播仍属于 S19。

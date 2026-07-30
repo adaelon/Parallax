@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
 };
@@ -22,13 +22,18 @@ use eam_ingestion::{
     ArchivedEvidence, BlockLineage, BlockLineageRepository, BlockLineageStatus,
     CanonicalEvidenceBlockSource, CanonicalLineageRevision, EvidenceBlock, EvidenceBlockDraft,
     EvidenceBlockId, EvidenceBlockMetadata, EvidenceBlockQueryRepository, EvidenceBlockRef,
-    EvidenceExtractionRepository, ExtractionRevision, ExtractionRevisionId, IncrementalWorkItem,
-    IncrementalWorkPlan, LineageBasis, LineageBatch, LineagePair, MARKDOWN_LOCATOR_VERSION,
-    MarkdownArchiveRepository, MarkdownLocator, MarkdownLocatorValue, MarkdownParseAttempt,
-    MarkdownParseStart, MarkdownParseState, MaterializedExtraction, SourceAnchor, UnparsedReason,
-    ValidatedExtraction,
+    EvidenceBlockView, EvidenceExtractionRepository, ExtractionRevision, ExtractionRevisionId,
+    IncrementalWorkItem, IncrementalWorkPlan, LineageBasis, LineageBatch, LineagePair,
+    MARKDOWN_LOCATOR_VERSION, MarkdownArchiveRepository, MarkdownLocator, MarkdownLocatorValue,
+    MarkdownParseAttempt, MarkdownParseStart, MarkdownParseState, MaterializedExtraction,
+    SourceAnchor, UnparsedReason, ValidatedExtraction,
 };
 use eam_markdown::{MarkdownBlockKind, MarkdownRelationKind, ParseResource, ParsedMarkdownV1};
+use eam_retrieval::{
+    AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, IndexBuildReceipt,
+    IndexDisposition, RETRIEVAL_INDEX_VERSION, RecallChannels, RecallHit, RetrievalQuery,
+    RetrievalRepository, SourceCurrentness, SourceScope, search_terms,
+};
 use eam_source_obsidian::{
     ObsidianSourceRepository, SourceArchiveInput, SourceArchiveReceipt, SourceAvailability,
     SourceDocumentProjection, SourceFileKind, SourceRecord, SourceRecordState, SourceRelation,
@@ -1205,6 +1210,62 @@ impl ObsidianSourceRepository for VaultRepository {
     }
 }
 
+impl RetrievalRepository for VaultRepository {
+    type Error = VaultError;
+
+    fn ensure_retrieval_index(&mut self) -> Result<IndexBuildReceipt, Self::Error> {
+        let authority = load_retrieval_authority(self)?;
+        let stored = self
+            .connection()
+            .query_row(
+                "SELECT contract_version, authority_digest, index_digest,
+                        evidence_block_count, ledger_claim_count, relation_count
+                 FROM retrieval_index_metadata WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let current_index_digest = retrieval_index_digest(self.connection()).ok();
+        let is_current = stored.is_some_and(
+            |(version, authority_digest, index_digest, blocks, claims, relations)| {
+                version == RETRIEVAL_INDEX_VERSION
+                    && authority_digest.as_slice() == authority.digest
+                    && current_index_digest
+                        .as_ref()
+                        .is_some_and(|actual| index_digest.as_slice() == actual)
+                    && usize::try_from(blocks).ok() == Some(authority.blocks.len())
+                    && usize::try_from(claims).ok() == Some(authority.claims.len())
+                    && usize::try_from(relations).ok() == Some(authority.relations.len())
+            },
+        );
+        if is_current {
+            return Ok(authority.receipt(IndexDisposition::Current));
+        }
+        rebuild_retrieval_index(self, &authority)
+    }
+
+    fn recall_candidates(&self, query: &RetrievalQuery) -> Result<Vec<RecallHit>, Self::Error> {
+        recall_retrieval_candidates(self.connection(), query)
+    }
+
+    fn resolve_authoritative(
+        &self,
+        reference: CandidateRef,
+        scope: SourceScope,
+    ) -> Result<Option<AuthoritativeCandidate>, Self::Error> {
+        resolve_retrieval_candidate(self, reference, scope)
+    }
+}
+
 impl MemoryRepository for VaultRepository {
     fn next_evidence_id(&mut self) -> EvidenceId {
         let id = EvidenceId::from_raw(self.next_evidence_id);
@@ -2076,6 +2137,986 @@ fn configure_connection(connection: &Connection) -> Result<(), VaultError> {
          PRAGMA synchronous = FULL;",
     )?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct RetrievalBlockAuthority {
+    reference: EvidenceBlockRef,
+    source_record_id: u64,
+    version_ordinal: u64,
+    recorded_at_millis: i64,
+    start_byte: usize,
+    end_byte: usize,
+    quote: String,
+}
+
+#[derive(Clone)]
+struct RetrievalEntityAuthority {
+    source_record_id: u64,
+    terms: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct RetrievalRelationAuthority {
+    from_ref: EvidenceBlockRef,
+    relation_ordinal: u64,
+    to_source_record_id: u64,
+    relation_kind: i64,
+}
+
+struct RetrievalAuthority {
+    digest: [u8; 32],
+    blocks: Vec<RetrievalBlockAuthority>,
+    claims: Vec<Claim>,
+    entities: Vec<RetrievalEntityAuthority>,
+    relations: Vec<RetrievalRelationAuthority>,
+    built_at_millis: i64,
+}
+
+impl RetrievalAuthority {
+    fn receipt(&self, disposition: IndexDisposition) -> IndexBuildReceipt {
+        IndexBuildReceipt::new(
+            disposition,
+            self.blocks.len(),
+            self.claims.len(),
+            self.relations.len(),
+        )
+    }
+}
+
+fn load_retrieval_authority(
+    repository: &VaultRepository,
+) -> Result<RetrievalAuthority, VaultError> {
+    let mut statement = repository.connection().prepare(
+        "SELECT r.evidence_id, r.contract_version, v.source_record_id,
+                v.version_ordinal, a.archived_at
+         FROM extraction_revisions r
+         JOIN archived_evidence a ON a.id = r.evidence_id
+         JOIN source_record_versions v ON v.evidence_id = r.evidence_id
+         ORDER BY r.evidence_id, r.id",
+    )?;
+    let revisions = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut blocks = Vec::new();
+    let mut built_at_millis = i64::MIN;
+    for (evidence_id, contract, source_record_id, version_ordinal, recorded_at_millis) in revisions
+    {
+        let evidence_id =
+            u64::try_from(evidence_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let materialized = repository
+            .materialized_extraction(evidence_id, &contract)?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        let canonical = String::from_utf8(repository.read_archived_content(evidence_id)?)
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        for block in materialized.blocks() {
+            blocks.push(RetrievalBlockAuthority {
+                reference: block.reference(),
+                source_record_id: u64::try_from(source_record_id)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                version_ordinal: u64::try_from(version_ordinal)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                recorded_at_millis,
+                start_byte: block.anchor().start_byte(),
+                end_byte: block.anchor().end_byte(),
+                quote: block
+                    .anchor()
+                    .quote(&canonical)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?
+                    .to_owned(),
+            });
+        }
+        built_at_millis = built_at_millis.max(recorded_at_millis);
+    }
+
+    let claims =
+        MemoryRepository::all_claims(repository).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    for claim in &claims {
+        built_at_millis = built_at_millis.max(claim.recorded_at().as_millis());
+    }
+    if built_at_millis == i64::MIN {
+        built_at_millis = 0;
+    }
+    let entities = load_retrieval_entities(repository.connection())?;
+    let relations = load_retrieval_relations(repository.connection(), &blocks)?;
+    let digest = retrieval_authority_digest(&blocks, &claims, &entities, &relations);
+    Ok(RetrievalAuthority {
+        digest,
+        blocks,
+        claims,
+        entities,
+        relations,
+        built_at_millis,
+    })
+}
+
+fn load_retrieval_entities(
+    connection: &Connection,
+) -> Result<Vec<RetrievalEntityAuthority>, VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT s.id, COALESCE(s.current_locator, s.source_locator),
+                (SELECT v.evidence_id FROM source_record_versions v
+                 WHERE v.source_record_id = s.id
+                 ORDER BY v.version_ordinal DESC LIMIT 1)
+         FROM source_records s ORDER BY s.id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    rows.into_iter()
+        .map(|(source_record_id, locator, evidence_id)| {
+            let mut values = vec![locator];
+            if let Some(evidence_id) = evidence_id {
+                values.extend(load_strings(
+                    connection,
+                    "SELECT value FROM obsidian_aliases WHERE evidence_id = ?1 ORDER BY ordinal",
+                    evidence_id,
+                )?);
+                values.extend(load_strings(
+                    connection,
+                    "SELECT value FROM obsidian_tags WHERE evidence_id = ?1 ORDER BY ordinal",
+                    evidence_id,
+                )?);
+                let properties = load_string_pairs(
+                    connection,
+                    "SELECT name, value FROM obsidian_properties
+                     WHERE evidence_id = ?1 ORDER BY property_ordinal, value_ordinal",
+                    evidence_id,
+                )?;
+                for (name, value) in properties {
+                    values.push(name);
+                    values.push(value);
+                }
+            }
+            let terms = values
+                .iter()
+                .flat_map(|value| search_terms(value))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Ok(RetrievalEntityAuthority {
+                source_record_id: u64::try_from(source_record_id)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                terms,
+            })
+        })
+        .collect()
+}
+
+fn load_retrieval_relations(
+    connection: &Connection,
+    blocks: &[RetrievalBlockAuthority],
+) -> Result<Vec<RetrievalRelationAuthority>, VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT r.evidence_id, r.ordinal, r.relation_kind,
+                r.start_byte, r.end_byte, x.resolved_source_record_id
+         FROM obsidian_relations r
+         JOIN obsidian_relation_resolutions x
+           ON x.evidence_id = r.evidence_id AND x.relation_ordinal = r.ordinal
+         ORDER BY r.evidence_id, r.ordinal",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(evidence_id, ordinal, kind, start, end, target)| {
+            let evidence_id =
+                u64::try_from(evidence_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+            let start = usize::try_from(start).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+            let end = usize::try_from(end).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+            let from_ref = blocks
+                .iter()
+                .filter(|block| {
+                    block.reference.evidence_id() == evidence_id
+                        && block.start_byte <= start
+                        && block.end_byte >= end
+                })
+                .min_by_key(|block| block.end_byte.saturating_sub(block.start_byte))
+                .map(|block| block.reference)
+                .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+            Ok(RetrievalRelationAuthority {
+                from_ref,
+                relation_ordinal: u64::try_from(ordinal)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                to_source_record_id: u64::try_from(target)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                relation_kind: kind,
+            })
+        })
+        .collect()
+}
+
+fn retrieval_authority_digest(
+    blocks: &[RetrievalBlockAuthority],
+    claims: &[Claim],
+    entities: &[RetrievalEntityAuthority],
+    relations: &[RetrievalRelationAuthority],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hash_bytes(&mut hasher, RETRIEVAL_INDEX_VERSION.as_bytes());
+    for block in blocks {
+        hash_u64(&mut hasher, block.reference.evidence_id());
+        hash_u64(&mut hasher, block.reference.block_id().get());
+        hash_u64(&mut hasher, block.source_record_id);
+        hash_u64(&mut hasher, block.version_ordinal);
+        hash_i64(&mut hasher, block.recorded_at_millis);
+        hash_u64(
+            &mut hasher,
+            u64::try_from(block.start_byte).unwrap_or(u64::MAX),
+        );
+        hash_u64(
+            &mut hasher,
+            u64::try_from(block.end_byte).unwrap_or(u64::MAX),
+        );
+        hash_bytes(&mut hasher, block.quote.as_bytes());
+    }
+    for claim in claims {
+        hash_u64(&mut hasher, claim.id().get());
+        hash_i64(&mut hasher, encode_owner(claim.owner()));
+        hash_bytes(&mut hasher, claim.statement().as_bytes());
+        hash_i64(
+            &mut hasher,
+            claim.uncertainty().map_or(-1, encode_uncertainty),
+        );
+        let (kind, start, end) = encode_applicable_time(claim.applicable_time());
+        hash_i64(&mut hasher, kind);
+        hash_optional_i64(&mut hasher, start);
+        hash_optional_i64(&mut hasher, end);
+        hash_i64(&mut hasher, claim.recorded_at().as_millis());
+        for citation in claim.support() {
+            hash_u64(&mut hasher, citation.evidence_id().get());
+            hash_bytes(&mut hasher, citation.quote().as_bytes());
+        }
+    }
+    for entity in entities {
+        hash_u64(&mut hasher, entity.source_record_id);
+        for term in &entity.terms {
+            hash_bytes(&mut hasher, term.as_bytes());
+        }
+    }
+    for relation in relations {
+        hash_u64(&mut hasher, relation.from_ref.evidence_id());
+        hash_u64(&mut hasher, relation.from_ref.block_id().get());
+        hash_u64(&mut hasher, relation.relation_ordinal);
+        hash_u64(&mut hasher, relation.to_source_record_id);
+        hash_i64(&mut hasher, relation.relation_kind);
+    }
+    hasher.finalize().into()
+}
+
+fn rebuild_retrieval_index(
+    repository: &mut VaultRepository,
+    authority: &RetrievalAuthority,
+) -> Result<IndexBuildReceipt, VaultError> {
+    let transaction = repository
+        .connection
+        .as_mut()
+        .expect("an open vault always owns a database connection")
+        .transaction()?;
+    clear_retrieval_index(&transaction)?;
+    insert_retrieval_blocks(&transaction, &authority.blocks)?;
+    insert_retrieval_claims(&transaction, &authority.claims)?;
+    insert_retrieval_graph(&transaction, &authority.entities, &authority.relations)?;
+    let index_digest = retrieval_index_digest(&transaction)?;
+    transaction.execute(
+        "INSERT INTO retrieval_index_metadata
+         (id, contract_version, authority_digest, index_digest, built_at,
+          evidence_block_count, ledger_claim_count, relation_count)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            RETRIEVAL_INDEX_VERSION,
+            authority.digest.as_slice(),
+            index_digest.as_slice(),
+            authority.built_at_millis,
+            i64::try_from(authority.blocks.len()).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            i64::try_from(authority.claims.len()).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            i64::try_from(authority.relations.len())
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(authority.receipt(IndexDisposition::Rebuilt))
+}
+
+fn clear_retrieval_index(transaction: &rusqlite::Transaction<'_>) -> Result<(), VaultError> {
+    for table in [
+        "retrieval_index_metadata",
+        "retrieval_relation_edges",
+        "retrieval_entity_terms",
+        "retrieval_claim_terms",
+        "retrieval_claim_documents",
+        "retrieval_block_terms",
+        "retrieval_block_documents",
+        "retrieval_evidence_availability",
+    ] {
+        transaction.execute(&format!("DELETE FROM {table}"), [])?;
+    }
+    Ok(())
+}
+
+fn insert_retrieval_blocks(
+    transaction: &rusqlite::Transaction<'_>,
+    blocks: &[RetrievalBlockAuthority],
+) -> Result<(), VaultError> {
+    let mut available_evidence = HashSet::new();
+    for block in blocks {
+        if available_evidence.insert(block.reference.evidence_id()) {
+            transaction.execute(
+                "INSERT INTO retrieval_evidence_availability (evidence_id, state)
+                 VALUES (?1, 1)",
+                [to_vault_sql_id(block.reference.evidence_id())?],
+            )?;
+        }
+        let content_digest: [u8; 32] = Sha256::digest(block.quote.as_bytes()).into();
+        transaction.execute(
+            "INSERT INTO retrieval_block_documents
+             (evidence_id, block_id, source_record_id, version_ordinal,
+              recorded_at, content_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                to_vault_sql_id(block.reference.evidence_id())?,
+                to_vault_sql_id(block.reference.block_id().get())?,
+                to_vault_sql_id(block.source_record_id)?,
+                i64::try_from(block.version_ordinal)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                block.recorded_at_millis,
+                content_digest.as_slice(),
+            ],
+        )?;
+        for term in search_terms(&block.quote) {
+            transaction.execute(
+                "INSERT INTO retrieval_block_terms (term, evidence_id, block_id)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    term,
+                    to_vault_sql_id(block.reference.evidence_id())?,
+                    to_vault_sql_id(block.reference.block_id().get())?,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_retrieval_claims(
+    transaction: &rusqlite::Transaction<'_>,
+    claims: &[Claim],
+) -> Result<(), VaultError> {
+    for claim in claims {
+        let (start, end, unknown) = retrieval_claim_interval(claim.applicable_time());
+        let statement_digest: [u8; 32] = Sha256::digest(claim.statement().as_bytes()).into();
+        transaction.execute(
+            "INSERT INTO retrieval_claim_documents
+             (claim_id, applicable_start, applicable_end, applicable_unknown,
+              recorded_at, statement_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                to_vault_sql_id(claim.id().get())?,
+                start,
+                end,
+                i64::from(unknown),
+                claim.recorded_at().as_millis(),
+                statement_digest.as_slice(),
+            ],
+        )?;
+        for term in search_terms(claim.statement()) {
+            transaction.execute(
+                "INSERT INTO retrieval_claim_terms (term, claim_id) VALUES (?1, ?2)",
+                params![term, to_vault_sql_id(claim.id().get())?],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_retrieval_graph(
+    transaction: &rusqlite::Transaction<'_>,
+    entities: &[RetrievalEntityAuthority],
+    relations: &[RetrievalRelationAuthority],
+) -> Result<(), VaultError> {
+    for entity in entities {
+        for term in &entity.terms {
+            transaction.execute(
+                "INSERT INTO retrieval_entity_terms (term, source_record_id)
+                 VALUES (?1, ?2)",
+                params![term, to_vault_sql_id(entity.source_record_id)?],
+            )?;
+        }
+    }
+    for relation in relations {
+        transaction.execute(
+            "INSERT INTO retrieval_relation_edges
+             (from_evidence_id, from_block_id, relation_ordinal,
+              to_source_record_id, relation_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_vault_sql_id(relation.from_ref.evidence_id())?,
+                to_vault_sql_id(relation.from_ref.block_id().get())?,
+                i64::try_from(relation.relation_ordinal)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                to_vault_sql_id(relation.to_source_record_id)?,
+                relation.relation_kind,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+const fn retrieval_claim_interval(value: ApplicableTime) -> (Option<i64>, Option<i64>, bool) {
+    match value {
+        ApplicableTime::At(value) => (Some(value.as_millis()), Some(value.as_millis()), false),
+        ApplicableTime::Since(value) => (Some(value.as_millis()), None, false),
+        ApplicableTime::Between { start, end } => {
+            (Some(start.as_millis()), Some(end.as_millis()), false)
+        }
+        ApplicableTime::Unknown => (None, None, true),
+    }
+}
+
+fn hash_bytes(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_u64(hasher: &mut Sha256, value: u64) {
+    hasher.update(value.to_le_bytes());
+}
+
+fn hash_i64(hasher: &mut Sha256, value: i64) {
+    hasher.update(value.to_le_bytes());
+}
+
+fn hash_optional_i64(hasher: &mut Sha256, value: Option<i64>) {
+    hasher.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        hash_i64(hasher, value);
+    }
+}
+
+fn retrieval_index_digest(connection: &Connection) -> Result<[u8; 32], VaultError> {
+    let mut hasher = Sha256::new();
+    hash_bytes(&mut hasher, RETRIEVAL_INDEX_VERSION.as_bytes());
+    hash_retrieval_block_index(connection, &mut hasher)?;
+    hash_retrieval_claim_index(connection, &mut hasher)?;
+    hash_retrieval_graph_index(connection, &mut hasher)?;
+    Ok(hasher.finalize().into())
+}
+
+fn hash_retrieval_block_index(
+    connection: &Connection,
+    hasher: &mut Sha256,
+) -> Result<(), VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT evidence_id, state FROM retrieval_evidence_availability ORDER BY evidence_id",
+    )?;
+    for (evidence_id, state) in statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        hash_i64(hasher, evidence_id);
+        hash_i64(hasher, state);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT evidence_id, block_id, source_record_id, version_ordinal,
+                recorded_at, content_digest
+         FROM retrieval_block_documents ORDER BY evidence_id, block_id",
+    )?;
+    for (evidence_id, block_id, source_id, version, recorded_at, digest) in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        for value in [evidence_id, block_id, source_id, version, recorded_at] {
+            hash_i64(hasher, value);
+        }
+        hash_bytes(hasher, &digest);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT term, evidence_id, block_id
+         FROM retrieval_block_terms ORDER BY term, evidence_id, block_id",
+    )?;
+    for (term, evidence_id, block_id) in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        hash_bytes(hasher, term.as_bytes());
+        hash_i64(hasher, evidence_id);
+        hash_i64(hasher, block_id);
+    }
+    Ok(())
+}
+
+fn hash_retrieval_claim_index(
+    connection: &Connection,
+    hasher: &mut Sha256,
+) -> Result<(), VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT claim_id, applicable_start, applicable_end, applicable_unknown,
+                recorded_at, statement_digest
+         FROM retrieval_claim_documents ORDER BY claim_id",
+    )?;
+    for (claim_id, start, end, unknown, recorded_at, digest) in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        hash_i64(hasher, claim_id);
+        hash_optional_i64(hasher, start);
+        hash_optional_i64(hasher, end);
+        hash_i64(hasher, unknown);
+        hash_i64(hasher, recorded_at);
+        hash_bytes(hasher, &digest);
+    }
+
+    let mut statement = connection
+        .prepare("SELECT term, claim_id FROM retrieval_claim_terms ORDER BY term, claim_id")?;
+    for (term, claim_id) in statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        hash_bytes(hasher, term.as_bytes());
+        hash_i64(hasher, claim_id);
+    }
+    Ok(())
+}
+
+fn hash_retrieval_graph_index(
+    connection: &Connection,
+    hasher: &mut Sha256,
+) -> Result<(), VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT term, source_record_id
+         FROM retrieval_entity_terms ORDER BY term, source_record_id",
+    )?;
+    for (term, source_id) in statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        hash_bytes(hasher, term.as_bytes());
+        hash_i64(hasher, source_id);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT from_evidence_id, from_block_id, relation_ordinal,
+                to_source_record_id, relation_kind
+         FROM retrieval_relation_edges
+         ORDER BY from_evidence_id, relation_ordinal",
+    )?;
+    for row in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        for value in [row.0, row.1, row.2, row.3, row.4] {
+            hash_i64(hasher, value);
+        }
+    }
+    Ok(())
+}
+
+fn recall_retrieval_candidates(
+    connection: &Connection,
+    query: &RetrievalQuery,
+) -> Result<Vec<RecallHit>, VaultError> {
+    let mut hits = Vec::new();
+    append_lexical_hits(connection, query.text(), &mut hits)?;
+    append_temporal_hits(connection, query.time(), &mut hits)?;
+    append_entity_hits(connection, query.entities(), &mut hits)?;
+    let has_non_temporal_filter = query
+        .text()
+        .is_some_and(|text| !search_terms(text).is_empty())
+        || query
+            .entities()
+            .iter()
+            .any(|entity| !search_terms(entity).is_empty());
+    if query.time().is_some() && has_non_temporal_filter {
+        let temporally_valid = hits
+            .iter()
+            .filter(|hit| hit.channels().contains_temporal())
+            .map(|hit| hit.reference())
+            .collect::<BTreeSet<_>>();
+        let recalled_by_content_or_relation = hits
+            .iter()
+            .filter(|hit| hit.channels().contains_lexical() || hit.channels().contains_relation())
+            .map(|hit| hit.reference())
+            .collect::<BTreeSet<_>>();
+        hits.retain(|hit| {
+            temporally_valid.contains(&hit.reference())
+                && recalled_by_content_or_relation.contains(&hit.reference())
+        });
+    }
+    Ok(hits)
+}
+
+fn append_lexical_hits(
+    connection: &Connection,
+    text: Option<&str>,
+    hits: &mut Vec<RecallHit>,
+) -> Result<(), VaultError> {
+    if let Some(text) = text {
+        for term in search_terms(text) {
+            let mut statement = connection.prepare(
+                "SELECT evidence_id, block_id FROM retrieval_block_terms WHERE term = ?1
+                 ORDER BY evidence_id, block_id",
+            )?;
+            for (evidence_id, block_id) in statement
+                .query_map([&term], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                hits.push(RecallHit::new(
+                    CandidateRef::Evidence {
+                        evidence_id: u64::try_from(evidence_id)
+                            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                        block_id: u64::try_from(block_id)
+                            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    },
+                    RecallChannels::lexical(),
+                    1,
+                ));
+            }
+            let mut statement = connection.prepare(
+                "SELECT claim_id FROM retrieval_claim_terms WHERE term = ?1 ORDER BY claim_id",
+            )?;
+            for claim_id in statement
+                .query_map([&term], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                hits.push(RecallHit::new(
+                    CandidateRef::Ledger {
+                        claim_id: u64::try_from(claim_id)
+                            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    },
+                    RecallChannels::lexical(),
+                    1,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_temporal_hits(
+    connection: &Connection,
+    time: Option<eam_retrieval::TimeRange>,
+    hits: &mut Vec<RecallHit>,
+) -> Result<(), VaultError> {
+    if let Some(time) = time {
+        let mut statement = connection.prepare(
+            "SELECT evidence_id, block_id FROM retrieval_block_documents
+             WHERE recorded_at BETWEEN ?1 AND ?2 ORDER BY evidence_id, block_id",
+        )?;
+        for (evidence_id, block_id) in statement
+            .query_map(params![time.start_millis(), time.end_millis()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            hits.push(RecallHit::new(
+                CandidateRef::Evidence {
+                    evidence_id: u64::try_from(evidence_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    block_id: u64::try_from(block_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                },
+                RecallChannels::temporal(),
+                0,
+            ));
+        }
+        let mut statement = connection.prepare(
+            "SELECT claim_id FROM retrieval_claim_documents
+             WHERE applicable_unknown = 0
+               AND applicable_start <= ?2
+               AND (applicable_end IS NULL OR applicable_end >= ?1)
+             ORDER BY claim_id",
+        )?;
+        for claim_id in statement
+            .query_map(params![time.start_millis(), time.end_millis()], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            hits.push(RecallHit::new(
+                CandidateRef::Ledger {
+                    claim_id: u64::try_from(claim_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                },
+                RecallChannels::temporal(),
+                0,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn append_entity_hits(
+    connection: &Connection,
+    entities: &[String],
+    hits: &mut Vec<RecallHit>,
+) -> Result<(), VaultError> {
+    let mut related_sources = BTreeSet::new();
+    for entity in entities {
+        for term in search_terms(entity) {
+            let mut statement = connection.prepare(
+                "SELECT source_record_id FROM retrieval_entity_terms
+                 WHERE term = ?1 ORDER BY source_record_id",
+            )?;
+            for source_id in statement
+                .query_map([&term], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                related_sources
+                    .insert(u64::try_from(source_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?);
+            }
+        }
+    }
+    for source_id in related_sources {
+        append_relation_hits(connection, source_id, hits)?;
+    }
+    Ok(())
+}
+
+fn append_relation_hits(
+    connection: &Connection,
+    source_record_id: u64,
+    hits: &mut Vec<RecallHit>,
+) -> Result<(), VaultError> {
+    let source_id = to_vault_sql_id(source_record_id)?;
+    let queries = [
+        "SELECT evidence_id, block_id FROM retrieval_block_documents
+         WHERE source_record_id = ?1 ORDER BY evidence_id, block_id",
+        "SELECT from_evidence_id, from_block_id FROM retrieval_relation_edges
+         WHERE to_source_record_id = ?1 ORDER BY from_evidence_id, from_block_id",
+        "SELECT target.evidence_id, target.block_id
+         FROM retrieval_relation_edges edge
+         JOIN retrieval_block_documents source
+           ON source.evidence_id = edge.from_evidence_id
+          AND source.block_id = edge.from_block_id
+         JOIN retrieval_block_documents target
+           ON target.source_record_id = edge.to_source_record_id
+         WHERE source.source_record_id = ?1
+         ORDER BY target.evidence_id, target.block_id",
+    ];
+    for query in queries {
+        let mut statement = connection.prepare(query)?;
+        for (evidence_id, block_id) in statement
+            .query_map([source_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            hits.push(RecallHit::new(
+                CandidateRef::Evidence {
+                    evidence_id: u64::try_from(evidence_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    block_id: u64::try_from(block_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                },
+                RecallChannels::relation(),
+                0,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_retrieval_candidate(
+    repository: &VaultRepository,
+    candidate: CandidateRef,
+    scope: SourceScope,
+) -> Result<Option<AuthoritativeCandidate>, VaultError> {
+    match candidate {
+        CandidateRef::Evidence {
+            evidence_id,
+            block_id,
+        } => resolve_retrieval_evidence(repository, evidence_id, block_id, scope),
+        CandidateRef::Ledger { claim_id } => {
+            resolve_retrieval_claim(repository, claim_id).map(Some)
+        }
+    }
+}
+
+fn resolve_retrieval_evidence(
+    repository: &VaultRepository,
+    evidence_id: u64,
+    block_id: u64,
+    scope: SourceScope,
+) -> Result<Option<AuthoritativeCandidate>, VaultError> {
+    let evidence_id_sql = to_vault_sql_id(evidence_id)?;
+    let source = repository
+        .connection()
+        .query_row(
+            "SELECT v.source_record_id,
+                    CASE WHEN s.origin_kind = 1 THEN s.current_locator
+                         ELSE s.source_locator END,
+                    s.record_state, a.archived_at,
+                    v.version_ordinal = (
+                        SELECT MAX(latest.version_ordinal)
+                        FROM source_record_versions latest
+                        WHERE latest.source_record_id = v.source_record_id
+                    )
+             FROM source_record_versions v
+             JOIN source_records s ON s.id = v.source_record_id
+             JOIN archived_evidence a ON a.id = v.evidence_id
+             JOIN retrieval_evidence_availability available
+               ON available.evidence_id = v.evidence_id AND available.state = 1
+             WHERE v.evidence_id = ?1",
+            [evidence_id_sql],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let currentness = match source.2 {
+        0 => SourceCurrentness::Present,
+        1 => SourceCurrentness::SourceRemoved,
+        _ => return Err(VaultError::InvalidKeyOrCorrupt),
+    };
+    if scope == SourceScope::Current
+        && (currentness == SourceCurrentness::SourceRemoved || !source.4)
+    {
+        return Ok(None);
+    }
+    let reference = EvidenceBlockRef::new(
+        evidence_id,
+        EvidenceBlockId::new(block_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+    )
+    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let canonical =
+        EvidenceBlockQueryRepository::load_canonical_evidence_block(repository, reference)?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let canonical_text = std::str::from_utf8(canonical.canonical_bytes())
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let view = EvidenceBlockView::new(canonical.block().clone(), canonical_text)
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let indexed_digest = repository
+        .connection()
+        .query_row(
+            "SELECT content_digest FROM retrieval_block_documents
+             WHERE evidence_id = ?1 AND block_id = ?2",
+            params![evidence_id_sql, to_vault_sql_id(block_id)?],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let authority_digest: [u8; 32] = Sha256::digest(view.verbatim().as_bytes()).into();
+    if indexed_digest.as_slice() != authority_digest {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    Ok(Some(AuthoritativeCandidate::Evidence(
+        AuthoritativeEvidence::new(
+            view,
+            u64::try_from(source.0).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            source.1.ok_or(VaultError::InvalidKeyOrCorrupt)?,
+            currentness,
+            source.3,
+        ),
+    )))
+}
+
+fn resolve_retrieval_claim(
+    repository: &VaultRepository,
+    claim_id: u64,
+) -> Result<AuthoritativeCandidate, VaultError> {
+    let claim = MemoryRepository::all_claims(repository)
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?
+        .into_iter()
+        .find(|claim| claim.id() == ClaimId::from_raw(claim_id))
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    if claim.support().is_empty() {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    for citation in claim.support() {
+        let evidence = MemoryRepository::evidence(repository, citation.evidence_id())
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        if citation.quote().is_empty() || !evidence.verbatim().contains(citation.quote()) {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+    }
+    let indexed_digest = repository
+        .connection()
+        .query_row(
+            "SELECT statement_digest FROM retrieval_claim_documents WHERE claim_id = ?1",
+            [to_vault_sql_id(claim_id)?],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let authority_digest: [u8; 32] = Sha256::digest(claim.statement().as_bytes()).into();
+    if indexed_digest.as_slice() != authority_digest {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    Ok(AuthoritativeCandidate::Ledger(claim))
 }
 
 fn recover_interrupted_markdown_attempts(connection: &mut Connection) -> Result<(), VaultError> {
@@ -4196,6 +5237,72 @@ mod tests {
                 .load_lineage_batch(current.revision().id(), batch.rule_version())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn corrupt_retrieval_index_rebuilds_without_mutating_authority() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let mut repository =
+            VaultRepository::open(directory.path(), VaultKey::new([0x91; 32])).unwrap();
+        let source = "# Rebuild\n\nAuthoritative retrieval evidence.\n";
+        let receipt = repository
+            .archive(ArchiveInput {
+                source_locator: "inbox/rebuild.md",
+                content: source.as_bytes(),
+                status: ArchiveStatus::Archived,
+                archived_at_millis: 10,
+            })
+            .unwrap();
+        eam_ingestion::process_archived_markdown(
+            &mut repository,
+            receipt.archive_id,
+            eam_markdown::ParseLimits::default(),
+            20,
+            30,
+        )
+        .unwrap();
+        eam_ingestion::materialize_accepted_markdown(
+            &mut repository,
+            receipt.archive_id,
+            eam_markdown::CONTRACT_VERSION,
+        )
+        .unwrap();
+        let canonical_before = repository
+            .read_archived_content(receipt.archive_id)
+            .unwrap();
+        let extraction_before = repository
+            .materialized_extraction(receipt.archive_id, eam_markdown::CONTRACT_VERSION)
+            .unwrap();
+
+        let first = repository.ensure_retrieval_index().unwrap();
+        assert_eq!(first.disposition(), IndexDisposition::Rebuilt);
+        repository
+            .connection()
+            .execute(
+                "UPDATE retrieval_block_documents SET content_digest = zeroblob(32)",
+                [],
+            )
+            .unwrap();
+        let rebuilt = repository.ensure_retrieval_index().unwrap();
+
+        assert_eq!(rebuilt.disposition(), IndexDisposition::Rebuilt);
+        assert_eq!(
+            repository
+                .read_archived_content(receipt.archive_id)
+                .unwrap(),
+            canonical_before
+        );
+        assert_eq!(
+            repository
+                .materialized_extraction(receipt.archive_id, eam_markdown::CONTRACT_VERSION)
+                .unwrap(),
+            extraction_before
+        );
+        assert_eq!(
+            repository.ensure_retrieval_index().unwrap().disposition(),
+            IndexDisposition::Current
         );
     }
 }

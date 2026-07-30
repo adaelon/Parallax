@@ -1,5 +1,28 @@
 # 代码链路
 
+## 2026-07-30 S13-2 权威多通道检索与可重建索引
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_10` — 新增全文词项、账本有效期、实体关系、AVAILABLE 投影与双摘要元数据。
+- `crates/vault/src/repository.rs:RetrievalRepository` — 实现索引新鲜度校验、原子重建、全文/时间/关系召回和 current/historical 门禁。
+- `crates/vault/src/repository.rs:recall_retrieval_candidates` — 将显式时间条件作为全文/关系候选的交集门禁，拒绝仅命中时间的无关结果混入。
+- `crates/vault/src/repository.rs:resolve_retrieval_candidate` — 每个候选认证回读规范证据块或校验带逐字来源的账本，拒绝索引片段成为事实。
+- `crates/vault/tests/retrieval_persistence.rs:authoritative_multi_channel_retrieval_survives_scope_changes_and_reopen` — 覆盖时间冲突、实体关系、来源移除、历史范围与跨重启。
+- `crates/vault/src/repository.rs::tests::corrupt_retrieval_index_rebuilds_without_mutating_authority` — 故障注入验证损坏索引重建不改权威证据。
+
+**入口**：可信 Core 调用 `retrieve(&mut repository, RetrievalQuery)`；查询先确保 `eam-retrieval-v1` 索引有效，再解析为 `EvidenceBlockRef | ClaimId` 对应的权威值。
+**测试**：S13 端到端基准 1/1 覆盖跨通道时间交集，损坏重建故障注入与 schema v10 中断回滚通过；全仓 Rust 119/119、fmt/clippy/desktop check、前端 2/2/typecheck/build 及 release 构建通过。
+
+## 2026-07-30 S13-1 检索领域契约
+
+**触达**:
+- `crates/retrieval/src/lib.rs:RetrievalQuery/TimeRange` — 固定全文、时间、实体、结果上限和 `current | historical` 输入。
+- `crates/retrieval/src/lib.rs:RetrievalRepository/retrieve` — 固定索引只产候选、候选必须权威解析的本地可信边界。
+- `crates/retrieval/src/lib.rs:search_terms` — 提供确定性 ASCII 大小写折叠和 Unicode/CJK 整词、字符及双字词项。
+
+**入口**：本地 Context Builder 或测试以 `RetrievalQuery` 调用 `retrieve`；外部模型与 WebView 不获得 repository。
+**测试**：`crates/retrieval/src/lib.rs::tests` 覆盖空查询/反向时间/越界结果拒绝及中英文词项稳定性。
+
 ## 2026-07-30 S12-3 Obsidian 端到端校准
 
 **触达**:

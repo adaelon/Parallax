@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 9;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 10;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -600,6 +600,101 @@ BEGIN
 END;
 ";
 
+const MIGRATION_10: &str = r"
+CREATE TABLE retrieval_index_metadata (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    contract_version TEXT NOT NULL CHECK (length(trim(contract_version)) > 0),
+    authority_digest BLOB NOT NULL CHECK (length(authority_digest) = 32),
+    index_digest BLOB NOT NULL CHECK (length(index_digest) = 32),
+    built_at INTEGER NOT NULL,
+    evidence_block_count INTEGER NOT NULL CHECK (evidence_block_count >= 0),
+    ledger_claim_count INTEGER NOT NULL CHECK (ledger_claim_count >= 0),
+    relation_count INTEGER NOT NULL CHECK (relation_count >= 0)
+) STRICT;
+
+CREATE TABLE retrieval_evidence_availability (
+    evidence_id INTEGER PRIMARY KEY
+        REFERENCES archived_evidence(id) ON DELETE CASCADE,
+    state INTEGER NOT NULL CHECK (state = 1)
+) STRICT;
+
+CREATE TABLE retrieval_block_documents (
+    evidence_id INTEGER NOT NULL,
+    block_id INTEGER NOT NULL,
+    source_record_id INTEGER NOT NULL
+        REFERENCES source_records(id) ON DELETE CASCADE,
+    version_ordinal INTEGER NOT NULL CHECK (version_ordinal >= 0),
+    recorded_at INTEGER NOT NULL,
+    content_digest BLOB NOT NULL CHECK (length(content_digest) = 32),
+    PRIMARY KEY (evidence_id, block_id),
+    FOREIGN KEY (block_id, evidence_id)
+        REFERENCES evidence_blocks(id, evidence_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE retrieval_block_terms (
+    term TEXT NOT NULL CHECK (length(term) > 0),
+    evidence_id INTEGER NOT NULL,
+    block_id INTEGER NOT NULL,
+    PRIMARY KEY (term, evidence_id, block_id),
+    FOREIGN KEY (evidence_id, block_id)
+        REFERENCES retrieval_block_documents(evidence_id, block_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE retrieval_claim_documents (
+    claim_id INTEGER PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+    applicable_start INTEGER,
+    applicable_end INTEGER,
+    applicable_unknown INTEGER NOT NULL CHECK (applicable_unknown IN (0, 1)),
+    recorded_at INTEGER NOT NULL,
+    statement_digest BLOB NOT NULL CHECK (length(statement_digest) = 32),
+    CHECK (
+        (applicable_unknown = 1 AND applicable_start IS NULL AND applicable_end IS NULL)
+        OR
+        (applicable_unknown = 0 AND applicable_start IS NOT NULL
+         AND (applicable_end IS NULL OR applicable_end >= applicable_start))
+    )
+) STRICT;
+
+CREATE TABLE retrieval_claim_terms (
+    term TEXT NOT NULL CHECK (length(term) > 0),
+    claim_id INTEGER NOT NULL
+        REFERENCES retrieval_claim_documents(claim_id) ON DELETE CASCADE,
+    PRIMARY KEY (term, claim_id)
+) STRICT;
+
+CREATE TABLE retrieval_entity_terms (
+    term TEXT NOT NULL CHECK (length(term) > 0),
+    source_record_id INTEGER NOT NULL
+        REFERENCES source_records(id) ON DELETE CASCADE,
+    PRIMARY KEY (term, source_record_id)
+) STRICT;
+
+CREATE TABLE retrieval_relation_edges (
+    from_evidence_id INTEGER NOT NULL,
+    from_block_id INTEGER NOT NULL,
+    relation_ordinal INTEGER NOT NULL CHECK (relation_ordinal >= 0),
+    to_source_record_id INTEGER NOT NULL
+        REFERENCES source_records(id) ON DELETE CASCADE,
+    relation_kind INTEGER NOT NULL CHECK (relation_kind BETWEEN 0 AND 4),
+    PRIMARY KEY (from_evidence_id, relation_ordinal),
+    FOREIGN KEY (from_evidence_id, from_block_id)
+        REFERENCES retrieval_block_documents(evidence_id, block_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX retrieval_block_terms_lookup
+    ON retrieval_block_terms(term);
+CREATE INDEX retrieval_claim_terms_lookup
+    ON retrieval_claim_terms(term);
+CREATE INDEX retrieval_entity_terms_lookup
+    ON retrieval_entity_terms(term);
+CREATE INDEX retrieval_block_time_lookup
+    ON retrieval_block_documents(recorded_at);
+CREATE INDEX retrieval_claim_time_lookup
+    ON retrieval_claim_documents(applicable_start, applicable_end);
+CREATE INDEX retrieval_relation_target_lookup
+    ON retrieval_relation_edges(to_source_record_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -626,6 +721,7 @@ where
             7 => transaction.execute_batch(MIGRATION_7)?,
             8 => transaction.execute_batch(MIGRATION_8)?,
             9 => transaction.execute_batch(MIGRATION_9)?,
+            10 => transaction.execute_batch(MIGRATION_10)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1040,6 +1136,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(root_table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_retrieval_migration_keeps_obsidian_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 9).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 10 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(10))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'retrieval_index_metadata'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
 
         migrate(&mut connection).unwrap();
         let version: i64 = connection
