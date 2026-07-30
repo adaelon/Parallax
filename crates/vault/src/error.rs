@@ -9,6 +9,7 @@ pub enum VaultError {
     CipherUnavailable,
     EntropyUnavailable,
     ExistingVaultWithoutKeyMetadata,
+    ExtractionInterrupted,
     InvalidKeyOrCorrupt,
     KeyProtectionFailed,
     UnlockFailed,
@@ -36,6 +37,9 @@ impl fmt::Display for VaultError {
             }
             Self::ExistingVaultWithoutKeyMetadata => {
                 formatter.write_str("an existing encrypted vault has no key metadata")
+            }
+            Self::ExtractionInterrupted => {
+                formatter.write_str("extraction database commit was interrupted")
             }
             Self::InvalidKeyOrCorrupt => {
                 formatter.write_str("vault key is incorrect or encrypted data is corrupt")
@@ -79,6 +83,7 @@ impl Error for VaultError {
             | Self::CipherUnavailable
             | Self::EntropyUnavailable
             | Self::ExistingVaultWithoutKeyMetadata
+            | Self::ExtractionInterrupted
             | Self::InvalidKeyOrCorrupt
             | Self::KeyProtectionFailed
             | Self::UnlockFailed

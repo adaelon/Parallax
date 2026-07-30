@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 6;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 7;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -234,6 +234,68 @@ CREATE TABLE markdown_parse_artifacts (
 ) STRICT;
 ";
 
+const MIGRATION_7: &str = r"
+CREATE TABLE extraction_revisions (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    evidence_id INTEGER NOT NULL
+        REFERENCES archived_evidence(id) ON DELETE RESTRICT,
+    contract_version TEXT NOT NULL CHECK (length(trim(contract_version)) > 0),
+    canonical_digest BLOB NOT NULL CHECK (length(canonical_digest) = 32),
+    accepted_at INTEGER NOT NULL,
+    UNIQUE (evidence_id, contract_version),
+    UNIQUE (id, evidence_id),
+    FOREIGN KEY (evidence_id, contract_version)
+        REFERENCES markdown_parse_artifacts(archive_id, parser_version)
+        ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE evidence_blocks (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    evidence_id INTEGER NOT NULL,
+    extraction_revision_id INTEGER NOT NULL,
+    parent_id INTEGER,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    kind INTEGER NOT NULL CHECK (kind BETWEEN 0 AND 12),
+    start_byte INTEGER NOT NULL CHECK (start_byte >= 0),
+    end_byte INTEGER NOT NULL CHECK (end_byte >= start_byte),
+    locator_version TEXT,
+    locator_kind INTEGER CHECK (locator_kind IS NULL OR locator_kind IN (0, 1)),
+    locator_value TEXT,
+    heading_level INTEGER CHECK (heading_level IS NULL OR heading_level BETWEEN 1 AND 6),
+    list_start TEXT,
+    task_checked INTEGER CHECK (task_checked IS NULL OR task_checked IN (0, 1)),
+    info_string TEXT,
+    UNIQUE (extraction_revision_id, ordinal),
+    UNIQUE (id, extraction_revision_id),
+    FOREIGN KEY (extraction_revision_id, evidence_id)
+        REFERENCES extraction_revisions(id, evidence_id) ON DELETE RESTRICT,
+    FOREIGN KEY (parent_id, extraction_revision_id)
+        REFERENCES evidence_blocks(id, extraction_revision_id) ON DELETE RESTRICT,
+    CHECK (parent_id IS NULL OR parent_id != id),
+    CHECK (
+        (locator_version IS NULL AND locator_kind IS NULL AND locator_value IS NULL)
+        OR
+        (length(trim(locator_version)) > 0 AND locator_kind IS NOT NULL
+         AND length(locator_value) > 0)
+    )
+) STRICT;
+
+CREATE INDEX evidence_blocks_evidence_idx
+    ON evidence_blocks(evidence_id, id);
+
+CREATE TRIGGER extraction_revisions_immutable
+BEFORE UPDATE ON extraction_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'extraction revisions are immutable');
+END;
+
+CREATE TRIGGER evidence_blocks_immutable
+BEFORE UPDATE ON evidence_blocks
+BEGIN
+    SELECT RAISE(ABORT, 'evidence blocks are immutable');
+END;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -257,6 +319,7 @@ where
             4 => transaction.execute_batch(MIGRATION_4)?,
             5 => transaction.execute_batch(MIGRATION_5)?,
             6 => transaction.execute_batch(MIGRATION_6)?,
+            7 => transaction.execute_batch(MIGRATION_7)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -491,6 +554,47 @@ mod tests {
             .unwrap();
         assert_eq!(archive_table_count, 1);
         assert_eq!(attempt_table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_extraction_migration_keeps_markdown_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.execute_batch(MIGRATION_3).unwrap();
+        connection.execute_batch(MIGRATION_4).unwrap();
+        connection.execute_batch(MIGRATION_5).unwrap();
+        connection.execute_batch(MIGRATION_6).unwrap();
+        connection.pragma_update(None, "user_version", 6).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 7 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(7))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let revision_table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'extraction_revisions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_table_count, 0);
 
         migrate(&mut connection).unwrap();
         let version: i64 = connection

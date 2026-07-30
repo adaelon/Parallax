@@ -8,9 +8,11 @@ use std::{
 };
 
 use crate::{
-    ArchiveInput, ArchiveRepository, ArchiveStatus, CandidateKind, FileObservation, ImportOutcome,
-    ImportPolicy, IntakeDecision, MarkdownArchiveRepository, MarkdownParseStart,
-    MarkdownParseState, UnparsedReason, evaluate_observations,
+    ArchiveInput, ArchiveRepository, ArchiveStatus, CandidateKind, EvidenceBlockQueryRepository,
+    EvidenceBlockRef, EvidenceBlockView, EvidenceError, EvidenceExtractionRepository,
+    FileObservation, ImportOutcome, ImportPolicy, IntakeDecision, MarkdownArchiveRepository,
+    MarkdownParseStart, MarkdownParseState, MaterializedExtraction, UnparsedReason,
+    evaluate_observations, validate_accepted_markdown,
 };
 use eam_markdown::{
     CONTRACT_VERSION, MarkdownParseError, ParseLimits, ParsedMarkdownV1, parse_markdown,
@@ -43,6 +45,54 @@ impl<E: Error + 'static> Error for ImportError<E> {
 #[derive(Debug)]
 pub enum MarkdownProcessError<E> {
     Repository(E),
+}
+
+#[derive(Debug)]
+pub enum ExtractionProcessError<E> {
+    Repository(E),
+    Evidence(EvidenceError),
+}
+
+impl<E: fmt::Display> fmt::Display for ExtractionProcessError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Repository(error) => write!(formatter, "extraction persistence failed: {error}"),
+            Self::Evidence(error) => write!(formatter, "accepted Markdown is invalid: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ExtractionProcessError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Repository(error) => Some(error),
+            Self::Evidence(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum EvidenceQueryError<E> {
+    Repository(E),
+    Evidence(EvidenceError),
+}
+
+impl<E: fmt::Display> fmt::Display for EvidenceQueryError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Repository(error) => write!(formatter, "evidence query failed: {error}"),
+            Self::Evidence(error) => write!(formatter, "evidence reference is invalid: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for EvidenceQueryError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Repository(error) => Some(error),
+            Self::Evidence(error) => Some(error),
+        }
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for MarkdownProcessError<E> {
@@ -206,6 +256,62 @@ pub fn process_archived_markdown<R: MarkdownArchiveRepository>(
         }
     };
     accept_markdown(repository, archive_id, &parsed, finished_at_millis)
+}
+
+/// Converts one accepted S09 artifact into an immutable S10 extraction.
+///
+/// The authenticated archived Markdown remains the only canonical text. The
+/// validated revision and all Core-owned blocks are committed atomically.
+///
+/// # Errors
+///
+/// Returns a repository error when the accepted input cannot be loaded or the
+/// transaction fails, and an evidence error when the accepted input violates
+/// the S10 contract.
+pub fn materialize_accepted_markdown<R: EvidenceExtractionRepository>(
+    repository: &mut R,
+    evidence_id: u64,
+    contract_version: &str,
+) -> Result<MaterializedExtraction, ExtractionProcessError<R::Error>> {
+    let accepted = repository
+        .load_accepted_markdown(evidence_id, contract_version)
+        .map_err(ExtractionProcessError::Repository)?;
+    let canonical_text = std::str::from_utf8(accepted.canonical_bytes())
+        .map_err(|_| ExtractionProcessError::Evidence(EvidenceError::InvalidCanonicalEncoding))?;
+    let extraction = validate_accepted_markdown(
+        accepted.evidence_id(),
+        canonical_text,
+        accepted.parsed(),
+        accepted.accepted_at_millis(),
+    )
+    .map_err(ExtractionProcessError::Evidence)?;
+    repository
+        .commit_extraction(&extraction)
+        .map_err(ExtractionProcessError::Repository)
+}
+
+/// Opens one permanent block reference as an exact quote plus ephemeral UI range.
+///
+/// # Errors
+///
+/// Returns a repository error for encrypted storage failures, `BlockNotFound`
+/// for an unknown immutable reference, or an evidence error for a corrupt
+/// canonical encoding/range.
+pub fn open_evidence_block<R: EvidenceBlockQueryRepository>(
+    repository: &R,
+    reference: EvidenceBlockRef,
+) -> Result<EvidenceBlockView, EvidenceQueryError<R::Error>> {
+    let source = repository
+        .load_canonical_evidence_block(reference)
+        .map_err(EvidenceQueryError::Repository)?
+        .ok_or(EvidenceQueryError::Evidence(EvidenceError::BlockNotFound))?;
+    if source.block().reference() != reference {
+        return Err(EvidenceQueryError::Evidence(EvidenceError::BlockNotFound));
+    }
+    let canonical_text = std::str::from_utf8(source.canonical_bytes())
+        .map_err(|_| EvidenceQueryError::Evidence(EvidenceError::InvalidCanonicalEncoding))?;
+    EvidenceBlockView::new(source.block().clone(), canonical_text)
+        .map_err(EvidenceQueryError::Evidence)
 }
 
 fn accept_markdown<R: MarkdownArchiveRepository>(

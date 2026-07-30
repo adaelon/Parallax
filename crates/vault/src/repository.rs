@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
 };
@@ -18,13 +18,18 @@ use eam_identity::{
     SelfIntroductionCategory, WakeCommit, WakeExit, WakeTrigger,
 };
 use eam_ingestion::{
-    ArchiveInput, ArchiveReceipt, ArchiveRepository, ArchiveStatus, ArchivedEvidence,
-    MarkdownArchiveRepository, MarkdownParseAttempt, MarkdownParseStart, MarkdownParseState,
-    UnparsedReason,
+    AcceptedMarkdownSource, ArchiveInput, ArchiveReceipt, ArchiveRepository, ArchiveStatus,
+    ArchivedEvidence, CanonicalEvidenceBlockSource, EvidenceBlock, EvidenceBlockDraft,
+    EvidenceBlockId, EvidenceBlockMetadata, EvidenceBlockQueryRepository, EvidenceBlockRef,
+    EvidenceExtractionRepository, ExtractionRevision, ExtractionRevisionId,
+    MARKDOWN_LOCATOR_VERSION, MarkdownArchiveRepository, MarkdownLocator, MarkdownLocatorValue,
+    MarkdownParseAttempt, MarkdownParseStart, MarkdownParseState, MaterializedExtraction,
+    SourceAnchor, UnparsedReason, ValidatedExtraction,
 };
-use eam_markdown::{ParseResource, ParsedMarkdownV1};
+use eam_markdown::{MarkdownBlockKind, ParseResource, ParsedMarkdownV1};
 use fs4::{FileExt, TryLockError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 use crate::{
     VaultError, VaultKey, crypto::sqlcipher_key_pragma, object_store::ObjectStore, schema::migrate,
@@ -237,6 +242,63 @@ impl VaultRepository {
         serde_json::from_str(&encoded).map_err(|_| VaultError::InvalidKeyOrCorrupt)
     }
 
+    /// Restores one complete immutable S10 extraction and its ordered blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encrypted rows, identifiers, source anchors, or
+    /// the canonical archived Markdown are missing or corrupt.
+    pub fn materialized_extraction(
+        &self,
+        evidence_id: u64,
+        contract_version: &str,
+    ) -> Result<Option<MaterializedExtraction>, VaultError> {
+        let stored = self
+            .connection()
+            .query_row(
+                "SELECT id, canonical_digest, accepted_at
+                 FROM extraction_revisions
+                 WHERE evidence_id = ?1 AND contract_version = ?2",
+                params![to_vault_sql_id(evidence_id)?, contract_version],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((revision_id, canonical_digest, accepted_at_millis)) = stored else {
+            return Ok(None);
+        };
+        let canonical_digest: [u8; 32] = canonical_digest
+            .try_into()
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let revision = ExtractionRevision::new(
+            ExtractionRevisionId::new(
+                u64::try_from(revision_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            )
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            evidence_id,
+            contract_version.to_owned(),
+            canonical_digest,
+            accepted_at_millis,
+        )
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let canonical_bytes = self.read_archived_content(evidence_id)?;
+        let actual_digest: [u8; 32] = Sha256::digest(&canonical_bytes).into();
+        if actual_digest != *revision.canonical_digest() {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let canonical_text =
+            std::str::from_utf8(&canonical_bytes).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let blocks = load_evidence_blocks(self.connection(), &revision, canonical_text)?;
+        MaterializedExtraction::new(revision, blocks, true)
+            .map(Some)
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+    }
+
     /// Checkpoints encrypted WAL state, closes `SQLCipher`, clears the owned
     /// Vault Key, and releases the writer lock.
     ///
@@ -326,6 +388,98 @@ impl VaultRepository {
             object_reused: stored.reused,
             source_version_reused: false,
         })
+    }
+
+    fn commit_extraction_with_hook<F>(
+        &mut self,
+        extraction: &ValidatedExtraction,
+        before_commit: F,
+    ) -> Result<MaterializedExtraction, VaultError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), VaultError>,
+    {
+        if let Some(existing) =
+            self.materialized_extraction(extraction.evidence_id(), extraction.contract_version())?
+        {
+            if materialized_matches(&existing, extraction) {
+                return Ok(existing);
+            }
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+
+        let evidence_id_sql = to_vault_sql_id(extraction.evidence_id())?;
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        let artifact_accepted_at = transaction
+            .query_row(
+                "SELECT a.accepted_at
+                 FROM markdown_parse_artifacts a
+                 JOIN markdown_parse_attempts p
+                   ON p.archive_id = a.archive_id
+                  AND p.parser_version = a.parser_version
+                 WHERE a.archive_id = ?1 AND a.parser_version = ?2 AND p.state = 1",
+                params![evidence_id_sql, extraction.contract_version()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        if artifact_accepted_at != extraction.accepted_at_millis() {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+
+        let revision_id =
+            ExtractionRevisionId::new(next_identifier(&transaction, "extraction_revisions")?)
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let revision = ExtractionRevision::new(
+            revision_id,
+            extraction.evidence_id(),
+            extraction.contract_version().to_owned(),
+            *extraction.canonical_digest(),
+            extraction.accepted_at_millis(),
+        )
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        transaction.execute(
+            "INSERT INTO extraction_revisions
+             (id, evidence_id, contract_version, canonical_digest, accepted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_vault_sql_id(revision.id().get())?,
+                evidence_id_sql,
+                revision.contract_version(),
+                revision.canonical_digest().as_slice(),
+                revision.accepted_at_millis(),
+            ],
+        )?;
+
+        let first_block_id = next_identifier(&transaction, "evidence_blocks")?;
+        let mut assigned = HashMap::<u64, EvidenceBlockId>::new();
+        let mut blocks = Vec::with_capacity(extraction.blocks().len());
+        for (offset, draft) in extraction.blocks().iter().enumerate() {
+            let block_id_raw = first_block_id
+                .checked_add(u64::try_from(offset).map_err(|_| VaultError::InvalidKeyOrCorrupt)?)
+                .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+            let block_id =
+                EvidenceBlockId::new(block_id_raw).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+            let parent_id = draft
+                .parent_local_id()
+                .map(|local_id| {
+                    assigned
+                        .get(&local_id)
+                        .copied()
+                        .ok_or(VaultError::InvalidKeyOrCorrupt)
+                })
+                .transpose()?;
+            let block = insert_evidence_block(&transaction, &revision, block_id, parent_id, draft)?;
+            assigned.insert(draft.local_id(), block_id);
+            blocks.push(block);
+        }
+        before_commit(&transaction)?;
+        transaction.commit()?;
+        MaterializedExtraction::new(revision, blocks, false)
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)
     }
 
     fn close_inner(&mut self) -> Result<(), VaultError> {
@@ -513,6 +667,86 @@ impl MarkdownArchiveRepository for VaultRepository {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+}
+
+impl EvidenceExtractionRepository for VaultRepository {
+    type Error = VaultError;
+
+    fn load_accepted_markdown(
+        &self,
+        evidence_id: u64,
+        contract_version: &str,
+    ) -> Result<AcceptedMarkdownSource, Self::Error> {
+        let (encoded, accepted_at_millis) = self
+            .connection()
+            .query_row(
+                "SELECT a.parsed_json, a.accepted_at
+                 FROM markdown_parse_artifacts a
+                 JOIN markdown_parse_attempts p
+                   ON p.archive_id = a.archive_id
+                  AND p.parser_version = a.parser_version
+                 WHERE a.archive_id = ?1 AND a.parser_version = ?2 AND p.state = 1",
+                params![to_vault_sql_id(evidence_id)?, contract_version],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        let parsed = serde_json::from_str(&encoded).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        AcceptedMarkdownSource::new(
+            evidence_id,
+            self.read_archived_content(evidence_id)?,
+            parsed,
+            accepted_at_millis,
+        )
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+    }
+
+    fn commit_extraction(
+        &mut self,
+        extraction: &ValidatedExtraction,
+    ) -> Result<MaterializedExtraction, Self::Error> {
+        self.commit_extraction_with_hook(extraction, |_| Ok(()))
+    }
+}
+
+impl EvidenceBlockQueryRepository for VaultRepository {
+    type Error = VaultError;
+
+    fn load_canonical_evidence_block(
+        &self,
+        reference: EvidenceBlockRef,
+    ) -> Result<Option<CanonicalEvidenceBlockSource>, Self::Error> {
+        let contract_version = self
+            .connection()
+            .query_row(
+                "SELECT r.contract_version
+                 FROM evidence_blocks b
+                 JOIN extraction_revisions r ON r.id = b.extraction_revision_id
+                 WHERE b.id = ?1 AND b.evidence_id = ?2",
+                params![
+                    to_vault_sql_id(reference.block_id().get())?,
+                    to_vault_sql_id(reference.evidence_id())?,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(contract_version) = contract_version else {
+            return Ok(None);
+        };
+        let materialized = self
+            .materialized_extraction(reference.evidence_id(), &contract_version)?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        let block = materialized
+            .blocks()
+            .iter()
+            .find(|block| block.id() == reference.block_id())
+            .cloned()
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        Ok(Some(CanonicalEvidenceBlockSource::new(
+            block,
+            self.read_archived_content(reference.evidence_id())?,
+        )))
     }
 }
 
@@ -1478,6 +1712,275 @@ const fn decode_markdown_parse_state(value: i64) -> Result<MarkdownParseState, V
     }
 }
 
+fn materialized_matches(
+    materialized: &MaterializedExtraction,
+    extraction: &ValidatedExtraction,
+) -> bool {
+    let revision = materialized.revision();
+    if revision.evidence_id() != extraction.evidence_id()
+        || revision.contract_version() != extraction.contract_version()
+        || revision.canonical_digest() != extraction.canonical_digest()
+        || revision.accepted_at_millis() != extraction.accepted_at_millis()
+        || materialized.blocks().len() != extraction.blocks().len()
+    {
+        return false;
+    }
+    let assigned = extraction
+        .blocks()
+        .iter()
+        .zip(materialized.blocks())
+        .map(|(draft, block)| (draft.local_id(), block.id()))
+        .collect::<HashMap<_, _>>();
+    extraction
+        .blocks()
+        .iter()
+        .zip(materialized.blocks())
+        .all(|(draft, block)| {
+            let expected_parent = draft
+                .parent_local_id()
+                .and_then(|local_id| assigned.get(&local_id).copied());
+            block.parent_id() == expected_parent
+                && block.ordinal() == draft.ordinal()
+                && block.kind() == draft.kind()
+                && block.anchor() == draft.anchor()
+                && block.metadata() == draft.metadata()
+        })
+}
+
+fn insert_evidence_block(
+    transaction: &rusqlite::Transaction<'_>,
+    revision: &ExtractionRevision,
+    block_id: EvidenceBlockId,
+    parent_id: Option<EvidenceBlockId>,
+    draft: &EvidenceBlockDraft,
+) -> Result<EvidenceBlock, VaultError> {
+    let (locator_version, locator_kind, locator_value) =
+        encode_markdown_locator(draft.anchor().native_locator());
+    let metadata = draft.metadata();
+    transaction.execute(
+        "INSERT INTO evidence_blocks
+         (id, evidence_id, extraction_revision_id, parent_id, ordinal, kind,
+          start_byte, end_byte, locator_version, locator_kind, locator_value,
+          heading_level, list_start, task_checked, info_string)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                 ?12, ?13, ?14, ?15)",
+        params![
+            to_vault_sql_id(block_id.get())?,
+            to_vault_sql_id(revision.evidence_id())?,
+            to_vault_sql_id(revision.id().get())?,
+            parent_id.map(|id| to_vault_sql_id(id.get())).transpose()?,
+            i64::try_from(draft.ordinal()).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            encode_markdown_block_kind(draft.kind()),
+            i64::try_from(draft.anchor().start_byte())
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            i64::try_from(draft.anchor().end_byte())
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            locator_version,
+            locator_kind,
+            locator_value,
+            metadata.heading_level().map(i64::from),
+            metadata.list_start().map(|value| value.to_string()),
+            metadata.task_checked().map(i64::from),
+            metadata.info_string(),
+        ],
+    )?;
+    EvidenceBlock::new(
+        block_id,
+        revision.evidence_id(),
+        revision.id(),
+        parent_id,
+        draft.ordinal(),
+        draft.kind(),
+        draft.anchor().clone(),
+        draft.metadata().clone(),
+    )
+    .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+}
+
+fn encode_markdown_locator(
+    locator: Option<&MarkdownLocator>,
+) -> (Option<&str>, Option<i64>, Option<&str>) {
+    match locator {
+        None => (None, None, None),
+        Some(locator) => match locator.value() {
+            MarkdownLocatorValue::Heading { text } => {
+                (Some(locator.version()), Some(0), Some(text))
+            }
+            MarkdownLocatorValue::BlockId { id } => (Some(locator.version()), Some(1), Some(id)),
+        },
+    }
+}
+
+fn decode_markdown_locator(
+    version: Option<String>,
+    kind: Option<i64>,
+    value: Option<String>,
+) -> Result<Option<MarkdownLocator>, VaultError> {
+    match (version, kind, value) {
+        (None, None, None) => Ok(None),
+        (Some(version), Some(kind), Some(value)) => {
+            if version != MARKDOWN_LOCATOR_VERSION {
+                return Err(VaultError::InvalidKeyOrCorrupt);
+            }
+            let value = match kind {
+                0 => MarkdownLocatorValue::Heading { text: value },
+                1 => MarkdownLocatorValue::BlockId { id: value },
+                _ => return Err(VaultError::InvalidKeyOrCorrupt),
+            };
+            MarkdownLocator::new(version, value)
+                .map(Some)
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+        }
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+const fn encode_markdown_block_kind(kind: MarkdownBlockKind) -> i64 {
+    match kind {
+        MarkdownBlockKind::Paragraph => 0,
+        MarkdownBlockKind::Heading => 1,
+        MarkdownBlockKind::BlockQuote => 2,
+        MarkdownBlockKind::List => 3,
+        MarkdownBlockKind::ListItem => 4,
+        MarkdownBlockKind::CodeBlock => 5,
+        MarkdownBlockKind::Table => 6,
+        MarkdownBlockKind::TableHead => 7,
+        MarkdownBlockKind::TableRow => 8,
+        MarkdownBlockKind::TableCell => 9,
+        MarkdownBlockKind::HtmlBlock => 10,
+        MarkdownBlockKind::ThematicBreak => 11,
+        MarkdownBlockKind::MetadataBlock => 12,
+    }
+}
+
+const fn decode_markdown_block_kind(value: i64) -> Result<MarkdownBlockKind, VaultError> {
+    match value {
+        0 => Ok(MarkdownBlockKind::Paragraph),
+        1 => Ok(MarkdownBlockKind::Heading),
+        2 => Ok(MarkdownBlockKind::BlockQuote),
+        3 => Ok(MarkdownBlockKind::List),
+        4 => Ok(MarkdownBlockKind::ListItem),
+        5 => Ok(MarkdownBlockKind::CodeBlock),
+        6 => Ok(MarkdownBlockKind::Table),
+        7 => Ok(MarkdownBlockKind::TableHead),
+        8 => Ok(MarkdownBlockKind::TableRow),
+        9 => Ok(MarkdownBlockKind::TableCell),
+        10 => Ok(MarkdownBlockKind::HtmlBlock),
+        11 => Ok(MarkdownBlockKind::ThematicBreak),
+        12 => Ok(MarkdownBlockKind::MetadataBlock),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+const LOAD_EVIDENCE_BLOCKS_QUERY: &str =
+    "SELECT id, evidence_id, parent_id, ordinal, kind, start_byte, end_byte,
+            locator_version, locator_kind, locator_value, heading_level,
+            list_start, task_checked, info_string
+     FROM evidence_blocks
+     WHERE extraction_revision_id = ?1
+     ORDER BY ordinal";
+
+fn load_evidence_blocks(
+    connection: &Connection,
+    revision: &ExtractionRevision,
+    canonical_text: &str,
+) -> Result<Vec<EvidenceBlock>, VaultError> {
+    let mut statement = connection.prepare(LOAD_EVIDENCE_BLOCKS_QUERY)?;
+    let rows = statement
+        .query_map([to_vault_sql_id(revision.id().get())?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                id,
+                evidence_id,
+                parent_id,
+                ordinal,
+                kind,
+                start_byte,
+                end_byte,
+                locator_version,
+                locator_kind,
+                locator_value,
+                heading_level,
+                list_start,
+                task_checked,
+                info_string,
+            )| {
+                let stored_evidence_id =
+                    u64::try_from(evidence_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+                if stored_evidence_id != revision.evidence_id() {
+                    return Err(VaultError::InvalidKeyOrCorrupt);
+                }
+                let locator =
+                    decode_markdown_locator(locator_version, locator_kind, locator_value)?;
+                let anchor = SourceAnchor::new(
+                    canonical_text,
+                    usize::try_from(start_byte).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    usize::try_from(end_byte).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    locator,
+                )
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+                let metadata = EvidenceBlockMetadata::new(
+                    heading_level
+                        .map(u8::try_from)
+                        .transpose()
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    list_start
+                        .map(|value| value.parse::<u64>())
+                        .transpose()
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    task_checked
+                        .map(|value| match value {
+                            0 => Ok(false),
+                            1 => Ok(true),
+                            _ => Err(VaultError::InvalidKeyOrCorrupt),
+                        })
+                        .transpose()?,
+                    info_string,
+                );
+                EvidenceBlock::new(
+                    EvidenceBlockId::new(
+                        u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    )
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    stored_evidence_id,
+                    revision.id(),
+                    parent_id
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?
+                        .map(EvidenceBlockId::new)
+                        .transpose()
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    usize::try_from(ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    decode_markdown_block_kind(kind)?,
+                    anchor,
+                    metadata,
+                )
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+            },
+        )
+        .collect()
+}
+
 fn next_identifier(connection: &Connection, table: &str) -> Result<u64, VaultError> {
     let query = format!("SELECT COALESCE(MAX(id), 0) FROM {table}");
     let maximum: i64 = connection.query_row(&query, [], |row| row.get(0))?;
@@ -2012,5 +2515,60 @@ mod tests {
             VaultRepository::open(directory.path(), VaultKey::new([0x29; 32])).unwrap();
         assert!(repository.archived_evidence().unwrap().is_empty());
         assert_eq!(repository.object_store.object_file_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn extraction_failure_rolls_back_revision_and_every_block_across_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let key = [0x6b; 32];
+        let source = "# 原子提交 😀\n\n正文 e\u{301} 日本語\n";
+        let mut repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        let receipt = repository
+            .archive(ArchiveInput {
+                source_locator: "inbox/atomic.md",
+                content: source.as_bytes(),
+                status: ArchiveStatus::Archived,
+                archived_at_millis: 10,
+            })
+            .unwrap();
+        eam_ingestion::process_archived_markdown(
+            &mut repository,
+            receipt.archive_id,
+            eam_markdown::ParseLimits::default(),
+            20,
+            30,
+        )
+        .unwrap();
+        let accepted = repository
+            .load_accepted_markdown(receipt.archive_id, eam_markdown::CONTRACT_VERSION)
+            .unwrap();
+        let validated = eam_ingestion::validate_accepted_markdown(
+            receipt.archive_id,
+            std::str::from_utf8(accepted.canonical_bytes()).unwrap(),
+            accepted.parsed(),
+            accepted.accepted_at_millis(),
+        )
+        .unwrap();
+
+        let result = repository
+            .commit_extraction_with_hook(&validated, |_| Err(VaultError::ExtractionInterrupted));
+
+        assert!(matches!(result, Err(VaultError::ExtractionInterrupted)));
+        assert!(
+            repository
+                .materialized_extraction(receipt.archive_id, eam_markdown::CONTRACT_VERSION)
+                .unwrap()
+                .is_none()
+        );
+        repository.close().unwrap();
+
+        let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        assert!(
+            repository
+                .materialized_extraction(receipt.archive_id, eam_markdown::CONTRACT_VERSION)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -1,5 +1,38 @@
 # 代码链路
 
+## 2026-07-30 S10-3 不可变引用读取与原生导航降级
+
+**触达**:
+- `crates/ingestion/src/evidence.rs:EvidenceBlockView` — 将一个永久块引用投影为逐字正文、已验证 UTF-8 锚点和临时 UTF-16 UI 范围。
+- `crates/ingestion/src/service.rs:open_evidence_block` — 只按 `evidence_id + block_id` 打开精确版本，错误组合稳定拒绝。
+- `crates/vault/src/repository.rs:EvidenceBlockQueryRepository` — 从 SQLCipher 恢复块所属契约并认证读取同一归档 Markdown，校验规范摘要后返回。
+- `crates/vault/tests/evidence_persistence.rs:extraction_revision_blocks_and_refs_are_stable_across_sqlcipher_reopen` — 覆盖跨重启引用读取、UTF-16 投影、错误引用和定位器失效降级。
+
+**入口**：可信 API 调用 `open_evidence_block(repository, EvidenceBlockRef)`；原生跳转另行调用 `EvidenceBlockView::native_navigation`，不参与规范引用判定。
+**测试**：`cargo test -p ingestion -p vault --no-fail-fast` 全绿；中日韩、组合字符与 emoji 的逐字范围和 UTF-16 坐标均由确定性断言覆盖。
+
+## 2026-07-30 S10-2 提取修订与证据块原子持久化
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_7` — 新增绑定 S09 接受产物的不可变提取修订和有序证据块表、复合外键与唯一约束。
+- `crates/vault/src/repository.rs:EvidenceExtractionRepository` — 认证读取同一归档 Markdown 与加密解析产物，再分配 Core-owned 修订/块 ID 并原子提交。
+- `crates/vault/src/repository.rs:VaultRepository::materialized_extraction` — 从 SQLCipher 恢复同一修订、父子结构、锚点、定位器与块引用。
+- `crates/vault/tests/evidence_persistence.rs:extraction_revision_blocks_and_refs_are_stable_across_sqlcipher_reopen` — 覆盖幂等物化、逐字块范围和跨重启 ID/引用稳定性。
+
+**入口**：可信 Core 调用 `materialize_accepted_markdown(repository, evidence_id, eam-markdown-v1)`，只消费状态为 `ACCEPTED` 的 S09 产物。
+**测试**：`cargo test -p vault --no-fail-fast` 全绿；repository 故障注入验证提交前失败不留下修订或任一证据块，schema v7 中断回滚保持 v6 可重开。
+
+## 2026-07-30 S10-1 权威证据值与坐标投影
+
+**触达**:
+- `crates/ingestion/src/evidence.rs:validate_accepted_markdown` — 把已接受 S09 产物校验为 Core-owned 修订草稿，拒绝非法 UTF-8 范围、顺序和父子关系。
+- `crates/ingestion/src/evidence.rs:SourceAnchor::quote` — 只按规范 Markdown 的 UTF-8 半开字节范围逐字取证。
+- `crates/ingestion/src/evidence.rs:project_utf8_span_to_utf16` — 在 API 边界从唯一 UTF-8 坐标确定性派生 UTF-16 UI 范围。
+- `crates/ingestion/src/evidence.rs:resolve_native_navigation` — 原生定位不可用时稳定返回 `NATIVE_NAVIGATION_UNAVAILABLE`，不影响规范引用。
+
+**入口**：可信 Core 从 S09 `ParsedMarkdownV1` 与同一归档 UTF-8 Markdown 调用 `validate_accepted_markdown`；UI 投影只消费已验证 `SourceAnchor`。
+**测试**：`crates/ingestion/src/evidence.rs::tests` 覆盖中日韩、组合字符、emoji、非法字符边界、逐字引用和原生定位降级；`cargo test -p ingestion --no-fail-fast` 12/12 通过。
+
 ## 2026-07-30 S09-3 加密解析尝试与归档重处理
 
 **触达**:

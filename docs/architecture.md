@@ -186,9 +186,13 @@ accept_markdown(evidence_id, source_utf8, limits)
   -> parsed := parse_markdown(source_utf8, limits)
   -> validate_structure_and_source_boundaries(parsed)
   -> validate_markdown_locator_shape(parsed.blocks)
+  -> commit(MarkdownParseArtifact + MarkdownParseAttempt(ACCEPTED))
+
+materialize_accepted_markdown(evidence_id, parser_version)
+  -> authenticated_load(archived_markdown + accepted_parse_artifact)
   -> canonical_digest := digest(source_utf8)
   -> assign_core_owned_block_ids(extraction_revision, parsed.blocks)
-  -> commit(ExtractionRevision + EvidenceBlock[] + MarkdownParseAttempt(ACCEPTED))
+  -> commit(ExtractionRevision + EvidenceBlock[])
 ```
 
 原始加密 Markdown 文件仍是原始证据；`canonical_text_utf8` 与该提取修订通过校验的 Markdown 原文逐字相同，不是解析器生成的第二份正文。检索和模型可以直接使用选中的 Markdown 原文片段；索引所需投影必须可由原文与结构元数据重建。同一已接受提取修订中的块 ID 保持稳定。来源内容或解析契约变化产生新的提取修订；旧引用继续绑定旧修订或显式进入待迁移状态，不得由解析器、索引器或模型静默重绑。
@@ -248,6 +252,8 @@ S05 将 `self.db` schema 升至 v3：`self_bundle_versions` 追加完整不可�
 S07 将 `self.db` schema 升至 v4，保存宿主会话、心跳和运行空缺。S08 升至 v5：`archived_evidence` 只保存加密边界内的来源定位器、对象映射、长度、归档状态和原因；相同内容可被不同来源记录复用，同一来源同一对象幂等。
 
 S09 将 `self.db` schema 升至 v6：`markdown_parse_attempts` 以归档版本和解析器版本为联合主键保存 `STARTED/ACCEPTED/REJECTED/INTERRUPTED`，`markdown_parse_artifacts` 保存已接受的 `eam-markdown-v1` 加密 JSON 产物。解析接受、拒绝与归档状态更新各自在一个 SQLCipher 事务内完成；启动恢复先把遗留 `STARTED` 转为 `INTERRUPTED/PARSER_INTERRUPTED`。本片不创建 S10 的提取修订、权威证据块或索引。
+
+S10 将 `self.db` schema 升至 v7：`extraction_revisions` 通过复合外键绑定一个 S09 已接受产物及其规范摘要，`evidence_blocks` 保存 Core-owned 块 ID、父子顺序、唯一 UTF-8 范围、结构元数据和可选 `eam-markdown-locator-v1`。修订与全部块在一个 SQLCipher 事务内提交并由数据库拒绝原地更新；重复物化只恢复同一修订和块引用，不生成新身份。正文不重复持久化，读取引用时认证解密同一归档 Markdown、复核摘要并临时投影 UTF-16 UI 范围。
 
 ### 4.2 逻辑数据模型
 
@@ -492,9 +498,11 @@ Obsidian 文件事件 | 启动和定期校准扫描
        ARCHIVED_UNPARSED(reason)；STOP
   -> Obsidian Markdown：提取 Properties、标签、别名、标题、块标识、
        内部链接与嵌入，并解析库内关系
-  -> Core 分配绑定提取修订的证据块 ID
-  -> 在 SQL 事务中写入提取修订、有序证据块、
+  -> 在 SQL 事务中写入加密解析产物、
        MarkdownParseAttempt(ACCEPTED)；Evidence(status=EXTRACTED)
+  -> 认证读取同一归档 Markdown 与已接受解析产物，复核契约、范围和摘要
+  -> Core 分配绑定提取修订的证据块 ID
+  -> 在 SQL 事务中写入提取修订与全部有序证据块
   -> 与同一 SourceRecord 的前一已接受版本计算块谱系
   -> 在 SQL 事务中写入块谱系并更新受影响索引
   -> Evidence(status=INDEXED)
@@ -1231,3 +1239,34 @@ VaultRepository::open
 ```
 
 S09 只产生解析器本地 `local_id`、来源字节范围、Properties、结构块、关系、标签和可选原生定位器；具体依赖、语法消歧和固定语料由 [G05 `eam-markdown-v1` 契约](markdown-contract-v1.md) 冻结。它不分配权威证据块 ID，不建立规范提取修订、块谱系、全文/向量索引或检索可用状态。桌面宿主没有新增解析 command 或 UI；S10 从已接受的加密解析产物继续建立权威证据块与逐字引用。
+
+### 9.10 S10 稳定证据块与规范引用当前实现边界
+
+```text
+crates/ingestion/src/
+  evidence.rs          # 修订/块/锚点/不可变引用、逐字验证与 UTF-16 投影
+  service.rs           # 已接受产物物化与永久引用打开入口
+crates/vault/src/
+  schema.rs            # schema v7 不可更新修订和有序证据块
+  repository.rs        # Core-owned ID、原子物化、摘要复核与引用查询
+crates/vault/tests/
+  evidence_persistence.rs  # 多语言、幂等、跨重启引用与导航降级
+```
+
+```text
+materialize_accepted_markdown(evidence_id, eam-markdown-v1)
+  -> 认证读取 S08 原件与 S09 ACCEPTED 产物
+  -> 校验 UTF-8 边界、全局 ordinal、本地父子关系和规范摘要
+  -> 丢弃结构非法的可选原生定位器，不改变规范范围
+  -> 原子写入 ExtractionRevision + EvidenceBlock[]
+  -> 重复调用恢复同一修订、块 ID 与 EvidenceBlockRef
+
+open_evidence_block(EvidenceBlockRef)
+  -> 按 evidence_id + block_id 读取精确历史块
+  -> 认证读取同一归档 Markdown并复核 canonical_digest
+  -> SourceAnchor UTF-8 范围逐字取文
+  -> 临时投影 UTF-16 UI 范围
+  -> 原生定位失效：NATIVE_NAVIGATION_UNAVAILABLE；引用仍有效
+```
+
+S10 不持久化第二套 UTF-16 坐标或块正文，不实现固定 token 切片、块谱系、检索索引、`AVAILABLE` 推进、Obsidian 文件跳转或 WebView command。跨修订 `UNCHANGED/MOVED/MODIFIED/REMOVED/AMBIGUOUS` 映射仍属于 S11。

@@ -2048,6 +2048,7 @@ name = "ingestion"
 version = "0.1.0"
 dependencies = [
  "eam-markdown",
+ "sha2 0.11.0",
  "tempfile",
 ]
 
