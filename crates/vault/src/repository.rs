@@ -5,8 +5,9 @@ use std::{
 };
 
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, EvidenceCitation, EvidenceId,
-    MemoryRepository, RepositoryError, SessionId, Speaker, Timestamp, Uncertainty,
+    ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, DisputeState,
+    EvidenceCitation, EvidenceId, MemoryRepository, RepositoryError, SessionId, Speaker, Timestamp,
+    Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -30,14 +31,18 @@ use eam_ingestion::{
 };
 use eam_markdown::{MarkdownBlockKind, MarkdownRelationKind, ParseResource, ParsedMarkdownV1};
 use eam_memory::{
-    LongTermMemoryRepository, MAX_MEMORY_SOURCES, MemoryBasis, MemoryConfidence, MemoryId,
-    MemoryKind, MemoryStatus, MemorySubject, MemoryTarget, MemoryVersion, ValidatedMemoryProposal,
+    LongTermMemoryRepository, MAX_DISPUTE_EVIDENCE, MAX_MEMORY_SOURCES, MemoryBasis,
+    MemoryConfidence, MemoryDispute, MemoryDisputeId, MemoryDisputeOutcome,
+    MemoryDisputeResolution, MemoryDisputeReviewRecord, MemoryId, MemoryKind, MemoryStatus,
+    MemorySubject, MemoryTarget, MemoryVersion, ValidatedMemoryDispute,
+    ValidatedMemoryDisputeReview, ValidatedMemoryProposal,
 };
 use eam_retrieval::{
-    AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, EMBEDDING_MODEL_VERSION,
-    IndexBuildReceipt, IndexDisposition, RETRIEVAL_INDEX_VERSION, RecallChannels, RecallHit,
-    RetrievalQuery, RetrievalRepository, SourceCurrentness, SourceScope, VECTOR_DIMENSIONS,
-    VECTOR_MIN_SCORE_BPS, VectorEmbedding, cosine_similarity_bps, embed_text, search_terms,
+    AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, DisputedMemoryRecall,
+    EMBEDDING_MODEL_VERSION, IndexBuildReceipt, IndexDisposition, RETRIEVAL_INDEX_VERSION,
+    RecallChannels, RecallHit, RetrievalQuery, RetrievalRepository, SourceCurrentness, SourceScope,
+    VECTOR_DIMENSIONS, VECTOR_MIN_SCORE_BPS, VectorEmbedding, cosine_similarity_bps, embed_text,
+    search_terms,
 };
 use eam_source_obsidian::{
     ObsidianSourceRepository, SourceArchiveInput, SourceArchiveReceipt, SourceAvailability,
@@ -1328,6 +1333,13 @@ impl RetrievalRepository for VaultRepository {
         recall_long_term_memory_candidates(self.connection(), query)
     }
 
+    fn recall_disputed_memories(
+        &self,
+        query: &RetrievalQuery,
+    ) -> Result<Vec<DisputedMemoryRecall>, Self::Error> {
+        recall_disputed_memories(self.connection(), query)
+    }
+
     fn recall_understanding_candidates(
         &self,
         query: &RetrievalQuery,
@@ -1510,6 +1522,214 @@ impl LongTermMemoryRepository for VaultRepository {
 
     fn all_memory_versions(&self) -> Result<Vec<MemoryVersion>, RepositoryError> {
         load_memory_versions(self.connection(), None)
+    }
+
+    fn evidence(&self, id: EvidenceId) -> Result<Option<ConversationEvidence>, RepositoryError> {
+        MemoryRepository::evidence(self, id)
+    }
+
+    fn append_memory_dispute(
+        &mut self,
+        dispute: ValidatedMemoryDispute,
+        raised_at: Timestamp,
+    ) -> Result<MemoryDispute, RepositoryError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        validate_persisted_evidence_citations(&transaction, dispute.counter_evidence())?;
+        let current = load_current_memory(&transaction, dispute.memory_id())?
+            .ok_or_else(|| RepositoryError::new("memory does not exist"))?;
+        if current.version() != dispute.memory_version() {
+            return Err(RepositoryError::new("stale memory version"));
+        }
+        if !matches!(
+            current.status(),
+            MemoryStatus::Active | MemoryStatus::Provisional | MemoryStatus::ProvisionalPattern
+        ) {
+            return Err(RepositoryError::new("memory is not disputable"));
+        }
+        let dispute_id =
+            next_identifier(&transaction, "memory_disputes").map_err(repository_error)?;
+        transaction
+            .execute(
+                "INSERT INTO memory_disputes
+                 (id, memory_id, memory_version, reason, raised_at, outcome)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                params![
+                    to_sql_id(dispute_id)?,
+                    to_sql_id(dispute.memory_id().get())?,
+                    to_sql_id(dispute.memory_version())?,
+                    dispute.reason(),
+                    raised_at.as_millis(),
+                ],
+            )
+            .map_err(repository_error)?;
+        insert_dispute_evidence(
+            &transaction,
+            "memory_dispute_counter_evidence",
+            dispute_id,
+            dispute.counter_evidence(),
+        )?;
+        insert_dispute_terms(
+            &transaction,
+            dispute_id,
+            std::iter::once(dispute.reason()).chain(
+                dispute
+                    .counter_evidence()
+                    .iter()
+                    .map(EvidenceCitation::quote),
+            ),
+        )?;
+        insert_memory_state_event(
+            &transaction,
+            dispute.memory_id(),
+            dispute.memory_version(),
+            MemoryStatus::Disputed,
+            raised_at,
+        )?;
+        transaction.commit().map_err(repository_error)?;
+        let dispute_id = MemoryDisputeId::new(dispute_id)
+            .ok_or_else(|| RepositoryError::new("invalid memory dispute id"))?;
+        load_memory_dispute(self.connection(), dispute_id)?
+            .ok_or_else(|| RepositoryError::new("committed memory dispute could not be reloaded"))
+    }
+
+    fn memory_dispute(
+        &self,
+        id: MemoryDisputeId,
+    ) -> Result<Option<MemoryDispute>, RepositoryError> {
+        load_memory_dispute(self.connection(), id)
+    }
+
+    fn memory_disputes(&self, id: MemoryId) -> Result<Vec<MemoryDispute>, RepositoryError> {
+        load_memory_disputes(self.connection(), id)
+    }
+
+    fn complete_memory_dispute(
+        &mut self,
+        review: ValidatedMemoryDisputeReview,
+        reviewed_at: Timestamp,
+    ) -> Result<MemoryDisputeResolution, RepositoryError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        validate_persisted_evidence_citations(&transaction, review.evidence())?;
+        let dispute = load_memory_dispute(&transaction, review.dispute_id())?
+            .ok_or_else(|| RepositoryError::new("memory dispute does not exist"))?;
+        if dispute.outcome() != MemoryDisputeOutcome::Open {
+            return Err(RepositoryError::new("memory dispute is already resolved"));
+        }
+        let current = load_current_memory(&transaction, dispute.memory_id())?
+            .ok_or_else(|| RepositoryError::new("memory does not exist"))?;
+        if current.version() != dispute.memory_version()
+            || current.status() != MemoryStatus::Disputed
+        {
+            return Err(RepositoryError::new("memory dispute state is stale"));
+        }
+
+        let revised_version = match review.outcome() {
+            MemoryDisputeOutcome::Maintained => None,
+            MemoryDisputeOutcome::Retracted => {
+                insert_memory_state_event(
+                    &transaction,
+                    current.id(),
+                    current.version(),
+                    MemoryStatus::Retracted,
+                    reviewed_at,
+                )?;
+                None
+            }
+            MemoryDisputeOutcome::Revised => {
+                let proposal = review
+                    .revision()
+                    .ok_or_else(|| RepositoryError::new("revised dispute has no proposal"))?;
+                validate_persisted_memory_sources(&transaction, proposal)?;
+                let MemoryTarget::Revise {
+                    memory_id,
+                    expected_version,
+                } = proposal.target()
+                else {
+                    return Err(RepositoryError::new("dispute revision target is invalid"));
+                };
+                if memory_id != current.id() || expected_version != current.version() {
+                    return Err(RepositoryError::new("dispute revision target is stale"));
+                }
+                insert_memory_state_event(
+                    &transaction,
+                    current.id(),
+                    current.version(),
+                    MemoryStatus::Superseded,
+                    reviewed_at,
+                )?;
+                let next_version = current
+                    .version()
+                    .checked_add(1)
+                    .ok_or_else(|| RepositoryError::new("memory version space exhausted"))?;
+                insert_memory_version(
+                    &transaction,
+                    current.id(),
+                    next_version,
+                    Some(current.version()),
+                    proposal,
+                    reviewed_at,
+                )?;
+                Some(next_version)
+            }
+            MemoryDisputeOutcome::Open => {
+                return Err(RepositoryError::new("review outcome cannot remain open"));
+            }
+        };
+        persist_dispute_review(&transaction, &review, reviewed_at, revised_version)?;
+        transaction.commit().map_err(repository_error)?;
+
+        let stored_dispute = load_memory_dispute(self.connection(), review.dispute_id())?
+            .ok_or_else(|| RepositoryError::new("resolved dispute could not be reloaded"))?;
+        let memory = load_current_memory(self.connection(), stored_dispute.memory_id())?
+            .ok_or_else(|| RepositoryError::new("resolved memory could not be reloaded"))?;
+        Ok(MemoryDisputeResolution::new(stored_dispute, memory))
+    }
+
+    fn retracted_memory_sources(
+        &self,
+        statement: &str,
+    ) -> Result<Vec<(MemoryId, Vec<ClaimId>)>, RepositoryError> {
+        let mut query = self
+            .connection()
+            .prepare(
+                "SELECT v.memory_id
+                 FROM long_term_memory_versions v
+                 WHERE v.version = (
+                         SELECT MAX(latest.version) FROM long_term_memory_versions latest
+                         WHERE latest.memory_id = v.memory_id
+                       )
+                   AND trim(v.statement) = trim(?1)
+                   AND (SELECT e.status FROM long_term_memory_state_events e
+                        WHERE e.memory_id = v.memory_id AND e.version = v.version
+                        ORDER BY e.ordinal DESC LIMIT 1) = 5
+                 ORDER BY v.memory_id",
+            )
+            .map_err(repository_error)?;
+        let ids = query
+            .query_map([statement], |row| row.get::<_, i64>(0))
+            .map_err(repository_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_error)?;
+        ids.into_iter()
+            .map(|id| {
+                let id = u64::try_from(id).map_err(repository_error)?;
+                let id = MemoryId::new(id)
+                    .ok_or_else(|| RepositoryError::new("invalid persisted memory id"))?;
+                let current = load_current_memory(self.connection(), id)?
+                    .ok_or_else(|| RepositoryError::new("retracted memory does not exist"))?;
+                Ok((id, current.source_claim_ids().to_vec()))
+            })
+            .collect()
     }
 }
 
@@ -1824,6 +2044,327 @@ fn load_memory_sources(
             }
             let claim_id = u64::try_from(claim_id).map_err(repository_error)?;
             Ok(ClaimId::from_raw(claim_id))
+        })
+        .collect()
+}
+
+fn load_conversation_evidence(
+    connection: &Connection,
+    id: EvidenceId,
+) -> Result<Option<ConversationEvidence>, RepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT id, session_id, speaker, verbatim, recorded_at
+             FROM conversation_evidence WHERE id = ?1",
+            [to_sql_id(id.get())?],
+            stored_evidence_from_row,
+        )
+        .optional()
+        .map_err(repository_error)?;
+    stored.map(StoredEvidence::decode).transpose()
+}
+
+fn validate_persisted_evidence_citations(
+    connection: &Connection,
+    citations: &[EvidenceCitation],
+) -> Result<(), RepositoryError> {
+    if citations.is_empty() || citations.len() > MAX_DISPUTE_EVIDENCE {
+        return Err(RepositoryError::new(
+            "invalid memory dispute evidence count",
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for citation in citations {
+        if !unique.insert(citation.evidence_id()) {
+            return Err(RepositoryError::new("duplicate memory dispute evidence"));
+        }
+        let evidence = load_conversation_evidence(connection, citation.evidence_id())?
+            .ok_or_else(|| RepositoryError::new("memory dispute evidence does not exist"))?;
+        if citation.quote().trim().is_empty() || !evidence.verbatim().contains(citation.quote()) {
+            return Err(RepositoryError::new(
+                "memory dispute evidence quote does not match",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn insert_dispute_evidence(
+    connection: &Connection,
+    table: &str,
+    dispute_id: u64,
+    citations: &[EvidenceCitation],
+) -> Result<(), RepositoryError> {
+    let sql = match table {
+        "memory_dispute_counter_evidence" => {
+            "INSERT INTO memory_dispute_counter_evidence
+             (dispute_id, ordinal, evidence_id, quote) VALUES (?1, ?2, ?3, ?4)"
+        }
+        "memory_dispute_review_evidence" => {
+            "INSERT INTO memory_dispute_review_evidence
+             (dispute_id, ordinal, evidence_id, quote) VALUES (?1, ?2, ?3, ?4)"
+        }
+        _ => {
+            return Err(RepositoryError::new(
+                "invalid memory dispute evidence table",
+            ));
+        }
+    };
+    for (ordinal, citation) in citations.iter().enumerate() {
+        connection
+            .execute(
+                sql,
+                params![
+                    to_sql_id(dispute_id)?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(citation.evidence_id().get())?,
+                    citation.quote(),
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
+fn insert_dispute_terms<'a>(
+    connection: &Connection,
+    dispute_id: u64,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<(), RepositoryError> {
+    let mut terms = BTreeSet::new();
+    for value in values {
+        terms.extend(search_terms(value));
+    }
+    for term in terms {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO memory_dispute_terms (dispute_id, term)
+                 VALUES (?1, ?2)",
+                params![to_sql_id(dispute_id)?, term],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
+fn persist_dispute_review(
+    transaction: &rusqlite::Transaction<'_>,
+    review: &ValidatedMemoryDisputeReview,
+    reviewed_at: Timestamp,
+    revised_version: Option<u64>,
+) -> Result<(), RepositoryError> {
+    transaction
+        .execute(
+            "UPDATE memory_disputes
+             SET outcome = ?1, reviewed_at = ?2, review_rationale = ?3,
+                 revised_version = ?4
+             WHERE id = ?5 AND outcome = 0",
+            params![
+                encode_dispute_outcome(review.outcome()),
+                reviewed_at.as_millis(),
+                review.rationale(),
+                revised_version.map(to_sql_id).transpose()?,
+                to_sql_id(review.dispute_id().get())?,
+            ],
+        )
+        .map_err(repository_error)?;
+    insert_dispute_evidence(
+        transaction,
+        "memory_dispute_review_evidence",
+        review.dispute_id().get(),
+        review.evidence(),
+    )?;
+    insert_dispute_terms(
+        transaction,
+        review.dispute_id().get(),
+        std::iter::once(review.rationale())
+            .chain(review.evidence().iter().map(EvidenceCitation::quote)),
+    )
+}
+
+fn load_dispute_evidence(
+    connection: &Connection,
+    table: &str,
+    dispute_id: MemoryDisputeId,
+    required: bool,
+) -> Result<Vec<EvidenceCitation>, RepositoryError> {
+    let sql = match table {
+        "memory_dispute_counter_evidence" => {
+            "SELECT ordinal, evidence_id, quote FROM memory_dispute_counter_evidence
+             WHERE dispute_id = ?1 ORDER BY ordinal"
+        }
+        "memory_dispute_review_evidence" => {
+            "SELECT ordinal, evidence_id, quote FROM memory_dispute_review_evidence
+             WHERE dispute_id = ?1 ORDER BY ordinal"
+        }
+        _ => {
+            return Err(RepositoryError::new(
+                "invalid memory dispute evidence table",
+            ));
+        }
+    };
+    let mut statement = connection.prepare(sql).map_err(repository_error)?;
+    let rows = statement
+        .query_map([to_sql_id(dispute_id.get())?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)?;
+    if (required && rows.is_empty()) || rows.len() > MAX_DISPUTE_EVIDENCE {
+        return Err(RepositoryError::new(
+            "invalid persisted memory dispute evidence count",
+        ));
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(expected, (ordinal, evidence_id, quote))| {
+            if usize::try_from(ordinal).ok() != Some(expected) || quote.trim().is_empty() {
+                return Err(RepositoryError::new(
+                    "invalid persisted memory dispute evidence order",
+                ));
+            }
+            let evidence_id = u64::try_from(evidence_id).map_err(repository_error)?;
+            let evidence_id = EvidenceId::from_raw(evidence_id);
+            let evidence = load_conversation_evidence(connection, evidence_id)?
+                .ok_or_else(|| RepositoryError::new("memory dispute evidence is missing"))?;
+            if !evidence.verbatim().contains(&quote) {
+                return Err(RepositoryError::new(
+                    "persisted memory dispute quote does not match",
+                ));
+            }
+            Ok(EvidenceCitation::new(evidence_id, quote))
+        })
+        .collect()
+}
+
+fn load_memory_dispute(
+    connection: &Connection,
+    id: MemoryDisputeId,
+) -> Result<Option<MemoryDispute>, RepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT memory_id, memory_version, reason, raised_at, outcome,
+                    reviewed_at, review_rationale, revised_version
+             FROM memory_disputes WHERE id = ?1",
+            [to_sql_id(id.get())?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(repository_error)?;
+    let Some((
+        memory_id,
+        memory_version,
+        reason,
+        raised_at,
+        outcome,
+        reviewed_at,
+        rationale,
+        revised_version,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    let memory_id = u64::try_from(memory_id).map_err(repository_error)?;
+    let memory_id = MemoryId::new(memory_id)
+        .ok_or_else(|| RepositoryError::new("invalid persisted memory id"))?;
+    let memory_version = u64::try_from(memory_version).map_err(repository_error)?;
+    let outcome = decode_dispute_outcome(outcome)?;
+    let revised_version = revised_version
+        .map(u64::try_from)
+        .transpose()
+        .map_err(repository_error)?;
+    let review = match outcome {
+        MemoryDisputeOutcome::Open => {
+            if reviewed_at.is_some() || rationale.is_some() || revised_version.is_some() {
+                return Err(RepositoryError::new("open memory dispute has a review"));
+            }
+            None
+        }
+        MemoryDisputeOutcome::Retracted
+        | MemoryDisputeOutcome::Revised
+        | MemoryDisputeOutcome::Maintained => {
+            match outcome {
+                MemoryDisputeOutcome::Revised => {
+                    let successor = revised_version.ok_or_else(|| {
+                        RepositoryError::new("revised dispute has no successor version")
+                    })?;
+                    let successor = load_memory_version(connection, memory_id, successor)?;
+                    if successor.predecessor_version() != Some(memory_version) {
+                        return Err(RepositoryError::new(
+                            "revised dispute successor does not follow the disputed version",
+                        ));
+                    }
+                }
+                MemoryDisputeOutcome::Retracted | MemoryDisputeOutcome::Maintained => {
+                    if revised_version.is_some() {
+                        return Err(RepositoryError::new(
+                            "non-revised dispute has a successor version",
+                        ));
+                    }
+                }
+                MemoryDisputeOutcome::Open => unreachable!(),
+            }
+            let reviewed_at = reviewed_at
+                .ok_or_else(|| RepositoryError::new("resolved dispute has no timestamp"))?;
+            let rationale = rationale
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| RepositoryError::new("resolved dispute has no rationale"))?;
+            Some(MemoryDisputeReviewRecord::restore(
+                outcome,
+                rationale,
+                load_dispute_evidence(connection, "memory_dispute_review_evidence", id, true)?,
+                Timestamp::from_millis(reviewed_at),
+            ))
+        }
+    };
+    Ok(Some(MemoryDispute::restore(
+        id,
+        memory_id,
+        memory_version,
+        reason,
+        load_dispute_evidence(connection, "memory_dispute_counter_evidence", id, true)?,
+        Timestamp::from_millis(raised_at),
+        outcome,
+        review,
+        revised_version,
+    )))
+}
+
+fn load_memory_disputes(
+    connection: &Connection,
+    memory_id: MemoryId,
+) -> Result<Vec<MemoryDispute>, RepositoryError> {
+    let mut statement = connection
+        .prepare("SELECT id FROM memory_disputes WHERE memory_id = ?1 ORDER BY id")
+        .map_err(repository_error)?;
+    let ids = statement
+        .query_map([to_sql_id(memory_id.get())?], |row| row.get::<_, i64>(0))
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)?;
+    ids.into_iter()
+        .map(|id| {
+            let id = u64::try_from(id).map_err(repository_error)?;
+            let id = MemoryDisputeId::new(id)
+                .ok_or_else(|| RepositoryError::new("invalid persisted dispute id"))?;
+            load_memory_dispute(connection, id)?
+                .ok_or_else(|| RepositoryError::new("persisted memory dispute is missing"))
         })
         .collect()
 }
@@ -4024,6 +4565,124 @@ fn recall_long_term_memory_candidates(
             )
         })
         .collect())
+}
+
+fn recall_disputed_memories(
+    connection: &Connection,
+    query: &RetrievalQuery,
+) -> Result<Vec<DisputedMemoryRecall>, VaultError> {
+    let mut terms = BTreeSet::new();
+    if let Some(text) = query.text() {
+        terms.extend(search_terms(text));
+    }
+    for entity in query.entities() {
+        terms.extend(search_terms(entity));
+    }
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let start = query.time().map(eam_retrieval::TimeRange::start_millis);
+    let end = query.time().map(eam_retrieval::TimeRange::end_millis);
+    let mut dispute_ids = BTreeSet::new();
+    for term in terms {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT d.id
+             FROM memory_disputes d
+             JOIN long_term_memory_versions v
+               ON v.memory_id = d.memory_id AND v.version = d.memory_version
+             LEFT JOIN memory_dispute_terms dt ON dt.dispute_id = d.id
+             LEFT JOIN long_term_memory_terms mt
+               ON mt.memory_id = v.memory_id AND mt.version = v.version
+             WHERE (dt.term = ?1 OR mt.term = ?1)
+               AND d.outcome IN (0, 3)
+               AND d.id = (
+                   SELECT MAX(latest_d.id) FROM memory_disputes latest_d
+                   WHERE latest_d.memory_id = d.memory_id
+                     AND latest_d.outcome IN (0, 3)
+               )
+               AND v.version = (
+                   SELECT MAX(latest_v.version) FROM long_term_memory_versions latest_v
+                   WHERE latest_v.memory_id = v.memory_id
+               )
+               AND (SELECT e.status FROM long_term_memory_state_events e
+                    WHERE e.memory_id = v.memory_id AND e.version = v.version
+                    ORDER BY e.ordinal DESC LIMIT 1) = 4
+               AND (?2 IS NULL OR (
+                    v.applicable_start IS NOT NULL
+                    AND v.applicable_start <= ?3
+                    AND (v.applicable_kind = 1
+                         OR COALESCE(v.applicable_end, v.applicable_start) >= ?2)
+               ))
+             ORDER BY d.id",
+        )?;
+        for id in statement
+            .query_map(params![term, start, end], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            dispute_ids.insert(u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?);
+            if dispute_ids.len() == MAX_LONG_TERM_MEMORY_CANDIDATES {
+                break;
+            }
+        }
+        if dispute_ids.len() == MAX_LONG_TERM_MEMORY_CANDIDATES {
+            break;
+        }
+    }
+
+    dispute_ids
+        .into_iter()
+        .map(|id| load_disputed_memory_recall(connection, id))
+        .collect()
+}
+
+fn load_disputed_memory_recall(
+    connection: &Connection,
+    id: u64,
+) -> Result<DisputedMemoryRecall, VaultError> {
+    let dispute_id = MemoryDisputeId::new(id).ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let dispute = load_memory_dispute(connection, dispute_id)
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let memory = load_memory_version(connection, dispute.memory_id(), dispute.memory_version())
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    if memory.status() != MemoryStatus::Disputed {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    let counterpart_sources = memory
+        .source_claim_ids()
+        .iter()
+        .map(|id| {
+            load_claim(connection, *id)
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?
+                .ok_or(VaultError::InvalidKeyOrCorrupt)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (review_rationale, review_evidence, state) = match dispute.outcome() {
+        MemoryDisputeOutcome::Open => (None, Vec::new(), DisputeState::Open),
+        MemoryDisputeOutcome::Maintained => {
+            let review = dispute.review().ok_or(VaultError::InvalidKeyOrCorrupt)?;
+            (
+                Some(review.rationale().to_owned()),
+                review.evidence().to_vec(),
+                DisputeState::Maintained,
+            )
+        }
+        MemoryDisputeOutcome::Retracted | MemoryDisputeOutcome::Revised => {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+    };
+    Ok(DisputedMemoryRecall::new(
+        dispute.id().get(),
+        memory.id().get(),
+        memory.version(),
+        memory.statement().to_owned(),
+        counterpart_sources,
+        dispute.reason().to_owned(),
+        dispute.counter_evidence().to_vec(),
+        review_rationale,
+        review_evidence,
+        state,
+    ))
 }
 
 fn recall_understanding_candidates(
@@ -6408,6 +7067,8 @@ const fn encode_memory_status(value: MemoryStatus) -> i64 {
         MemoryStatus::Provisional => 1,
         MemoryStatus::ProvisionalPattern => 2,
         MemoryStatus::Superseded => 3,
+        MemoryStatus::Disputed => 4,
+        MemoryStatus::Retracted => 5,
     }
 }
 
@@ -6417,7 +7078,30 @@ fn decode_memory_status(value: i64) -> Result<MemoryStatus, RepositoryError> {
         1 => Ok(MemoryStatus::Provisional),
         2 => Ok(MemoryStatus::ProvisionalPattern),
         3 => Ok(MemoryStatus::Superseded),
+        4 => Ok(MemoryStatus::Disputed),
+        5 => Ok(MemoryStatus::Retracted),
         _ => Err(RepositoryError::new("invalid persisted memory status")),
+    }
+}
+
+const fn encode_dispute_outcome(value: MemoryDisputeOutcome) -> i64 {
+    match value {
+        MemoryDisputeOutcome::Open => 0,
+        MemoryDisputeOutcome::Retracted => 1,
+        MemoryDisputeOutcome::Revised => 2,
+        MemoryDisputeOutcome::Maintained => 3,
+    }
+}
+
+fn decode_dispute_outcome(value: i64) -> Result<MemoryDisputeOutcome, RepositoryError> {
+    match value {
+        0 => Ok(MemoryDisputeOutcome::Open),
+        1 => Ok(MemoryDisputeOutcome::Retracted),
+        2 => Ok(MemoryDisputeOutcome::Revised),
+        3 => Ok(MemoryDisputeOutcome::Maintained),
+        _ => Err(RepositoryError::new(
+            "invalid persisted memory dispute outcome",
+        )),
     }
 }
 

@@ -1,5 +1,51 @@
 # 代码链路
 
+## 2026-07-30 S17-4 修订关联补全、架构对齐与全仓门禁
+
+**触达**:
+- `crates/memory/src/domain.rs:MemoryDispute::revised_version` — 让修订争议在即时结果与跨重启读取中都保留后继版本关联。
+- `crates/vault/src/repository.rs:load_memory_dispute` — 恢复并校验修订后继必须直接承接被争议版本，损坏关联失败关闭。
+- `crates/vault/tests/memory_persistence.rs:revised_dispute_survives_reopen_with_its_successor_version_link` — 覆盖 schema v14 修订关联跨重启恢复。
+- `docs/architecture.md:§2/§4.1/§4.2/§5.5～§5.7/§8/§9.17` — 对齐 schema v14、争议数据流、运行时出口和 S17 当前实现边界。
+
+**入口**：陌生会话从架构 §9.17 定位本人异议、第二自我复核、成对召回与自然/高影响运行时披露的完整路径。
+**测试**：全仓 Rust 156/156、fmt、workspace clippy、desktop check、release build、前端 2/2、typecheck、production build、3 个变更 Markdown 的 94 个本地链接及 `git diff --check` 全部通过。
+
+## 2026-07-30 S17-3 自然分层披露与高影响失败关闭
+
+**触达**:
+- `crates/core/src/domain.rs:FrozenMemoryDispute/DecisionImpact` — 把完整争议对和普通/高影响级别纳入不可变工作上下文。
+- `crates/retrieval/src/context.rs:freeze_working_context/replay_digest` — 优先预算争议对，并让影响级别参与快照重放摘要。
+- `crates/runtime-gateway/src/adapter.rs:WorkingContextInput/respond` — 普通模式禁止状态朗读与固定模板，高影响模式要求主动不确定性策略及争议依据入口。
+- `crates/runtime-gateway/src/transport.rs:OutboundContextSource::MemoryDispute` — 外发审计记录争议身份、来源 Claim 和双方对话证据 ID。
+- `crates/runtime-gateway/tests/runtime_contract.rs` — 覆盖普通自然策略、高影响主动披露和缺少依据入口失败关闭。
+
+**入口**：可信调用方在 `RetrievalQuery::with_decision_impact` 标注高影响；冻结快照把该级别传给运行时，模型不能自行降级披露。
+**测试**：runtime-gateway 11/11、retrieval 10/10 与 core/retrieval/runtime-gateway 目标 clippy 通过。
+
+## 2026-07-30 S17-2 schema v14 争议持久化与直接相关成对召回
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_14` — 扩展记忆状态事件并保存争议、本人反证、复核结果、复核依据和直接相关路由词。
+- `crates/vault/src/repository.rs:LongTermMemoryRepository` — 原子写入 `DISPUTED/RETRACTED`、保持/撤回/修订结果，并跨重启恢复争议及修订后继版本关联。
+- `crates/vault/src/repository.rs:recall_disputed_memories` — 只对当前查询词直接相关的活动争议返回不可拆分双方配对，撤回与修订结果停止召回。
+- `crates/retrieval/src/context.rs:freeze_working_context` — 在预算内优先冻结双方立场、来源、反证、复核依据和争议状态。
+- `crates/vault/tests/memory_persistence.rs` — 覆盖跨重启保持争议、修订后继版本、相关/非相关召回和撤回关闭全部召回路径。
+
+**入口**：`retrieve` 单独请求 `recall_disputed_memories`；普通长期记忆通道继续排除 `DISPUTED`，Context Builder 只接受完整配对。
+**测试**：retrieval 9/9、Vault 62/62 与两 crate 目标 clippy 通过；schema v14 中断迁移保持 v13 可重开。
+
+## 2026-07-30 S17-1 记忆争议与复核领域契约
+
+**触达**:
+- `crates/memory/src/domain.rs:MemoryDisputeRequest/MemoryDisputeReview/MemoryDisputeResolution` — 固定本人异议、第二自我复核、双方原文依据和三种复核结果。
+- `crates/memory/src/service.rs:MemoryMaintenance::raise_dispute/review_dispute` — 校验版本、逐字反证、复核依据与撤回后新增来源门禁。
+- `crates/memory/src/in_memory.rs:InMemoryLongTermMemoryRepository` — 提供 `DISPUTED/RETRACTED` 与修订后继版本的原子领域测试仓储。
+- `crates/memory/tests/memory_disputes.rs` — 覆盖保持争议、撤回、修订和缺少反证拒绝。
+
+**入口**：可信 Core 以本人已保留的原文证据调用 `raise_dispute`；第二自我完成复核后调用 `review_dispute`，本人不能直接选择结果。
+**测试**：`cargo test -p memory --no-fail-fast` 8/8 与 `cargo clippy -p memory --all-targets -- -D warnings` 通过。
+
 ## 2026-07-30 S16-3 架构对齐与全仓门禁
 
 **触达**:

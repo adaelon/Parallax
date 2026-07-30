@@ -10,7 +10,7 @@ use std::{
     fmt,
 };
 
-use eam_core::{Claim, ClaimId};
+use eam_core::{Claim, ClaimId, DecisionImpact, DisputeState, EvidenceCitation};
 use eam_ingestion::{EvidenceBlockRef, EvidenceBlockView};
 
 mod context;
@@ -83,6 +83,7 @@ pub struct RetrievalQuery {
     time: Option<TimeRange>,
     entities: Vec<String>,
     source_scope: SourceScope,
+    decision_impact: DecisionImpact,
     limit: usize,
 }
 
@@ -94,6 +95,7 @@ impl RetrievalQuery {
             time: None,
             entities: Vec::new(),
             source_scope: SourceScope::Current,
+            decision_impact: DecisionImpact::Ordinary,
             limit: DEFAULT_RESULT_LIMIT,
         }
     }
@@ -105,6 +107,7 @@ impl RetrievalQuery {
             time: Some(time),
             entities: Vec::new(),
             source_scope: SourceScope::Current,
+            decision_impact: DecisionImpact::Ordinary,
             limit: DEFAULT_RESULT_LIMIT,
         }
     }
@@ -116,6 +119,7 @@ impl RetrievalQuery {
             time: None,
             entities: vec![entity.into()],
             source_scope: SourceScope::Current,
+            decision_impact: DecisionImpact::Ordinary,
             limit: DEFAULT_RESULT_LIMIT,
         }
     }
@@ -145,6 +149,12 @@ impl RetrievalQuery {
     }
 
     #[must_use]
+    pub const fn with_decision_impact(mut self, impact: DecisionImpact) -> Self {
+        self.decision_impact = impact;
+        self
+    }
+
+    #[must_use]
     pub const fn with_limit(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
@@ -168,6 +178,11 @@ impl RetrievalQuery {
     #[must_use]
     pub const fn source_scope(&self) -> SourceScope {
         self.source_scope
+    }
+
+    #[must_use]
+    pub const fn decision_impact(&self) -> DecisionImpact {
+        self.decision_impact
     }
 
     #[must_use]
@@ -482,6 +497,100 @@ pub enum AuthoritativeCandidate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisputedMemoryRecall {
+    dispute_id: u64,
+    memory_id: u64,
+    memory_version: u64,
+    counterpart_view: String,
+    counterpart_sources: Vec<Claim>,
+    person_position: String,
+    person_evidence: Vec<EvidenceCitation>,
+    review_rationale: Option<String>,
+    review_evidence: Vec<EvidenceCitation>,
+    state: DisputeState,
+}
+
+impl DisputedMemoryRecall {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        dispute_id: u64,
+        memory_id: u64,
+        memory_version: u64,
+        counterpart_view: String,
+        counterpart_sources: Vec<Claim>,
+        person_position: String,
+        person_evidence: Vec<EvidenceCitation>,
+        review_rationale: Option<String>,
+        review_evidence: Vec<EvidenceCitation>,
+        state: DisputeState,
+    ) -> Self {
+        Self {
+            dispute_id,
+            memory_id,
+            memory_version,
+            counterpart_view,
+            counterpart_sources,
+            person_position,
+            person_evidence,
+            review_rationale,
+            review_evidence,
+            state,
+        }
+    }
+
+    #[must_use]
+    pub const fn dispute_id(&self) -> u64 {
+        self.dispute_id
+    }
+
+    #[must_use]
+    pub const fn memory_id(&self) -> u64 {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn memory_version(&self) -> u64 {
+        self.memory_version
+    }
+
+    #[must_use]
+    pub fn counterpart_view(&self) -> &str {
+        &self.counterpart_view
+    }
+
+    #[must_use]
+    pub fn counterpart_sources(&self) -> &[Claim] {
+        &self.counterpart_sources
+    }
+
+    #[must_use]
+    pub fn person_position(&self) -> &str {
+        &self.person_position
+    }
+
+    #[must_use]
+    pub fn person_evidence(&self) -> &[EvidenceCitation] {
+        &self.person_evidence
+    }
+
+    #[must_use]
+    pub fn review_rationale(&self) -> Option<&str> {
+        self.review_rationale.as_deref()
+    }
+
+    #[must_use]
+    pub fn review_evidence(&self) -> &[EvidenceCitation] {
+        &self.review_evidence
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> DisputeState {
+        self.state
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetrievalCandidate {
     reference: CandidateRef,
     authority: AuthoritativeCandidate,
@@ -538,6 +647,7 @@ impl RetrievalCandidate {
 pub struct RetrievalResult {
     index: IndexBuildReceipt,
     candidates: Vec<RetrievalCandidate>,
+    disputed_memories: Vec<DisputedMemoryRecall>,
 }
 
 impl RetrievalResult {
@@ -549,6 +659,11 @@ impl RetrievalResult {
     #[must_use]
     pub fn candidates(&self) -> &[RetrievalCandidate] {
         &self.candidates
+    }
+
+    #[must_use]
+    pub fn disputed_memories(&self) -> &[DisputedMemoryRecall] {
+        &self.disputed_memories
     }
 }
 
@@ -581,6 +696,20 @@ pub trait RetrievalRepository {
         &self,
         _query: &RetrievalQuery,
     ) -> Result<Vec<RecallHit>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Returns only directly relevant disputed memories as indivisible pairs:
+    /// counterpart view and sources, person objection and evidence, plus the
+    /// current dispute state. Implementations must not emit one side alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when durable dispute state cannot be queried.
+    fn recall_disputed_memories(
+        &self,
+        _query: &RetrievalQuery,
+    ) -> Result<Vec<DisputedMemoryRecall>, Self::Error> {
         Ok(Vec::new())
     }
 
@@ -638,6 +767,9 @@ pub fn retrieve<R: RetrievalRepository>(
     let index = repository
         .ensure_retrieval_index()
         .map_err(RetrievalFailure::Repository)?;
+    let disputed_memories = repository
+        .recall_disputed_memories(query)
+        .map_err(RetrievalFailure::Repository)?;
     let mut hits = repository
         .recall_candidates(query)
         .map_err(RetrievalFailure::Repository)?;
@@ -692,7 +824,11 @@ pub fn retrieve<R: RetrievalRepository>(
             break;
         }
     }
-    Ok(RetrievalResult { index, candidates })
+    Ok(RetrievalResult {
+        index,
+        candidates,
+        disputed_memories,
+    })
 }
 
 /// Normalizes text and emits deterministic word plus Unicode n-gram terms.

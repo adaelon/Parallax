@@ -299,11 +299,19 @@ pub enum PersonTurnClassification {
     Ambiguous,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecisionImpact {
+    #[default]
+    Ordinary,
+    High,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingContext {
     evidence: Vec<ConversationEvidence>,
     retrieved: Vec<RetrievedContextItem>,
     retrieval_snapshot: Option<RetrievalSnapshot>,
+    decision_impact: DecisionImpact,
     frozen_at: Timestamp,
 }
 
@@ -313,6 +321,7 @@ impl WorkingContext {
             evidence,
             retrieved: Vec::new(),
             retrieval_snapshot: None,
+            decision_impact: DecisionImpact::Ordinary,
             frozen_at,
         }
     }
@@ -360,6 +369,12 @@ impl WorkingContext {
     }
 
     #[must_use]
+    pub const fn with_decision_impact(mut self, impact: DecisionImpact) -> Self {
+        self.decision_impact = impact;
+        self
+    }
+
+    #[must_use]
     pub fn evidence(&self) -> &[ConversationEvidence] {
         &self.evidence
     }
@@ -372,6 +387,11 @@ impl WorkingContext {
     #[must_use]
     pub const fn retrieval_snapshot(&self) -> Option<&RetrievalSnapshot> {
         self.retrieval_snapshot.as_ref()
+    }
+
+    #[must_use]
+    pub const fn decision_impact(&self) -> DecisionImpact {
+        self.decision_impact
     }
 
     #[must_use]
@@ -534,10 +554,119 @@ impl FrozenLedgerClaim {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisputeState {
+    Open,
+    Maintained,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenMemoryDispute {
+    dispute_id: u64,
+    memory_id: u64,
+    memory_version: u64,
+    counterpart_view: String,
+    counterpart_sources: Vec<Claim>,
+    person_position: String,
+    person_evidence: Vec<EvidenceCitation>,
+    review_rationale: Option<String>,
+    review_evidence: Vec<EvidenceCitation>,
+    state: DisputeState,
+    estimated_tokens: usize,
+}
+
+impl FrozenMemoryDispute {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        dispute_id: u64,
+        memory_id: u64,
+        memory_version: u64,
+        counterpart_view: String,
+        counterpart_sources: Vec<Claim>,
+        person_position: String,
+        person_evidence: Vec<EvidenceCitation>,
+        review_rationale: Option<String>,
+        review_evidence: Vec<EvidenceCitation>,
+        state: DisputeState,
+        estimated_tokens: usize,
+    ) -> Self {
+        Self {
+            dispute_id,
+            memory_id,
+            memory_version,
+            counterpart_view,
+            counterpart_sources,
+            person_position,
+            person_evidence,
+            review_rationale,
+            review_evidence,
+            state,
+            estimated_tokens,
+        }
+    }
+
+    #[must_use]
+    pub const fn dispute_id(&self) -> u64 {
+        self.dispute_id
+    }
+
+    #[must_use]
+    pub const fn memory_id(&self) -> u64 {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn memory_version(&self) -> u64 {
+        self.memory_version
+    }
+
+    #[must_use]
+    pub fn counterpart_view(&self) -> &str {
+        &self.counterpart_view
+    }
+
+    #[must_use]
+    pub fn counterpart_sources(&self) -> &[Claim] {
+        &self.counterpart_sources
+    }
+
+    #[must_use]
+    pub fn person_position(&self) -> &str {
+        &self.person_position
+    }
+
+    #[must_use]
+    pub fn person_evidence(&self) -> &[EvidenceCitation] {
+        &self.person_evidence
+    }
+
+    #[must_use]
+    pub fn review_rationale(&self) -> Option<&str> {
+        self.review_rationale.as_deref()
+    }
+
+    #[must_use]
+    pub fn review_evidence(&self) -> &[EvidenceCitation] {
+        &self.review_evidence
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> DisputeState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn estimated_tokens(&self) -> usize {
+        self.estimated_tokens
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RetrievedContextItem {
     EvidenceWindow(FrozenRetrievalWindow),
     LedgerClaim(FrozenLedgerClaim),
+    MemoryDispute(FrozenMemoryDispute),
 }
 
 impl RetrievedContextItem {
@@ -546,6 +675,7 @@ impl RetrievedContextItem {
         match self {
             Self::EvidenceWindow(window) => window.estimated_tokens(),
             Self::LedgerClaim(claim) => claim.estimated_tokens(),
+            Self::MemoryDispute(dispute) => dispute.estimated_tokens(),
         }
     }
 }

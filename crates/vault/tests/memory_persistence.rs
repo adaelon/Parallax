@@ -1,12 +1,17 @@
 use eam_core::{
     ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, EvidenceCitation, EvidenceId,
-    IncrementingClock, MemoryRepository, SessionId, Speaker, Timestamp, Uncertainty,
+    IncrementingClock, MemoryRepository, RetrievedContextItem, SessionId, Speaker, Timestamp,
+    Uncertainty,
 };
 use eam_memory::{
-    LongTermMemoryRepository, MemoryBasis, MemoryConfidence, MemoryKind, MemoryMaintenance,
+    LongTermMemoryRepository, MemoryBasis, MemoryConfidence, MemoryDisputeOutcome,
+    MemoryDisputeRequest, MemoryDisputeReview, MemoryId, MemoryKind, MemoryMaintenance,
     MemoryProposal, MemoryStatus, MemorySubject,
 };
-use eam_retrieval::{AuthoritativeCandidate, RetrievalQuery, TimeRange, retrieve};
+use eam_retrieval::{
+    AuthoritativeCandidate, RetrievalQuery, TimeRange, TokenBudget, freeze_working_context,
+    retrieve,
+};
 use eam_vault::{VaultKey, VaultRepository};
 use tempfile::tempdir;
 
@@ -82,7 +87,7 @@ fn explicit_versions_survive_reopen_and_only_current_memory_sources_are_recalled
 
     let mut repository =
         VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
     let versions = repository.memory_versions(first.id()).unwrap();
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].status(), MemoryStatus::Superseded);
@@ -124,6 +129,266 @@ fn ledger_rows_remain_zero_memory_state_until_an_explicit_proposal_commits() {
     assert!(repository.all_memory_versions().unwrap().is_empty());
 }
 
+#[test]
+fn maintained_dispute_survives_reopen_and_freezes_only_as_a_complete_relevant_pair() {
+    let vault = tempdir().unwrap();
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    seed_claim(
+        &mut repository,
+        1,
+        ClaimOwner::Counterpart,
+        "Planning has become steadier",
+        Some(Uncertainty::Medium),
+        ApplicableTime::Since(Timestamp::from_millis(10)),
+    );
+    seed_evidence(
+        &mut repository,
+        2,
+        Speaker::Person,
+        "That week was exceptional",
+    );
+    seed_evidence(
+        &mut repository,
+        3,
+        Speaker::Counterpart,
+        "The broader sequence still supports the interpretation",
+    );
+    let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(2_000));
+    let memory = maintenance
+        .propose(
+            &MemoryProposal::new("Planning has become steadier")
+                .with_subject(MemorySubject::Counterpart)
+                .with_kind(MemoryKind::Hypothesis)
+                .with_source_claim(ClaimId::from_raw(1))
+                .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(10)))
+                .with_confidence(MemoryConfidence::Medium)
+                .with_salience_reason("Useful in future planning conversations")
+                .with_basis(MemoryBasis::InterpretiveInference),
+        )
+        .unwrap();
+    let dispute = maintenance
+        .raise_dispute(
+            &MemoryDisputeRequest::new(
+                memory.id(),
+                memory.version(),
+                "One exceptional week should not define the pattern",
+            )
+            .with_counter_evidence(EvidenceCitation::new(
+                EvidenceId::from_raw(2),
+                "That week was exceptional",
+            )),
+        )
+        .unwrap();
+    maintenance
+        .review_dispute(
+            &MemoryDisputeReview::maintain(dispute.id(), "The longer sequence remains persuasive")
+                .with_evidence(EvidenceCitation::new(
+                    EvidenceId::from_raw(3),
+                    "The broader sequence still supports the interpretation",
+                )),
+        )
+        .unwrap();
+    let (repository, _) = maintenance.into_parts();
+    repository.close().unwrap();
+
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(
+        repository
+            .current_memory(memory.id())
+            .unwrap()
+            .unwrap()
+            .status(),
+        MemoryStatus::Disputed
+    );
+    let disputes = repository.memory_disputes(memory.id()).unwrap();
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes[0].outcome(), MemoryDisputeOutcome::Maintained);
+
+    assert_relevant_dispute_pair_and_unrelated_absence(&mut repository, memory.id());
+}
+
+#[test]
+fn revised_dispute_survives_reopen_with_its_successor_version_link() {
+    let vault = tempdir().unwrap();
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    seed_claim(
+        &mut repository,
+        1,
+        ClaimOwner::Counterpart,
+        "Planning has become steadier",
+        Some(Uncertainty::Medium),
+        ApplicableTime::Since(Timestamp::from_millis(10)),
+    );
+    seed_evidence(
+        &mut repository,
+        2,
+        Speaker::Person,
+        "That week was exceptional",
+    );
+    seed_evidence(
+        &mut repository,
+        3,
+        Speaker::Counterpart,
+        "The objection supports a narrower interpretation",
+    );
+    seed_claim(
+        &mut repository,
+        4,
+        ClaimOwner::Counterpart,
+        "Busy-week planning can become less steady",
+        Some(Uncertainty::Medium),
+        ApplicableTime::Since(Timestamp::from_millis(10)),
+    );
+    let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(3_000));
+    let memory = maintenance
+        .propose(
+            &MemoryProposal::new("Planning has become steadier")
+                .with_subject(MemorySubject::Counterpart)
+                .with_kind(MemoryKind::Hypothesis)
+                .with_source_claim(ClaimId::from_raw(1))
+                .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(10)))
+                .with_confidence(MemoryConfidence::Medium)
+                .with_salience_reason("Useful in future planning conversations")
+                .with_basis(MemoryBasis::InterpretiveInference),
+        )
+        .unwrap();
+    let dispute = maintenance
+        .raise_dispute(
+            &MemoryDisputeRequest::new(
+                memory.id(),
+                memory.version(),
+                "The conclusion is too broad",
+            )
+            .with_counter_evidence(EvidenceCitation::new(
+                EvidenceId::from_raw(2),
+                "That week was exceptional",
+            )),
+        )
+        .unwrap();
+    let revision = MemoryProposal::new("Busy-week planning can become less steady")
+        .with_subject(MemorySubject::Counterpart)
+        .with_kind(MemoryKind::Hypothesis)
+        .with_source_claims([ClaimId::from_raw(1), ClaimId::from_raw(4)])
+        .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(10)))
+        .with_confidence(MemoryConfidence::Medium)
+        .with_salience_reason("Retain the narrower, evidence-bounded interpretation")
+        .with_basis(MemoryBasis::InterpretiveInference)
+        .revising(memory.id(), memory.version());
+    let resolution = maintenance
+        .review_dispute(
+            &MemoryDisputeReview::revise(
+                dispute.id(),
+                "The objection supports a narrower interpretation",
+                revision,
+            )
+            .with_evidence(EvidenceCitation::new(
+                EvidenceId::from_raw(3),
+                "The objection supports a narrower interpretation",
+            )),
+        )
+        .unwrap();
+    assert_eq!(resolution.dispute().revised_version(), Some(2));
+    let (repository, _) = maintenance.into_parts();
+    repository.close().unwrap();
+
+    let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    let disputes = repository.memory_disputes(memory.id()).unwrap();
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes[0].outcome(), MemoryDisputeOutcome::Revised);
+    assert_eq!(disputes[0].revised_version(), Some(2));
+    let versions = repository.memory_versions(memory.id()).unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].status(), MemoryStatus::Superseded);
+    assert_eq!(versions[1].predecessor_version(), Some(memory.version()));
+    assert_eq!(
+        versions[1].statement(),
+        "Busy-week planning can become less steady"
+    );
+}
+
+#[test]
+fn retracted_dispute_survives_reopen_and_contributes_no_recall_path() {
+    let vault = tempdir().unwrap();
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    seed_claim(
+        &mut repository,
+        1,
+        ClaimOwner::Counterpart,
+        "Planning has become steadier",
+        Some(Uncertainty::Medium),
+        ApplicableTime::Since(Timestamp::from_millis(10)),
+    );
+    seed_evidence(&mut repository, 2, Speaker::Person, "A direct exception");
+    seed_evidence(
+        &mut repository,
+        3,
+        Speaker::Counterpart,
+        "The exception defeats the conclusion",
+    );
+    let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(4_000));
+    let memory = maintenance
+        .propose(
+            &MemoryProposal::new("Planning has become steadier")
+                .with_subject(MemorySubject::Counterpart)
+                .with_kind(MemoryKind::Hypothesis)
+                .with_source_claim(ClaimId::from_raw(1))
+                .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(10)))
+                .with_confidence(MemoryConfidence::Medium)
+                .with_salience_reason("Useful in future planning conversations")
+                .with_basis(MemoryBasis::InterpretiveInference),
+        )
+        .unwrap();
+    let dispute = maintenance
+        .raise_dispute(
+            &MemoryDisputeRequest::new(memory.id(), memory.version(), "A direct exception exists")
+                .with_counter_evidence(EvidenceCitation::new(
+                    EvidenceId::from_raw(2),
+                    "A direct exception",
+                )),
+        )
+        .unwrap();
+    maintenance
+        .review_dispute(
+            &MemoryDisputeReview::retract(dispute.id(), "The exception changes my view")
+                .with_evidence(EvidenceCitation::new(
+                    EvidenceId::from_raw(3),
+                    "The exception defeats the conclusion",
+                )),
+        )
+        .unwrap();
+    let (repository, _) = maintenance.into_parts();
+    repository.close().unwrap();
+
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    assert_eq!(
+        repository
+            .current_memory(memory.id())
+            .unwrap()
+            .unwrap()
+            .status(),
+        MemoryStatus::Retracted
+    );
+    let result = retrieve(
+        &mut repository,
+        &RetrievalQuery::lexical("planning steadier"),
+    )
+    .unwrap();
+    assert!(result.disputed_memories().is_empty());
+    assert!(result.candidates().iter().all(|candidate| {
+        !candidate.channels().contains_long_term_memory()
+            || !matches!(
+                candidate.authority(),
+                AuthoritativeCandidate::Ledger(claim) if claim.id() == ClaimId::from_raw(1)
+            )
+    }));
+}
+
 fn direct_proposal(statement: &str, claim_id: ClaimId, since_millis: i64) -> MemoryProposal {
     MemoryProposal::new(statement)
         .with_subject(MemorySubject::Person)
@@ -162,6 +427,65 @@ fn seed_claim(
             Timestamp::from_millis(i64::try_from(id).unwrap()),
         ))
         .unwrap();
+}
+
+fn seed_evidence(repository: &mut VaultRepository, id: u64, speaker: Speaker, statement: &str) {
+    repository
+        .append_evidence(ConversationEvidence::restore(
+            EvidenceId::from_raw(id),
+            SessionId::new("memory-dispute-persistence"),
+            speaker,
+            statement.to_owned(),
+            Timestamp::from_millis(i64::try_from(id).unwrap()),
+        ))
+        .unwrap();
+}
+
+fn assert_relevant_dispute_pair_and_unrelated_absence(
+    repository: &mut VaultRepository,
+    memory_id: MemoryId,
+) {
+    let related = freeze_working_context(
+        repository,
+        &RetrievalQuery::lexical("planning steadier"),
+        TokenBudget::new(512).unwrap(),
+        Vec::new(),
+        Timestamp::from_millis(3_000),
+    )
+    .unwrap();
+    let pair = related
+        .retrieved()
+        .iter()
+        .find_map(|item| match item {
+            RetrievedContextItem::MemoryDispute(pair) => Some(pair),
+            _ => None,
+        })
+        .expect("the directly relevant dispute must be frozen as one pair");
+    assert_eq!(pair.memory_id(), memory_id.get());
+    assert_eq!(pair.counterpart_view(), "Planning has become steadier");
+    assert_eq!(pair.counterpart_sources().len(), 1);
+    assert_eq!(
+        pair.person_position(),
+        "One exceptional week should not define the pattern"
+    );
+    assert_eq!(pair.person_evidence().len(), 1);
+    assert_eq!(pair.review_evidence().len(), 1);
+    assert_eq!(pair.state(), eam_core::DisputeState::Maintained);
+
+    let unrelated = freeze_working_context(
+        repository,
+        &RetrievalQuery::lexical("holiday recipes"),
+        TokenBudget::new(512).unwrap(),
+        Vec::new(),
+        Timestamp::from_millis(3_001),
+    )
+    .unwrap();
+    assert!(
+        unrelated
+            .retrieved()
+            .iter()
+            .all(|item| !matches!(item, RetrievedContextItem::MemoryDispute(_)))
+    );
 }
 
 fn assert_long_term_claim(repository: &mut VaultRepository, query: &str, expected_claim: ClaimId) {

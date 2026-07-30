@@ -1,11 +1,17 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
-use eam_core::{ApplicableTime, Claim, ClaimId, ClaimOwner, Clock, RepositoryError, Uncertainty};
+use eam_core::{
+    ApplicableTime, Claim, ClaimId, ClaimOwner, Clock, EvidenceCitation, EvidenceId,
+    RepositoryError, Uncertainty,
+};
 
 use crate::{
-    LongTermMemoryRepository, MAX_MEMORY_SOURCES, MAX_MEMORY_TEXT_BYTES, MemoryBasis,
-    MemoryConfidence, MemoryId, MemoryProposal, MemoryStatus, MemorySubject, MemoryTarget,
-    MemoryVersion, ValidatedMemoryProposal,
+    LongTermMemoryRepository, MAX_DISPUTE_EVIDENCE, MAX_MEMORY_SOURCES, MAX_MEMORY_TEXT_BYTES,
+    MemoryBasis, MemoryConfidence, MemoryDispute, MemoryDisputeId, MemoryDisputeOutcome,
+    MemoryDisputeRequest, MemoryDisputeResolution, MemoryDisputeReview,
+    MemoryDisputeReviewDecision, MemoryId, MemoryProposal, MemoryStatus, MemorySubject,
+    MemoryTarget, MemoryVersion, ValidatedMemoryDispute, ValidatedMemoryDisputeReview,
+    ValidatedMemoryProposal,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,11 +52,51 @@ pub enum MemoryProposalRejectionReason {
         actual: u64,
     },
     RevisionChangesSubject,
+    RetractedClaimRequiresNewEvidence(MemoryId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryDisputeRejectionReason {
+    EmptyReason,
+    OversizedReason,
+    MissingCounterEvidence,
+    TooManyCounterEvidence,
+    DuplicateCounterEvidence(EvidenceId),
+    CounterEvidenceNotFound(EvidenceId),
+    EmptyCounterEvidenceQuote(EvidenceId),
+    CounterEvidenceQuoteMismatch(EvidenceId),
+    MemoryNotFound(MemoryId),
+    InvalidExpectedVersion,
+    StaleExpectedVersion { expected: u64, actual: u64 },
+    MemoryNotDisputable(MemoryStatus),
+    OpenDisputeExists(MemoryDisputeId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryDisputeReviewRejectionReason {
+    EmptyRationale,
+    OversizedRationale,
+    MissingEvidence,
+    TooManyEvidence,
+    DuplicateEvidence(EvidenceId),
+    EvidenceNotFound(EvidenceId),
+    EmptyEvidenceQuote(EvidenceId),
+    EvidenceQuoteMismatch(EvidenceId),
+    DisputeNotFound(MemoryDisputeId),
+    DisputeAlreadyResolved(MemoryDisputeOutcome),
+    MemoryNotFound(MemoryId),
+    MemoryNoLongerDisputed(MemoryStatus),
+    RevisionTargetsDifferentMemory,
+    RevisionRequired,
+    RevisionNotAllowed,
+    RevisionDoesNotChangeStatement,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemoryError {
     InvalidProposal(MemoryProposalRejectionReason),
+    InvalidDispute(MemoryDisputeRejectionReason),
+    InvalidReview(MemoryDisputeReviewRejectionReason),
     Repository(RepositoryError),
 }
 
@@ -94,6 +140,42 @@ where
         let formed_at = self.clock.now();
         self.repository
             .append_memory(validated, formed_at)
+            .map_err(MemoryError::from)
+    }
+
+    /// Records a sourced person objection and moves the current memory version
+    /// into explicit dispute without letting the person overwrite it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed rejection for incomplete evidence, stale state, or an
+    /// already-open dispute.
+    pub fn raise_dispute(
+        &mut self,
+        request: &MemoryDisputeRequest,
+    ) -> Result<MemoryDispute, MemoryError> {
+        let validated = validate_dispute(&self.repository, request)?;
+        let raised_at = self.clock.now();
+        self.repository
+            .append_memory_dispute(validated, raised_at)
+            .map_err(MemoryError::from)
+    }
+
+    /// Applies one counterpart-authored review as an atomic maintained,
+    /// retracted, or revised transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed rejection for incomplete review evidence, closed or
+    /// stale disputes, or an invalid revision proposal.
+    pub fn review_dispute(
+        &mut self,
+        review: &MemoryDisputeReview,
+    ) -> Result<MemoryDisputeResolution, MemoryError> {
+        let validated = validate_dispute_review(&self.repository, review)?;
+        let reviewed_at = self.clock.now();
+        self.repository
+            .complete_memory_dispute(validated, reviewed_at)
             .map_err(MemoryError::from)
     }
 
@@ -162,6 +244,19 @@ fn validate_proposal<R: LongTermMemoryRepository>(
         }
         claims.push(claim);
     }
+    for (memory_id, previous_sources) in
+        repository.retracted_memory_sources(proposal.statement())?
+    {
+        if proposal
+            .source_claim_ids()
+            .iter()
+            .all(|source| previous_sources.contains(source))
+        {
+            return Err(MemoryError::InvalidProposal(
+                MemoryProposalRejectionReason::RetractedClaimRequiresNewEvidence(memory_id),
+            ));
+        }
+    }
     validate_basis(
         basis,
         proposal.statement(),
@@ -187,6 +282,222 @@ fn validate_proposal<R: LongTermMemoryRepository>(
         basis,
         initial_status,
     ))
+}
+
+fn validate_dispute<R: LongTermMemoryRepository>(
+    repository: &R,
+    request: &MemoryDisputeRequest,
+) -> Result<ValidatedMemoryDispute, MemoryError> {
+    if request.reason().trim().is_empty() {
+        return Err(MemoryError::InvalidDispute(
+            MemoryDisputeRejectionReason::EmptyReason,
+        ));
+    }
+    if request.reason().len() > MAX_MEMORY_TEXT_BYTES {
+        return Err(MemoryError::InvalidDispute(
+            MemoryDisputeRejectionReason::OversizedReason,
+        ));
+    }
+    validate_dispute_evidence(repository, request.counter_evidence())?;
+    if request.expected_version() == 0 {
+        return Err(MemoryError::InvalidDispute(
+            MemoryDisputeRejectionReason::InvalidExpectedVersion,
+        ));
+    }
+    let memory =
+        repository
+            .current_memory(request.memory_id())?
+            .ok_or(MemoryError::InvalidDispute(
+                MemoryDisputeRejectionReason::MemoryNotFound(request.memory_id()),
+            ))?;
+    if memory.version() != request.expected_version() {
+        return Err(MemoryError::InvalidDispute(
+            MemoryDisputeRejectionReason::StaleExpectedVersion {
+                expected: request.expected_version(),
+                actual: memory.version(),
+            },
+        ));
+    }
+    if !matches!(
+        memory.status(),
+        MemoryStatus::Active | MemoryStatus::Provisional | MemoryStatus::ProvisionalPattern
+    ) {
+        return Err(MemoryError::InvalidDispute(
+            MemoryDisputeRejectionReason::MemoryNotDisputable(memory.status()),
+        ));
+    }
+    if let Some(open) = repository
+        .memory_disputes(memory.id())?
+        .into_iter()
+        .find(|dispute| dispute.outcome() == MemoryDisputeOutcome::Open)
+    {
+        return Err(MemoryError::InvalidDispute(
+            MemoryDisputeRejectionReason::OpenDisputeExists(open.id()),
+        ));
+    }
+    Ok(ValidatedMemoryDispute::new(
+        memory.id(),
+        memory.version(),
+        request.reason().to_owned(),
+        request.counter_evidence().to_vec(),
+    ))
+}
+
+fn validate_dispute_review<R: LongTermMemoryRepository>(
+    repository: &R,
+    review: &MemoryDisputeReview,
+) -> Result<ValidatedMemoryDisputeReview, MemoryError> {
+    if review.rationale().trim().is_empty() {
+        return Err(MemoryError::InvalidReview(
+            MemoryDisputeReviewRejectionReason::EmptyRationale,
+        ));
+    }
+    if review.rationale().len() > MAX_MEMORY_TEXT_BYTES {
+        return Err(MemoryError::InvalidReview(
+            MemoryDisputeReviewRejectionReason::OversizedRationale,
+        ));
+    }
+    validate_review_evidence(repository, review.evidence())?;
+    let dispute =
+        repository
+            .memory_dispute(review.dispute_id())?
+            .ok_or(MemoryError::InvalidReview(
+                MemoryDisputeReviewRejectionReason::DisputeNotFound(review.dispute_id()),
+            ))?;
+    if dispute.outcome() != MemoryDisputeOutcome::Open {
+        return Err(MemoryError::InvalidReview(
+            MemoryDisputeReviewRejectionReason::DisputeAlreadyResolved(dispute.outcome()),
+        ));
+    }
+    let memory =
+        repository
+            .current_memory(dispute.memory_id())?
+            .ok_or(MemoryError::InvalidReview(
+                MemoryDisputeReviewRejectionReason::MemoryNotFound(dispute.memory_id()),
+            ))?;
+    if memory.version() != dispute.memory_version() || memory.status() != MemoryStatus::Disputed {
+        return Err(MemoryError::InvalidReview(
+            MemoryDisputeReviewRejectionReason::MemoryNoLongerDisputed(memory.status()),
+        ));
+    }
+    let (outcome, revision) = match review.decision() {
+        MemoryDisputeReviewDecision::Maintain => (MemoryDisputeOutcome::Maintained, None),
+        MemoryDisputeReviewDecision::Retract => (MemoryDisputeOutcome::Retracted, None),
+        MemoryDisputeReviewDecision::Revise(proposal) => {
+            let MemoryTarget::Revise {
+                memory_id,
+                expected_version,
+            } = proposal.target()
+            else {
+                return Err(MemoryError::InvalidReview(
+                    MemoryDisputeReviewRejectionReason::RevisionRequired,
+                ));
+            };
+            if memory_id != memory.id() || expected_version != memory.version() {
+                return Err(MemoryError::InvalidReview(
+                    MemoryDisputeReviewRejectionReason::RevisionTargetsDifferentMemory,
+                ));
+            }
+            if proposal.statement().trim() == memory.statement().trim() {
+                return Err(MemoryError::InvalidReview(
+                    MemoryDisputeReviewRejectionReason::RevisionDoesNotChangeStatement,
+                ));
+            }
+            (
+                MemoryDisputeOutcome::Revised,
+                Some(validate_proposal(repository, proposal)?),
+            )
+        }
+    };
+    Ok(ValidatedMemoryDisputeReview::new(
+        review.dispute_id(),
+        outcome,
+        review.rationale().to_owned(),
+        review.evidence().to_vec(),
+        revision,
+    ))
+}
+
+fn validate_dispute_evidence<R: LongTermMemoryRepository>(
+    repository: &R,
+    evidence: &[EvidenceCitation],
+) -> Result<(), MemoryError> {
+    if evidence.is_empty() {
+        return Err(MemoryError::InvalidDispute(
+            MemoryDisputeRejectionReason::MissingCounterEvidence,
+        ));
+    }
+    if evidence.len() > MAX_DISPUTE_EVIDENCE {
+        return Err(MemoryError::InvalidDispute(
+            MemoryDisputeRejectionReason::TooManyCounterEvidence,
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for citation in evidence {
+        if !unique.insert(citation.evidence_id()) {
+            return Err(MemoryError::InvalidDispute(
+                MemoryDisputeRejectionReason::DuplicateCounterEvidence(citation.evidence_id()),
+            ));
+        }
+        let stored =
+            repository
+                .evidence(citation.evidence_id())?
+                .ok_or(MemoryError::InvalidDispute(
+                    MemoryDisputeRejectionReason::CounterEvidenceNotFound(citation.evidence_id()),
+                ))?;
+        if citation.quote().trim().is_empty() {
+            return Err(MemoryError::InvalidDispute(
+                MemoryDisputeRejectionReason::EmptyCounterEvidenceQuote(citation.evidence_id()),
+            ));
+        }
+        if !stored.verbatim().contains(citation.quote()) {
+            return Err(MemoryError::InvalidDispute(
+                MemoryDisputeRejectionReason::CounterEvidenceQuoteMismatch(citation.evidence_id()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_evidence<R: LongTermMemoryRepository>(
+    repository: &R,
+    evidence: &[EvidenceCitation],
+) -> Result<(), MemoryError> {
+    if evidence.is_empty() {
+        return Err(MemoryError::InvalidReview(
+            MemoryDisputeReviewRejectionReason::MissingEvidence,
+        ));
+    }
+    if evidence.len() > MAX_DISPUTE_EVIDENCE {
+        return Err(MemoryError::InvalidReview(
+            MemoryDisputeReviewRejectionReason::TooManyEvidence,
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for citation in evidence {
+        if !unique.insert(citation.evidence_id()) {
+            return Err(MemoryError::InvalidReview(
+                MemoryDisputeReviewRejectionReason::DuplicateEvidence(citation.evidence_id()),
+            ));
+        }
+        let stored =
+            repository
+                .evidence(citation.evidence_id())?
+                .ok_or(MemoryError::InvalidReview(
+                    MemoryDisputeReviewRejectionReason::EvidenceNotFound(citation.evidence_id()),
+                ))?;
+        if citation.quote().trim().is_empty() {
+            return Err(MemoryError::InvalidReview(
+                MemoryDisputeReviewRejectionReason::EmptyEvidenceQuote(citation.evidence_id()),
+            ));
+        }
+        if !stored.verbatim().contains(citation.quote()) {
+            return Err(MemoryError::InvalidReview(
+                MemoryDisputeReviewRejectionReason::EvidenceQuoteMismatch(citation.evidence_id()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_text(value: &str, field: MemoryProposalField) -> Result<(), MemoryError> {

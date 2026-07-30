@@ -1,0 +1,14 @@
+{
+  "id": "resp_high_impact_dispute_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"text\":\"我对这个判断仍不完全确定；在据此作出重要决定前，你可以展开查看双方依据。\",\"citations\":[{\"evidence_id\":1,\"quote\":\"只选择这一条\"}],\"operations\":[]}"
+        }
+      ]
+    }
+  ]
+}

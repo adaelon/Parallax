@@ -2,15 +2,15 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 use eam_core::{
     ApplicableTime, ConversationEvidence, FrozenEvidenceBlock, FrozenLedgerClaim,
-    FrozenRetrievalWindow, RetrievalSnapshot, RetrievedContextItem,
+    FrozenMemoryDispute, FrozenRetrievalWindow, RetrievalSnapshot, RetrievedContextItem,
     SourceCurrentness as CoreSourceCurrentness, Timestamp, WorkingContext, WorkingContextError,
 };
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, EMBEDDING_MODEL_VERSION,
-    RETRIEVAL_INDEX_VERSION, RecallHit, RetrievalFailure, RetrievalQuery, RetrievalRepository,
-    SourceCurrentness, retrieve,
+    AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, DisputedMemoryRecall,
+    EMBEDDING_MODEL_VERSION, RETRIEVAL_INDEX_VERSION, RecallHit, RetrievalFailure, RetrievalQuery,
+    RetrievalRepository, SourceCurrentness, retrieve,
 };
 
 pub const DEFAULT_TOKEN_BUDGET: usize = 4_096;
@@ -20,6 +20,7 @@ pub const MAX_TOKEN_BUDGET: usize = 32_768;
 const WINDOW_METADATA_TOKENS: usize = 24;
 const BLOCK_METADATA_TOKENS: usize = 16;
 const CLAIM_METADATA_TOKENS: usize = 24;
+const DISPUTE_METADATA_TOKENS: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenBudget(usize);
@@ -68,6 +69,29 @@ pub fn freeze_working_context<R: RetrievalRepository>(
     let mut items = Vec::new();
     let mut used_tokens = 0_usize;
     let mut selected_refs = BTreeSet::new();
+
+    for dispute in result.disputed_memories() {
+        let cost = estimate_dispute_tokens(dispute);
+        if used_tokens.saturating_add(cost) > budget.get() {
+            continue;
+        }
+        used_tokens += cost;
+        items.push(RetrievedContextItem::MemoryDispute(
+            FrozenMemoryDispute::new(
+                dispute.dispute_id(),
+                dispute.memory_id(),
+                dispute.memory_version(),
+                dispute.counterpart_view().to_owned(),
+                dispute.counterpart_sources().to_vec(),
+                dispute.person_position().to_owned(),
+                dispute.person_evidence().to_vec(),
+                dispute.review_rationale().map(str::to_owned),
+                dispute.review_evidence().to_vec(),
+                dispute.state(),
+                cost,
+            ),
+        ));
+    }
 
     for candidate in result.candidates() {
         if used_tokens >= budget.get() {
@@ -121,9 +145,10 @@ pub fn freeze_working_context<R: RetrievalRepository>(
         used_tokens,
         replay_digest,
     );
-    WorkingContext::from_selected_evidence(selected_conversation, frozen_at)
+    let context = WorkingContext::from_selected_evidence(selected_conversation, frozen_at)
         .with_retrieval(items, snapshot)
-        .map_err(FreezeFailure::WorkingContext)
+        .map_err(FreezeFailure::WorkingContext)?;
+    Ok(context.with_decision_impact(query.decision_impact()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,6 +315,28 @@ fn estimate_claim_tokens(claim: &eam_core::Claim) -> usize {
             .sum::<usize>()
 }
 
+fn estimate_dispute_tokens(dispute: &DisputedMemoryRecall) -> usize {
+    DISPUTE_METADATA_TOKENS
+        + estimate_text_tokens(dispute.counterpart_view())
+        + dispute
+            .counterpart_sources()
+            .iter()
+            .map(estimate_claim_tokens)
+            .sum::<usize>()
+        + estimate_text_tokens(dispute.person_position())
+        + dispute
+            .person_evidence()
+            .iter()
+            .map(|citation| estimate_text_tokens(citation.quote()).saturating_add(4))
+            .sum::<usize>()
+        + dispute.review_rationale().map_or(0, estimate_text_tokens)
+        + dispute
+            .review_evidence()
+            .iter()
+            .map(|citation| estimate_text_tokens(citation.quote()).saturating_add(4))
+            .sum::<usize>()
+}
+
 fn estimate_text_tokens(value: &str) -> usize {
     let mut ascii_bytes = 0_usize;
     let mut non_ascii = 0_usize;
@@ -323,6 +370,10 @@ fn replay_digest(
     hasher.update([match query.source_scope() {
         crate::SourceScope::Current => 0,
         crate::SourceScope::Historical => 1,
+    }]);
+    hasher.update([match query.decision_impact() {
+        eam_core::DecisionImpact::Ordinary => 0,
+        eam_core::DecisionImpact::High => 1,
     }]);
     hash_usize(&mut hasher, query.limit());
     for entity in query.entities() {
@@ -366,6 +417,35 @@ fn replay_digest(
                     hash_u64(&mut hasher, citation.evidence_id().get());
                     hash_bytes(&mut hasher, citation.quote().as_bytes());
                 }
+            }
+            RetrievedContextItem::MemoryDispute(dispute) => {
+                hasher.update([2]);
+                hash_u64(&mut hasher, dispute.dispute_id());
+                hash_u64(&mut hasher, dispute.memory_id());
+                hash_u64(&mut hasher, dispute.memory_version());
+                hash_bytes(&mut hasher, dispute.counterpart_view().as_bytes());
+                for claim in dispute.counterpart_sources() {
+                    hash_u64(&mut hasher, claim.id().get());
+                    hash_bytes(&mut hasher, claim.statement().as_bytes());
+                    for citation in claim.support() {
+                        hash_u64(&mut hasher, citation.evidence_id().get());
+                        hash_bytes(&mut hasher, citation.quote().as_bytes());
+                    }
+                }
+                hash_bytes(&mut hasher, dispute.person_position().as_bytes());
+                for citation in dispute.person_evidence() {
+                    hash_u64(&mut hasher, citation.evidence_id().get());
+                    hash_bytes(&mut hasher, citation.quote().as_bytes());
+                }
+                hash_optional_bytes(&mut hasher, dispute.review_rationale().map(str::as_bytes));
+                for citation in dispute.review_evidence() {
+                    hash_u64(&mut hasher, citation.evidence_id().get());
+                    hash_bytes(&mut hasher, citation.quote().as_bytes());
+                }
+                hasher.update([match dispute.state() {
+                    eam_core::DisputeState::Open => 0,
+                    eam_core::DisputeState::Maintained => 1,
+                }]);
             }
         }
     }

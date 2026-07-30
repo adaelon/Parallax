@@ -40,7 +40,7 @@ flowchart LR
             Vault[Evidence Vault<br/>SQLCipher + 加密对象库]
             Ledgers[时间化三账本]
             Retrieval[检索领域契约与编排<br/>crates/retrieval]
-            Indexes[可重建检索、理解投影与记忆路由<br/>SQLCipher schema v13+]
+            Indexes[可重建检索、理解投影与记忆路由<br/>SQLCipher schema v14+]
             Understanding[选择性深度理解投影]
             SelfBundle[Self Bundle]
             Memory[长期记忆维护器]
@@ -273,6 +273,8 @@ S15 将 `self.db` schema 升至 v12：`understanding_projections` 保存 `eam-un
 
 S16 将 `self.db` schema 升至 v13：`long_term_memories/versions` 保存稳定记忆 ID 与不可变后继版本，来源只引用三账本 Claim；`long_term_memory_state_events` 追加 `ACTIVE/PROVISIONAL/PROVISIONAL_PATTERN/SUPERSEDED` 状态，`long_term_memory_terms` 只为当前版本提供可重建路由。显式修订在同一事务追加前版 `SUPERSEDED` 事件和完整后继版本；账本入账与理解投影均无自动创建记忆的数据库路径。
 
+S17 将 `self.db` schema 升至 v14：状态事件扩展 `DISPUTED/RETRACTED`；`memory_disputes` 保存本人理由、目标记忆版本、`OPEN/RETRACTED/REVISED/MAINTAINED` 复核结果和可选后继版本，两个有序子表分别保存本人反证与第二自我复核依据。提出异议在一个事务内追加争议和 `DISPUTED`；撤回、保持或修订在一个事务内提交复核、状态事件及可选后继版本。`memory_dispute_terms` 只作直接相关路由，权威双方内容仍回读记忆来源 Claim 与逐字对话证据。
+
 ### 4.2 逻辑数据模型
 
 以下是架构契约，不是最终数据库模式：
@@ -399,7 +401,15 @@ PatternMaturityProposal {
 MemoryDispute {
   memory_id, raised_by = person,
   reason, counter_evidence_refs[], raised_at,
-  outcome = OPEN | RETRACTED | REVISED | MAINTAINED
+  outcome = OPEN | RETRACTED | REVISED | MAINTAINED,
+  review?: { rationale, evidence_refs[], reviewed_at },
+  revised_version?
+}
+
+WorkingContextDisclosure {
+  decision_impact = ORDINARY | HIGH,
+  disputed_memory = paired(counterpart_view, person_objection,
+                             both_evidence, OPEN | MAINTAINED)
 }
 
 IdentityStateVersion {
@@ -809,7 +819,9 @@ MemoryReviewRequested
 
 深度理解投影与长期记忆是两个独立层：前者是可重建的证据结构，后者是第二自我选择跨任务保留的认识。投影不能绕过记忆写入策略直接成为长期信念。
 
-S16 当前实现由 `crates/memory` 固定不完整提议表示、三账本来源校验、可信度上限、直接证据严格条件和显式版本目标。`MemoryMaintenance::propose` 是唯一领域入口：直接证据写 `ACTIVE`，解释性推断写 `PROVISIONAL`，模式候选只写 `PROVISIONAL_PATTERN`；Vault 在 schema v13 中原子追加版本与状态事件。S17 的争议状态、S18 的纠错传播和 S27 的三事件门槛/成熟提议仍不在本片入口内。
+S16 当前实现由 `crates/memory` 固定不完整提议表示、三账本来源校验、可信度上限、直接证据严格条件和显式版本目标。`MemoryMaintenance::propose` 是唯一领域入口：直接证据写 `ACTIVE`，解释性推断写 `PROVISIONAL`，模式候选只写 `PROVISIONAL_PATTERN`；Vault 从 schema v13 起原子追加版本与状态事件。S18 的纠错传播和 S27 的三事件门槛/成熟提议仍不在本片入口内。
+
+S17 在长期记忆普通通道之外增加 `recall_disputed_memories`：查询必须有文本或实体词，并直接命中当前记忆、本人异议或复核依据；适用时间仍是交集门禁。Vault 只返回最新且状态为 `DISPUTED` 的 `OPEN/MAINTAINED` 争议，并在可信边界内回读记忆来源 Claim、本人逐字反证和第二自我复核依据。Context Builder 优先把整对作为单个预算项冻结；任何一方缺失、状态损坏或预算不足都不返回半对。`DecisionImpact` 同时进入 replay digest，确保普通与高影响上下文不可误当成同一快照。
 
 ### 5.7 纠错与遗忘
 
@@ -840,6 +852,8 @@ S16 当前实现由 `crates/memory` 固定不完整提议表示、三账本来�
 ```
 
 恢复流程必须在重新开放检索前应用最新删除意图，避免旧备份复活已经遗忘的上下文。首版的遗忘语义是从活动保险库及可用派生数据中移除，不声称能够从 SSD 未分配块或用户保留的历史备份中完成法证级物理擦除。
+
+S17 当前实现由 `MemoryMaintenance::raise_dispute/review_dispute` 固定本人只能提出带逐字反证的异议，复核结果只能由第二自我提交。`OPEN -> MAINTAINED` 保持 `DISPUTED`；`OPEN -> RETRACTED` 停止全部召回，且相同陈述没有新增来源 Claim 时不得重提；`OPEN -> REVISED` 原子取代争议版本。运行时只接收完整争议对：普通模式要求自然保留实质分歧且禁止内部状态名或固定模板，高影响模式要求主动说明不确定性并至少引用一个争议依据入口，否则响应失败关闭。
 
 ### 5.8 备份与恢复
 
@@ -962,8 +976,8 @@ self.db + objects + deletion state
 | 约定范围、生效时间与显式持续有效 | [ADR-0033：共同约定签署明确边界](adr/0033-shared-agreements-sign-explicit-scope-and-validity.md) |
 | 约定冲突、显式取代与历史保留 | [ADR-0034：冲突约定必须显式取代](adr/0034-conflicting-agreements-require-explicit-supersession.md) |
 | `crates/memory`、schema v13 记忆版本、账本来源召回与长期记忆晋升 | [ADR-0035：长期记忆由第二自我显式提议](adr/0035-counterpart-explicitly-proposes-long-term-memory.md) |
-| 本人质疑、第二自我复核与争议判断 | [ADR-0036：记忆否定采用说服与争议](adr/0036-memory-challenges-require-persuasion.md) |
-| 争议召回、自然表达与高影响披露 | [ADR-0037：争议记忆采用自然分层披露](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) |
+| `crates/memory`、schema v14 争议状态、本人质疑与第二自我复核 | [ADR-0036：记忆否定采用说服与争议](adr/0036-memory-challenges-require-persuasion.md) |
+| `crates/retrieval`、运行时出口、争议成对召回、自然表达与高影响披露 | [ADR-0037：争议记忆采用自然分层披露](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) |
 | 共同经历定义、关系事件边界与普通互动 | [ADR-0038：共同经历采用狭义关系事件边界](adr/0038-shared-experience-uses-narrow-relational-event-boundary.md) |
 | 身份自我塑造、版本演化与反思使命 | [ADR-0039：身份自主演化受宪法反思使命约束](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) |
 | 主动反思、自然时机与安全打断 | [ADR-0040：第二自我采用可延后的主动反思邀请](adr/0040-counterpart-uses-deferrable-reflection-invitations.md) |
@@ -1467,3 +1481,40 @@ explicit revision(memory_id, expected_version)
 ```
 
 直接证据必须是一个无不确定性的同账本 Claim，提议陈述和适用时间与来源完全一致且可信度为高；否则不能获得 `ACTIVE`。解释性推断即使可信度较高也保持 `PROVISIONAL`。模式候选在 S16 只获得独立状态，不实现 S27 的三事件资格或 `SUPPORTED_COUNTERPART_VIEW` 成熟路径；账本和 S15 投影没有调用 `append_memory` 的自动入口。
+
+### 9.17 S17 记忆争议与自然分层披露当前实现边界
+
+```text
+crates/memory/src/
+  domain.rs                         # MemoryDispute、复核结果与 DISPUTED/RETRACTED
+  service.rs                        # 逐字反证、版本、复核与撤回后新增来源门禁
+  ports.rs                          # 原子争议/复核与撤回来源查询契约
+crates/vault/src/
+  schema.rs                         # schema v14 争议、双方依据、结果与路由词
+  repository.rs                     # 跨重启状态机/修订关联、直接相关配对和撤回关闭
+crates/retrieval/src/
+  lib.rs / context.rs               # 独立争议通道、不可拆分冻结与影响级别 replay
+crates/core/src/domain.rs            # FrozenMemoryDispute 与 DecisionImpact
+crates/runtime-gateway/src/adapter.rs # 自然/高影响策略、最小出口与依据入口门禁
+```
+
+```text
+person MemoryDispute(reason, counter_evidence)
+  -> validate exact retained quotes + current memory version
+  -> append dispute + DISPUTED atomically
+  -> counterpart review(rationale, evidence)
+       -> MAINTAINED: remain DISPUTED
+       -> RETRACTED: stop all recall; same claim needs a new Claim source
+       -> REVISED: SUPERSEDED old version + append complete successor
+
+retrieve(query with lexical/entity intent)
+  -> direct term match only
+  -> load counterpart view + source Claims
+  -> load person objection + exact counter evidence
+  -> load review rationale/evidence when maintained
+  -> freeze one indivisible MemoryDispute item
+  -> ordinary: natural material disagreement, no state narration/template
+  -> high impact: proactive uncertainty + cited evidence entry or fail closed
+```
+
+S17 不实现 S18 的一般事实纠错传播、S19 遗忘删除或 S27 模式成熟/强反例 `WEAKENED`；`DecisionImpact` 由可信调用方显式标注，不让模型自行把普通建议升级或降级以规避披露。

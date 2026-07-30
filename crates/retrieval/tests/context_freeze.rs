@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, convert::Infallible};
 
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, EvidenceCitation, EvidenceId,
-    RetrievedContextItem, SessionId, Speaker, Timestamp,
+    ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, DecisionImpact,
+    EvidenceCitation, EvidenceId, RetrievedContextItem, SessionId, Speaker, Timestamp,
 };
 use eam_ingestion::{
     EvidenceBlock, EvidenceBlockId, EvidenceBlockMetadata, EvidenceBlockView, ExtractionRevisionId,
@@ -150,6 +150,33 @@ fn one_oversized_authoritative_block_is_skipped_without_truncation() {
 
     assert!(context.retrieved().is_empty());
     assert_eq!(context.retrieval_snapshot().unwrap().used_tokens(), 0);
+}
+
+#[test]
+fn high_impact_is_frozen_and_changes_the_replay_contract() {
+    let ordinary = freeze_working_context(
+        &mut fixture_repository(),
+        &RetrievalQuery::lexical("coordinating Aurora"),
+        TokenBudget::new(512).unwrap(),
+        selected_conversation(),
+        Timestamp::from_millis(500),
+    )
+    .unwrap();
+    let high = freeze_working_context(
+        &mut fixture_repository(),
+        &RetrievalQuery::lexical("coordinating Aurora").with_decision_impact(DecisionImpact::High),
+        TokenBudget::new(512).unwrap(),
+        selected_conversation(),
+        Timestamp::from_millis(500),
+    )
+    .unwrap();
+
+    assert_eq!(ordinary.decision_impact(), DecisionImpact::Ordinary);
+    assert_eq!(high.decision_impact(), DecisionImpact::High);
+    assert_ne!(
+        ordinary.retrieval_snapshot().unwrap().replay_digest(),
+        high.retrieval_snapshot().unwrap().replay_digest()
+    );
 }
 
 fn fixture_repository() -> FixtureRepository {

@@ -134,6 +134,7 @@ impl OutboundDisclosureRecord {
 pub enum OutboundContextSource {
     EvidenceBlock { evidence_id: u64, block_id: u64 },
     LedgerClaim { claim_id: ClaimId },
+    MemoryDispute { memory_id: u64, dispute_id: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

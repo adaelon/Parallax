@@ -11,12 +11,16 @@ mod ports;
 mod service;
 
 pub use domain::{
-    MAX_MEMORY_SOURCES, MAX_MEMORY_TEXT_BYTES, MemoryBasis, MemoryConfidence, MemoryId, MemoryKind,
-    MemoryProposal, MemoryStatus, MemorySubject, MemoryTarget, MemoryVersion,
+    MAX_DISPUTE_EVIDENCE, MAX_MEMORY_SOURCES, MAX_MEMORY_TEXT_BYTES, MemoryBasis, MemoryConfidence,
+    MemoryDispute, MemoryDisputeId, MemoryDisputeOutcome, MemoryDisputeRequest,
+    MemoryDisputeResolution, MemoryDisputeReview, MemoryDisputeReviewDecision,
+    MemoryDisputeReviewRecord, MemoryId, MemoryKind, MemoryProposal, MemoryStatus, MemorySubject,
+    MemoryTarget, MemoryVersion, ValidatedMemoryDispute, ValidatedMemoryDisputeReview,
     ValidatedMemoryProposal,
 };
 pub use in_memory::InMemoryLongTermMemoryRepository;
 pub use ports::LongTermMemoryRepository;
 pub use service::{
-    MemoryError, MemoryMaintenance, MemoryProposalField, MemoryProposalRejectionReason,
+    MemoryDisputeRejectionReason, MemoryDisputeReviewRejectionReason, MemoryError,
+    MemoryMaintenance, MemoryProposalField, MemoryProposalRejectionReason,
 };

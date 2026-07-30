@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 13;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 14;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -883,6 +883,87 @@ CREATE INDEX long_term_memory_sources_claim
     ON long_term_memory_sources(claim_id);
 ";
 
+const MIGRATION_14: &str = r"
+ALTER TABLE long_term_memory_state_events
+    RENAME TO long_term_memory_state_events_v13;
+
+CREATE TABLE long_term_memory_state_events (
+    memory_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    status INTEGER NOT NULL CHECK (status BETWEEN 0 AND 5),
+    occurred_at INTEGER NOT NULL,
+    PRIMARY KEY (memory_id, version, ordinal),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE CASCADE
+) STRICT;
+
+INSERT INTO long_term_memory_state_events
+    (memory_id, version, ordinal, status, occurred_at)
+SELECT memory_id, version, ordinal, status, occurred_at
+FROM long_term_memory_state_events_v13;
+
+DROP TABLE long_term_memory_state_events_v13;
+
+CREATE TABLE memory_disputes (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    memory_id INTEGER NOT NULL,
+    memory_version INTEGER NOT NULL CHECK (memory_version > 0),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    raised_at INTEGER NOT NULL,
+    outcome INTEGER NOT NULL CHECK (outcome BETWEEN 0 AND 3),
+    reviewed_at INTEGER,
+    review_rationale TEXT,
+    revised_version INTEGER,
+    FOREIGN KEY (memory_id, memory_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    FOREIGN KEY (memory_id, revised_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    CHECK (
+        (outcome = 0 AND reviewed_at IS NULL AND review_rationale IS NULL
+                     AND revised_version IS NULL)
+        OR
+        (outcome BETWEEN 1 AND 3 AND reviewed_at IS NOT NULL
+                                 AND length(trim(review_rationale)) > 0)
+    ),
+    CHECK (
+        (outcome = 2 AND revised_version IS NOT NULL)
+        OR
+        (outcome <> 2 AND revised_version IS NULL)
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX one_open_memory_dispute
+    ON memory_disputes(memory_id) WHERE outcome = 0;
+
+CREATE TABLE memory_dispute_counter_evidence (
+    dispute_id INTEGER NOT NULL REFERENCES memory_disputes(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    evidence_id INTEGER NOT NULL REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    quote TEXT NOT NULL CHECK (length(trim(quote)) > 0),
+    PRIMARY KEY (dispute_id, ordinal),
+    UNIQUE (dispute_id, evidence_id)
+) STRICT;
+
+CREATE TABLE memory_dispute_review_evidence (
+    dispute_id INTEGER NOT NULL REFERENCES memory_disputes(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    evidence_id INTEGER NOT NULL REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    quote TEXT NOT NULL CHECK (length(trim(quote)) > 0),
+    PRIMARY KEY (dispute_id, ordinal),
+    UNIQUE (dispute_id, evidence_id)
+) STRICT;
+
+CREATE TABLE memory_dispute_terms (
+    dispute_id INTEGER NOT NULL REFERENCES memory_disputes(id) ON DELETE CASCADE,
+    term TEXT NOT NULL CHECK (length(term) > 0),
+    PRIMARY KEY (dispute_id, term)
+) STRICT;
+
+CREATE INDEX memory_dispute_terms_lookup ON memory_dispute_terms(term);
+CREATE INDEX memory_disputes_memory ON memory_disputes(memory_id, memory_version);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -913,6 +994,7 @@ where
             11 => transaction.execute_batch(MIGRATION_11)?,
             12 => transaction.execute_batch(MIGRATION_12)?,
             13 => transaction.execute_batch(MIGRATION_13)?,
+            14 => transaction.execute_batch(MIGRATION_14)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1520,6 +1602,58 @@ mod tests {
         let table_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'long_term_memories'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_dispute_migration_keeps_memory_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+            MIGRATION_12,
+            MIGRATION_13,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 13).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 14 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(14))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 13);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'memory_disputes'",
                 [],
                 |row| row.get(0),
             )

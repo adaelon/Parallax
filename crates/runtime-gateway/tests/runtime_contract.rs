@@ -7,10 +7,11 @@ use std::{
 };
 
 use eam_core::{
-    ClaimOwner, CoreError, FrozenEvidenceBlock, FrozenRetrievalWindow, InMemoryRepository,
-    IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification, RetrievalSnapshot,
-    RetrievedContextItem, RuntimeErrorKind, SessionId, SourceCurrentness,
-    StructuredOperationRejectionReason, Timestamp,
+    ApplicableTime, Claim, ClaimId, ClaimOwner, CoreError, DecisionImpact, DisputeState,
+    EvidenceCitation, EvidenceId, FrozenEvidenceBlock, FrozenMemoryDispute, FrozenRetrievalWindow,
+    InMemoryRepository, IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification,
+    RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SessionId, SourceCurrentness,
+    StructuredOperationRejectionReason, Timestamp, Uncertainty,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL,
@@ -25,6 +26,8 @@ const CLASSIFICATION_RESPONSE: &str = include_str!("fixtures/classification-resp
 const TURN_RESPONSE: &str = include_str!("fixtures/turn-response.json");
 const UNSUPPORTED_OPERATION_RESPONSE: &str =
     include_str!("fixtures/unsupported-operation-response.json");
+const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
+    include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,6 +384,78 @@ fn response_payload_and_disclosure_contain_only_the_frozen_retrieval_result() {
 }
 
 #[test]
+fn ordinary_dispute_context_preserves_the_pair_without_a_fixed_disclosure_template() {
+    let runtime = run_disputed_contract(DecisionImpact::Ordinary, TURN_RESPONSE).unwrap();
+    let disclosure = runtime.disclosures().last().unwrap();
+    let request: Value = serde_json::from_str(disclosure.request_json()).unwrap();
+    let instructions = request["instructions"].as_str().unwrap();
+    assert!(instructions.contains("do not narrate internal state names"));
+    assert!(instructions.contains("do not") && instructions.contains("fixed disclosure template"));
+
+    let input: Value = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
+    assert_eq!(input["working_context"]["decision_impact"], "ordinary");
+    assert_eq!(
+        input["working_context"]["disclosure_policy"],
+        "natural_material_disagreement"
+    );
+    let pair = &input["working_context"]["retrieved"][0];
+    assert_eq!(pair["kind"], "memory_dispute");
+    assert_eq!(pair["counterpart_view"], "Planning has become steadier");
+    assert_eq!(
+        pair["person_position"],
+        "One exceptional week should not define the pattern"
+    );
+    assert_eq!(pair["state"], "maintained");
+    assert_eq!(pair["counterpart_sources"].as_array().unwrap().len(), 1);
+    assert_eq!(pair["person_evidence"].as_array().unwrap().len(), 1);
+    assert!(
+        disclosure
+            .retrieved_sources()
+            .contains(&OutboundContextSource::MemoryDispute {
+                memory_id: 41,
+                dispute_id: 51,
+            })
+    );
+    assert!(
+        disclosure
+            .retrieved_sources()
+            .contains(&OutboundContextSource::LedgerClaim {
+                claim_id: ClaimId::from_raw(61),
+            })
+    );
+}
+
+#[test]
+fn high_impact_dispute_requires_proactive_uncertainty_with_an_evidence_entry() {
+    let runtime =
+        run_disputed_contract(DecisionImpact::High, HIGH_IMPACT_DISPUTE_RESPONSE).unwrap();
+    let request: Value =
+        serde_json::from_str(runtime.disclosures().last().unwrap().request_json()).unwrap();
+    assert!(
+        request["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("naturally and proactively explain material uncertainty")
+    );
+    let input: Value = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
+    assert_eq!(input["working_context"]["decision_impact"], "high");
+    assert_eq!(
+        input["working_context"]["disclosure_policy"],
+        "proactive_uncertainty_with_evidence_entry"
+    );
+
+    let Err(error) = run_disputed_contract(DecisionImpact::High, UNSUPPORTED_OPERATION_RESPONSE)
+    else {
+        panic!("high-impact disputed output without a cited entry point must fail closed");
+    };
+    assert!(matches!(
+        error,
+        CoreError::Runtime(ref runtime_error)
+            if runtime_error.kind() == RuntimeErrorKind::InvalidResponse
+    ));
+}
+
+#[test]
 fn core_rejects_an_operation_outside_the_structured_whitelist() {
     let runtime = cloud_runtime([
         Ok(CLASSIFICATION_RESPONSE),
@@ -473,6 +548,68 @@ fn assert_retryable_error_degrades_to_local(error: TransportError) {
         core.runtime().fallback().disclosures()[0].target(),
         RuntimeTargetKind::Local
     );
+}
+
+fn run_disputed_contract(
+    impact: DecisionImpact,
+    response: &'static str,
+) -> Result<OpenAiResponsesRuntime<ScriptedTransport>, CoreError> {
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(response),
+    ]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(7_000),
+    );
+    let (selected, _) = core
+        .record_person_turn(SessionId::new("dispute-source"), "只选择这一条")
+        .unwrap();
+    let source = Claim::restore(
+        ClaimId::from_raw(61),
+        ClaimOwner::Counterpart,
+        "Planning has become steadier".to_owned(),
+        vec![EvidenceCitation::new(
+            EvidenceId::from_raw(1),
+            "只选择这一条",
+        )],
+        Some(Uncertainty::Medium),
+        ApplicableTime::Since(Timestamp::from_millis(10)),
+        Timestamp::from_millis(20),
+    );
+    let dispute = FrozenMemoryDispute::new(
+        51,
+        41,
+        1,
+        "Planning has become steadier".to_owned(),
+        vec![source],
+        "One exceptional week should not define the pattern".to_owned(),
+        vec![EvidenceCitation::new(
+            EvidenceId::from_raw(1),
+            "只选择这一条",
+        )],
+        Some("The longer sequence remains persuasive".to_owned()),
+        vec![EvidenceCitation::new(
+            EvidenceId::from_raw(1),
+            "只选择这一条",
+        )],
+        DisputeState::Maintained,
+        96,
+    );
+    let context = core
+        .freeze_working_context(&[selected])
+        .unwrap()
+        .with_retrieval(
+            vec![RetrievedContextItem::MemoryDispute(dispute)],
+            RetrievalSnapshot::new("eam-retrieval-v2", "model-v1", 128, 96, [7; 32]),
+        )
+        .unwrap()
+        .with_decision_impact(impact);
+    core.run_counterpart_turn(SessionId::new("chat"), "请回答", context)?;
+    let (_, runtime, _) = core.into_parts();
+    Ok(runtime)
 }
 
 #[test]

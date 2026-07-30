@@ -1,7 +1,8 @@
-use eam_core::{ApplicableTime, ClaimId, Timestamp};
+use eam_core::{ApplicableTime, ClaimId, EvidenceCitation, Timestamp};
 
 pub const MAX_MEMORY_SOURCES: usize = 64;
 pub const MAX_MEMORY_TEXT_BYTES: usize = 16 * 1_024;
+pub const MAX_DISPUTE_EVIDENCE: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryId(u64);
@@ -59,7 +60,442 @@ pub enum MemoryStatus {
     Active,
     Provisional,
     ProvisionalPattern,
+    Disputed,
     Superseded,
+    Retracted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MemoryDisputeId(u64);
+
+impl MemoryDisputeId {
+    /// Restores a positive identifier supplied by a trusted repository.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 {
+            return None;
+        }
+        Some(Self(value))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryDisputeOutcome {
+    Open,
+    Retracted,
+    Revised,
+    Maintained,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDisputeRequest {
+    memory_id: MemoryId,
+    expected_version: u64,
+    reason: String,
+    counter_evidence: Vec<EvidenceCitation>,
+}
+
+impl MemoryDisputeRequest {
+    #[must_use]
+    pub fn new(memory_id: MemoryId, expected_version: u64, reason: impl Into<String>) -> Self {
+        Self {
+            memory_id,
+            expected_version,
+            reason: reason.into(),
+            counter_evidence: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_counter_evidence(mut self, evidence: EvidenceCitation) -> Self {
+        self.counter_evidence.push(evidence);
+        self
+    }
+
+    #[must_use]
+    pub fn with_counter_evidence_all(
+        mut self,
+        evidence: impl IntoIterator<Item = EvidenceCitation>,
+    ) -> Self {
+        self.counter_evidence.extend(evidence);
+        self
+    }
+
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn expected_version(&self) -> u64 {
+        self.expected_version
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    #[must_use]
+    pub fn counter_evidence(&self) -> &[EvidenceCitation] {
+        &self.counter_evidence
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryDisputeReviewDecision {
+    Retract,
+    Revise(MemoryProposal),
+    Maintain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDisputeReview {
+    dispute_id: MemoryDisputeId,
+    rationale: String,
+    evidence: Vec<EvidenceCitation>,
+    decision: MemoryDisputeReviewDecision,
+}
+
+impl MemoryDisputeReview {
+    #[must_use]
+    pub fn maintain(dispute_id: MemoryDisputeId, rationale: impl Into<String>) -> Self {
+        Self {
+            dispute_id,
+            rationale: rationale.into(),
+            evidence: Vec::new(),
+            decision: MemoryDisputeReviewDecision::Maintain,
+        }
+    }
+
+    #[must_use]
+    pub fn retract(dispute_id: MemoryDisputeId, rationale: impl Into<String>) -> Self {
+        Self {
+            dispute_id,
+            rationale: rationale.into(),
+            evidence: Vec::new(),
+            decision: MemoryDisputeReviewDecision::Retract,
+        }
+    }
+
+    #[must_use]
+    pub fn revise(
+        dispute_id: MemoryDisputeId,
+        rationale: impl Into<String>,
+        proposal: MemoryProposal,
+    ) -> Self {
+        Self {
+            dispute_id,
+            rationale: rationale.into(),
+            evidence: Vec::new(),
+            decision: MemoryDisputeReviewDecision::Revise(proposal),
+        }
+    }
+
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: EvidenceCitation) -> Self {
+        self.evidence.push(evidence);
+        self
+    }
+
+    #[must_use]
+    pub fn with_evidence_all(
+        mut self,
+        evidence: impl IntoIterator<Item = EvidenceCitation>,
+    ) -> Self {
+        self.evidence.extend(evidence);
+        self
+    }
+
+    #[must_use]
+    pub const fn dispute_id(&self) -> MemoryDisputeId {
+        self.dispute_id
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &str {
+        &self.rationale
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &[EvidenceCitation] {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub const fn decision(&self) -> &MemoryDisputeReviewDecision {
+        &self.decision
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedMemoryDispute {
+    memory_id: MemoryId,
+    memory_version: u64,
+    reason: String,
+    counter_evidence: Vec<EvidenceCitation>,
+}
+
+impl ValidatedMemoryDispute {
+    pub(crate) const fn new(
+        memory_id: MemoryId,
+        memory_version: u64,
+        reason: String,
+        counter_evidence: Vec<EvidenceCitation>,
+    ) -> Self {
+        Self {
+            memory_id,
+            memory_version,
+            reason,
+            counter_evidence,
+        }
+    }
+
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn memory_version(&self) -> u64 {
+        self.memory_version
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    #[must_use]
+    pub fn counter_evidence(&self) -> &[EvidenceCitation] {
+        &self.counter_evidence
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedMemoryDisputeReview {
+    dispute_id: MemoryDisputeId,
+    outcome: MemoryDisputeOutcome,
+    rationale: String,
+    evidence: Vec<EvidenceCitation>,
+    revision: Option<ValidatedMemoryProposal>,
+}
+
+impl ValidatedMemoryDisputeReview {
+    pub(crate) const fn new(
+        dispute_id: MemoryDisputeId,
+        outcome: MemoryDisputeOutcome,
+        rationale: String,
+        evidence: Vec<EvidenceCitation>,
+        revision: Option<ValidatedMemoryProposal>,
+    ) -> Self {
+        Self {
+            dispute_id,
+            outcome,
+            rationale,
+            evidence,
+            revision,
+        }
+    }
+
+    #[must_use]
+    pub const fn dispute_id(&self) -> MemoryDisputeId {
+        self.dispute_id
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> MemoryDisputeOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &str {
+        &self.rationale
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &[EvidenceCitation] {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Option<&ValidatedMemoryProposal> {
+        self.revision.as_ref()
+    }
+
+    #[must_use]
+    pub fn into_revision(self) -> Option<ValidatedMemoryProposal> {
+        self.revision
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDisputeReviewRecord {
+    outcome: MemoryDisputeOutcome,
+    rationale: String,
+    evidence: Vec<EvidenceCitation>,
+    reviewed_at: Timestamp,
+}
+
+impl MemoryDisputeReviewRecord {
+    #[must_use]
+    pub const fn restore(
+        outcome: MemoryDisputeOutcome,
+        rationale: String,
+        evidence: Vec<EvidenceCitation>,
+        reviewed_at: Timestamp,
+    ) -> Self {
+        Self {
+            outcome,
+            rationale,
+            evidence,
+            reviewed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> MemoryDisputeOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &str {
+        &self.rationale
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &[EvidenceCitation] {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub const fn reviewed_at(&self) -> Timestamp {
+        self.reviewed_at
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDispute {
+    id: MemoryDisputeId,
+    memory_id: MemoryId,
+    memory_version: u64,
+    reason: String,
+    counter_evidence: Vec<EvidenceCitation>,
+    raised_at: Timestamp,
+    outcome: MemoryDisputeOutcome,
+    review: Option<MemoryDisputeReviewRecord>,
+    revised_version: Option<u64>,
+}
+
+impl MemoryDispute {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn restore(
+        id: MemoryDisputeId,
+        memory_id: MemoryId,
+        memory_version: u64,
+        reason: String,
+        counter_evidence: Vec<EvidenceCitation>,
+        raised_at: Timestamp,
+        outcome: MemoryDisputeOutcome,
+        review: Option<MemoryDisputeReviewRecord>,
+        revised_version: Option<u64>,
+    ) -> Self {
+        Self {
+            id,
+            memory_id,
+            memory_version,
+            reason,
+            counter_evidence,
+            raised_at,
+            outcome,
+            review,
+            revised_version,
+        }
+    }
+
+    pub(crate) fn set_review(
+        &mut self,
+        review: MemoryDisputeReviewRecord,
+        revised_version: Option<u64>,
+    ) {
+        self.outcome = review.outcome();
+        self.review = Some(review);
+        self.revised_version = revised_version;
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> MemoryDisputeId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn memory_version(&self) -> u64 {
+        self.memory_version
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    #[must_use]
+    pub fn counter_evidence(&self) -> &[EvidenceCitation] {
+        &self.counter_evidence
+    }
+
+    #[must_use]
+    pub const fn raised_at(&self) -> Timestamp {
+        self.raised_at
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> MemoryDisputeOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn review(&self) -> Option<&MemoryDisputeReviewRecord> {
+        self.review.as_ref()
+    }
+
+    #[must_use]
+    pub const fn revised_version(&self) -> Option<u64> {
+        self.revised_version
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDisputeResolution {
+    dispute: MemoryDispute,
+    memory: MemoryVersion,
+}
+
+impl MemoryDisputeResolution {
+    #[must_use]
+    pub const fn new(dispute: MemoryDispute, memory: MemoryVersion) -> Self {
+        Self { dispute, memory }
+    }
+
+    #[must_use]
+    pub const fn dispute(&self) -> &MemoryDispute {
+        &self.dispute
+    }
+
+    #[must_use]
+    pub const fn memory(&self) -> &MemoryVersion {
+        &self.memory
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
