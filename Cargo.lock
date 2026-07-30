@@ -841,6 +841,7 @@ dependencies = [
  "core",
  "desktop-host",
  "ingestion",
+ "retrieval",
  "runtime-gateway",
  "serde",
  "tauri",
@@ -3245,7 +3246,9 @@ name = "retrieval"
 version = "0.1.0"
 dependencies = [
  "core",
+ "eam-markdown",
  "ingestion",
+ "sha2 0.11.0",
 ]
 
 [[package]]

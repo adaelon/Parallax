@@ -30,9 +30,10 @@ use eam_ingestion::{
 };
 use eam_markdown::{MarkdownBlockKind, MarkdownRelationKind, ParseResource, ParsedMarkdownV1};
 use eam_retrieval::{
-    AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, IndexBuildReceipt,
-    IndexDisposition, RETRIEVAL_INDEX_VERSION, RecallChannels, RecallHit, RetrievalQuery,
-    RetrievalRepository, SourceCurrentness, SourceScope, search_terms,
+    AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, EMBEDDING_MODEL_VERSION,
+    IndexBuildReceipt, IndexDisposition, RETRIEVAL_INDEX_VERSION, RecallChannels, RecallHit,
+    RetrievalQuery, RetrievalRepository, SourceCurrentness, SourceScope, VECTOR_DIMENSIONS,
+    VECTOR_MIN_SCORE_BPS, VectorEmbedding, cosine_similarity_bps, embed_text, search_terms,
 };
 use eam_source_obsidian::{
     ObsidianSourceRepository, SourceArchiveInput, SourceArchiveReceipt, SourceAvailability,
@@ -49,6 +50,10 @@ use crate::{
 
 const DATABASE_FILE: &str = "self.db";
 const WRITER_LOCK_FILE: &str = "self.db.writer.lock";
+const MAX_VECTOR_CANDIDATES: usize = 64;
+const TEMPORAL_NEIGHBOR_RADIUS_MILLIS: i64 = 7 * 24 * 60 * 60 * 1_000;
+const MAX_TEMPORAL_NEIGHBORS: usize = 4;
+const MAX_RELATION_NEIGHBORS: usize = 8;
 
 pub struct VaultRepository {
     connection: Option<Connection>,
@@ -1235,6 +1240,9 @@ impl RetrievalRepository for VaultRepository {
             )
             .optional()?;
         let current_index_digest = retrieval_index_digest(self.connection()).ok();
+        let vector_index_complete =
+            retrieval_vector_index_is_complete(self.connection(), authority.blocks.len())
+                .unwrap_or(false);
         let is_current = stored.is_some_and(
             |(version, authority_digest, index_digest, blocks, claims, relations)| {
                 version == RETRIEVAL_INDEX_VERSION
@@ -1245,6 +1253,7 @@ impl RetrievalRepository for VaultRepository {
                     && usize::try_from(blocks).ok() == Some(authority.blocks.len())
                     && usize::try_from(claims).ok() == Some(authority.claims.len())
                     && usize::try_from(relations).ok() == Some(authority.relations.len())
+                    && vector_index_complete
             },
         );
         if is_current {
@@ -1255,6 +1264,14 @@ impl RetrievalRepository for VaultRepository {
 
     fn recall_candidates(&self, query: &RetrievalQuery) -> Result<Vec<RecallHit>, Self::Error> {
         recall_retrieval_candidates(self.connection(), query)
+    }
+
+    fn recall_neighbors(
+        &self,
+        reference: CandidateRef,
+        _scope: SourceScope,
+    ) -> Result<Vec<RecallHit>, Self::Error> {
+        recall_retrieval_neighbors(self.connection(), reference)
     }
 
     fn resolve_authoritative(
@@ -2467,6 +2484,7 @@ fn rebuild_retrieval_index(
 fn clear_retrieval_index(transaction: &rusqlite::Transaction<'_>) -> Result<(), VaultError> {
     for table in [
         "retrieval_index_metadata",
+        "retrieval_block_vectors",
         "retrieval_relation_edges",
         "retrieval_entity_terms",
         "retrieval_claim_terms",
@@ -2520,6 +2538,19 @@ fn insert_retrieval_blocks(
                 ],
             )?;
         }
+        let embedding = embed_text(&block.quote);
+        transaction.execute(
+            "INSERT INTO retrieval_block_vectors
+             (evidence_id, block_id, model_version, dimensions, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_vault_sql_id(block.reference.evidence_id())?,
+                to_vault_sql_id(block.reference.block_id().get())?,
+                EMBEDDING_MODEL_VERSION,
+                i64::try_from(VECTOR_DIMENSIONS).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                embedding.to_le_bytes(),
+            ],
+        )?;
     }
     Ok(())
 }
@@ -2623,9 +2654,58 @@ fn retrieval_index_digest(connection: &Connection) -> Result<[u8; 32], VaultErro
     let mut hasher = Sha256::new();
     hash_bytes(&mut hasher, RETRIEVAL_INDEX_VERSION.as_bytes());
     hash_retrieval_block_index(connection, &mut hasher)?;
+    hash_retrieval_vector_index(connection, &mut hasher)?;
     hash_retrieval_claim_index(connection, &mut hasher)?;
     hash_retrieval_graph_index(connection, &mut hasher)?;
     Ok(hasher.finalize().into())
+}
+
+fn hash_retrieval_vector_index(
+    connection: &Connection,
+    hasher: &mut Sha256,
+) -> Result<(), VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT evidence_id, block_id, model_version, dimensions, embedding
+         FROM retrieval_block_vectors ORDER BY evidence_id, block_id",
+    )?;
+    for (evidence_id, block_id, model, dimensions, embedding) in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        hash_i64(hasher, evidence_id);
+        hash_i64(hasher, block_id);
+        hash_bytes(hasher, model.as_bytes());
+        hash_i64(hasher, dimensions);
+        hash_bytes(hasher, &embedding);
+    }
+    Ok(())
+}
+
+fn retrieval_vector_index_is_complete(
+    connection: &Connection,
+    expected_blocks: usize,
+) -> Result<bool, VaultError> {
+    let (count, invalid): (i64, i64) = connection.query_row(
+        "SELECT count(*),
+                COALESCE(sum(CASE
+                    WHEN model_version = ?1 AND dimensions = ?2 AND length(embedding) = 512
+                    THEN 0 ELSE 1 END), 0)
+         FROM retrieval_block_vectors",
+        params![
+            EMBEDDING_MODEL_VERSION,
+            i64::try_from(VECTOR_DIMENSIONS).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(usize::try_from(count).ok() == Some(expected_blocks) && invalid == 0)
 }
 
 fn hash_retrieval_block_index(
@@ -2781,6 +2861,7 @@ fn recall_retrieval_candidates(
 ) -> Result<Vec<RecallHit>, VaultError> {
     let mut hits = Vec::new();
     append_lexical_hits(connection, query.text(), &mut hits)?;
+    append_vector_hits(connection, query.text(), &mut hits)?;
     append_temporal_hits(connection, query.time(), &mut hits)?;
     append_entity_hits(connection, query.entities(), &mut hits)?;
     let has_non_temporal_filter = query
@@ -2798,7 +2879,11 @@ fn recall_retrieval_candidates(
             .collect::<BTreeSet<_>>();
         let recalled_by_content_or_relation = hits
             .iter()
-            .filter(|hit| hit.channels().contains_lexical() || hit.channels().contains_relation())
+            .filter(|hit| {
+                hit.channels().contains_lexical()
+                    || hit.channels().contains_vector()
+                    || hit.channels().contains_relation()
+            })
             .map(|hit| hit.reference())
             .collect::<BTreeSet<_>>();
         hits.retain(|hit| {
@@ -2855,6 +2940,63 @@ fn append_lexical_hits(
             }
         }
     }
+    Ok(())
+}
+
+fn append_vector_hits(
+    connection: &Connection,
+    text: Option<&str>,
+    hits: &mut Vec<RecallHit>,
+) -> Result<(), VaultError> {
+    let Some(text) = text else {
+        return Ok(());
+    };
+    let query_vector = embed_text(text);
+    if query_vector.is_zero() {
+        return Ok(());
+    }
+    let mut statement = connection.prepare(
+        "SELECT evidence_id, block_id, dimensions, embedding
+         FROM retrieval_block_vectors WHERE model_version = ?1
+         ORDER BY evidence_id, block_id",
+    )?;
+    let mut ranked = Vec::new();
+    for (evidence_id, block_id, dimensions, bytes) in statement
+        .query_map([EMBEDDING_MODEL_VERSION], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        if usize::try_from(dimensions).ok() != Some(VECTOR_DIMENSIONS) {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let vector =
+            VectorEmbedding::from_le_bytes(&bytes).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let score = cosine_similarity_bps(&query_vector, &vector);
+        if score >= VECTOR_MIN_SCORE_BPS {
+            ranked.push((
+                CandidateRef::Evidence {
+                    evidence_id: u64::try_from(evidence_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    block_id: u64::try_from(block_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                },
+                score,
+            ));
+        }
+    }
+    ranked.sort_by_key(|(reference, score)| (std::cmp::Reverse(*score), *reference));
+    hits.extend(
+        ranked
+            .into_iter()
+            .take(MAX_VECTOR_CANDIDATES)
+            .map(|(reference, score)| RecallHit::vector(reference, score)),
+    );
     Ok(())
 }
 
@@ -2980,6 +3122,179 @@ fn append_relation_hits(
         }
     }
     Ok(())
+}
+
+fn recall_retrieval_neighbors(
+    connection: &Connection,
+    reference: CandidateRef,
+) -> Result<Vec<RecallHit>, VaultError> {
+    let CandidateRef::Evidence {
+        evidence_id,
+        block_id,
+    } = reference
+    else {
+        return Ok(Vec::new());
+    };
+    let evidence_id_sql = to_vault_sql_id(evidence_id)?;
+    let block_id_sql = to_vault_sql_id(block_id)?;
+    let (source_record_id, recorded_at, ordinal) = connection
+        .query_row(
+            "SELECT d.source_record_id, d.recorded_at, b.ordinal
+             FROM retrieval_block_documents d
+             JOIN evidence_blocks b
+               ON b.evidence_id = d.evidence_id AND b.id = d.block_id
+             WHERE d.evidence_id = ?1 AND d.block_id = ?2",
+            params![evidence_id_sql, block_id_sql],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let mut hits = structural_neighbor_hits(connection, evidence_id_sql, block_id_sql, ordinal)?;
+    hits.extend(temporal_neighbor_hits(
+        connection,
+        source_record_id,
+        recorded_at,
+        reference,
+    )?);
+    let mut relation_hits = Vec::new();
+    append_relation_hits(
+        connection,
+        u64::try_from(source_record_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        &mut relation_hits,
+    )?;
+    let mut relation_count = 0;
+    for hit in relation_hits {
+        if hit.reference() == reference
+            || candidate_source_record_id(connection, hit.reference())? == source_record_id
+        {
+            continue;
+        }
+        hits.push(hit);
+        relation_count += 1;
+        if relation_count == MAX_RELATION_NEIGHBORS {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+fn structural_neighbor_hits(
+    connection: &Connection,
+    evidence_id: i64,
+    block_id: i64,
+    ordinal: i64,
+) -> Result<Vec<RecallHit>, VaultError> {
+    let mut statement = connection.prepare(
+        "SELECT d.evidence_id, d.block_id
+         FROM retrieval_block_documents d
+         JOIN evidence_blocks b
+           ON b.evidence_id = d.evidence_id AND b.id = d.block_id
+         WHERE d.evidence_id = ?1 AND d.block_id != ?2
+           AND b.ordinal BETWEEN ?3 - 1 AND ?3 + 1
+         ORDER BY b.ordinal",
+    )?;
+    statement
+        .query_map(params![evidence_id, block_id, ordinal], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .map(|row| {
+            let (evidence_id, block_id) = row?;
+            Ok(RecallHit::new(
+                CandidateRef::Evidence {
+                    evidence_id: u64::try_from(evidence_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    block_id: u64::try_from(block_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                },
+                RecallChannels::default(),
+                0,
+            ))
+        })
+        .collect()
+}
+
+fn temporal_neighbor_hits(
+    connection: &Connection,
+    source_record_id: i64,
+    recorded_at: i64,
+    seed: CandidateRef,
+) -> Result<Vec<RecallHit>, VaultError> {
+    let CandidateRef::Evidence {
+        evidence_id: seed_evidence_id,
+        ..
+    } = seed
+    else {
+        return Ok(Vec::new());
+    };
+    let start = recorded_at.saturating_sub(TEMPORAL_NEIGHBOR_RADIUS_MILLIS);
+    let end = recorded_at.saturating_add(TEMPORAL_NEIGHBOR_RADIUS_MILLIS);
+    let mut statement = connection.prepare(
+        "SELECT evidence_id, block_id, recorded_at
+         FROM retrieval_block_documents
+         WHERE source_record_id = ?1 AND recorded_at BETWEEN ?2 AND ?3
+           AND evidence_id != ?4
+         ORDER BY abs(recorded_at - ?5), evidence_id, block_id",
+    )?;
+    let mut hits = Vec::new();
+    for (evidence_id, block_id, _) in statement
+        .query_map(
+            params![
+                source_record_id,
+                start,
+                end,
+                to_vault_sql_id(seed_evidence_id)?,
+                recorded_at
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        let reference = CandidateRef::Evidence {
+            evidence_id: u64::try_from(evidence_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            block_id: u64::try_from(block_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        };
+        if reference != seed {
+            hits.push(RecallHit::new(reference, RecallChannels::temporal(), 0));
+            if hits.len() == MAX_TEMPORAL_NEIGHBORS {
+                break;
+            }
+        }
+    }
+    Ok(hits)
+}
+
+fn candidate_source_record_id(
+    connection: &Connection,
+    reference: CandidateRef,
+) -> Result<i64, VaultError> {
+    let CandidateRef::Evidence {
+        evidence_id,
+        block_id,
+    } = reference
+    else {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    };
+    connection
+        .query_row(
+            "SELECT source_record_id FROM retrieval_block_documents
+             WHERE evidence_id = ?1 AND block_id = ?2",
+            params![to_vault_sql_id(evidence_id)?, to_vault_sql_id(block_id)?,],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)
 }
 
 fn resolve_retrieval_candidate(
@@ -5303,6 +5618,23 @@ mod tests {
         assert_eq!(
             repository.ensure_retrieval_index().unwrap().disposition(),
             IndexDisposition::Current
+        );
+        repository
+            .connection()
+            .execute(
+                "UPDATE retrieval_block_vectors SET embedding = zeroblob(512)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            repository.ensure_retrieval_index().unwrap().disposition(),
+            IndexDisposition::Rebuilt
+        );
+        assert_eq!(
+            repository
+                .read_archived_content(receipt.archive_id)
+                .unwrap(),
+            canonical_before
         );
     }
 }

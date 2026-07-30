@@ -11,6 +11,6 @@ pub use adapter::OpenAiResponsesRuntime;
 pub use fallback::FallbackRuntime;
 pub use transport::{
     HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL, OPENAI_LOCAL_MODEL,
-    OutboundDisclosureRecord, ResponsesTransport, RuntimeTarget, RuntimeTargetKind, TransportError,
-    TransportErrorKind,
+    OutboundContextSource, OutboundDisclosureRecord, ResponsesTransport, RuntimeTarget,
+    RuntimeTargetKind, TransportError, TransportErrorKind,
 };

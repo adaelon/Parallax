@@ -1,5 +1,50 @@
 # 代码链路
 
+## 2026-07-30 S14-4 冻结上下文最小出口与桌面入口
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:WorkingContextInput` — 只序列化冻结窗口、账本来源与检索快照，不外发 repository、向量或未选候选。
+- `crates/runtime-gateway/src/transport.rs:OutboundContextSource` — 在外发审计中记录证据块或账本的稳定来源引用。
+- `apps/desktop/src-tauri/src/state.rs:send_message_with_retrieval` — 以本人当前消息构造 S14 上下文，再交给既有持续对话运行时。
+- `crates/runtime-gateway/tests/runtime_contract.rs:response_payload_and_disclosure_contain_only_the_frozen_retrieval_result` — 验证冻结块外发、未选候选隔离和来源审计。
+
+**入口**：WebView `send_message` 白名单 command 经 `ManagedHost` 进入本地 Vault 检索；外部运行时只看到 `RuntimeRequest` 的冻结值。
+**测试**：runtime-gateway 9/9、desktop-app 12/12、全仓 Rust 131/131 与 workspace clippy 通过；真实 Vault 对话测试确认 `eam-retrieval-v2` 快照进入运行时，纯 emoji 消息不会被空检索拒绝。
+
+## 2026-07-30 S14-3 schema v11 向量索引与有界邻域
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_11` — 新增模型版本、256 维和 512 字节硬约束的可重建向量表。
+- `crates/vault/src/repository.rs:append_vector_hits` — 对加密向量做精确余弦扫描，按阈值和稳定引用保留最多 64 个候选。
+- `crates/vault/src/repository.rs:recall_retrieval_neighbors` — 扩展相邻结构块、7 天同来源时间邻居与一跳关系邻居，不递归扩散。
+- `crates/vault/src/repository.rs:rebuild_retrieval_index` — 在同一事务重建全文、时间、关系和向量索引并校验统一摘要。
+- `crates/vault/tests/retrieval_persistence.rs:vector_windows_and_replay_digest_survive_sqlcipher_reopen` — 覆盖纯向量命中、动态窗口与跨重启相同冻结结果。
+
+**入口**：`RetrievalRepository` 在本地可信边界执行向量召回和邻域查询；每个返回引用仍由 `resolve_authoritative` 认证回读。
+**测试**：schema v11 中断回滚、向量摘要损坏重建不改权威数据、Vault 全测和目标 clippy 通过。
+
+## 2026-07-30 S14-2 多通道重排与冻结工作上下文
+
+**触达**:
+- `crates/retrieval/src/lib.rs:RecallChannels/retrieve` — 增加 vector 与 long-term-memory 召回位，按通道数、全文分数、向量分数和稳定引用重排。
+- `crates/retrieval/src/context.rs:freeze_working_context` — 权威解析种子与邻域，按预算组成完整块窗口并生成 SHA-256 replay digest。
+- `crates/core/src/domain.rs:WorkingContext` — 保存冻结窗口、账本项、来源当前性、token 账目和检索/模型版本。
+- `crates/retrieval/tests/context_freeze.rs` — 覆盖向量/记忆通道、邻域、可重放冻结及超预算整块跳过。
+
+**入口**：可信 Context Builder 以 `RetrievalQuery + TokenBudget + frozen_at` 调用 `freeze_working_context`；S16 前 Vault 的长期记忆通道稳定为空。
+**测试**：retrieval 9/9、core 6/6 与两个 crate 的目标 clippy 通过。
+
+## 2026-07-30 S14-1 G07 固定向量基准
+
+**触达**:
+- `docs/retrieval-contract-v2.md:G07 Retrieval Contract v2` — 冻结本地模型、精确索引、重排、邻域、token budget 与性能上限。
+- `crates/retrieval/src/vector.rs:embed_text/cosine_similarity_bps` — 实现无下载的 256 维确定性子词特征哈希和 basis-point 余弦分数。
+- `crates/retrieval/tests/fixtures/g07-retrieval-benchmark.tsv` — 固定英文形态变化、共享主题和中文措辞变化语料。
+- `crates/retrieval/tests/g07_vector_benchmark.rs` — 锁定 3/3 Top-3 覆盖、向量字节重放和 4,096 向量 debug 扫描上限。
+
+**入口**：索引构建与查询必须同时调用 `embed_text`；模型或特征语义变化必须提升契约版本并重建派生索引。
+**测试**：固定质量基准 3/3、4,096 向量扫描小于 5 秒，空输入和非法向量字节失败关闭。
+
 ## 2026-07-30 S13-2 权威多通道检索与可重建索引
 
 **触达**:

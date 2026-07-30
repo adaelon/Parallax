@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 10;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 11;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -695,6 +695,22 @@ CREATE INDEX retrieval_relation_target_lookup
     ON retrieval_relation_edges(to_source_record_id);
 ";
 
+const MIGRATION_11: &str = r"
+CREATE TABLE retrieval_block_vectors (
+    evidence_id INTEGER NOT NULL,
+    block_id INTEGER NOT NULL,
+    model_version TEXT NOT NULL CHECK (length(trim(model_version)) > 0),
+    dimensions INTEGER NOT NULL CHECK (dimensions = 256),
+    embedding BLOB NOT NULL CHECK (length(embedding) = 512),
+    PRIMARY KEY (evidence_id, block_id),
+    FOREIGN KEY (evidence_id, block_id)
+        REFERENCES retrieval_block_documents(evidence_id, block_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX retrieval_block_vectors_model
+    ON retrieval_block_vectors(model_version);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -722,6 +738,7 @@ where
             8 => transaction.execute_batch(MIGRATION_8)?,
             9 => transaction.execute_batch(MIGRATION_9)?,
             10 => transaction.execute_batch(MIGRATION_10)?,
+            11 => transaction.execute_batch(MIGRATION_11)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1179,6 +1196,55 @@ mod tests {
         let table_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'retrieval_index_metadata'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_vector_migration_keeps_retrieval_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 10).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 11 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(11))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'retrieval_block_vectors'",
                 [],
                 |row| row.get(0),
             )

@@ -7,12 +7,16 @@ use std::{
 
 use eam_core::{
     Clock, ConversationEvidence, CounterpartRuntime, EvidenceId, MemoryCore, MemoryRepository,
-    SessionId, Speaker, SystemClock,
+    SessionId, Speaker, SystemClock, WorkingContext,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_ingestion::{
     ArchiveRepository, ArchiveStatus, ImportOutcome, ImportPolicy, RejectReason, UnparsedReason,
     ingest_inbox_file,
+};
+use eam_retrieval::{
+    RetrievalQuery, RetrievalRepository, TokenBudget, freeze_working_context as freeze_retrieval,
+    search_terms,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, OpenAiResponsesRuntime, RuntimeTarget,
@@ -180,7 +184,7 @@ impl ManagedHost {
 
     pub fn send_message(&self, verbatim: String) -> Result<ConversationTurnResult, String> {
         match &mut *self.lock() {
-            HostSlot::Ready(host) => send_message_with_core(&mut host.core, verbatim),
+            HostSlot::Ready(host) => send_message_with_retrieval(&mut host.core, verbatim),
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -340,6 +344,7 @@ where
         })
 }
 
+#[cfg(test)]
 fn send_message_with_core<R, T, C>(
     core: &mut MemoryCore<R, T, C>,
     verbatim: String,
@@ -361,6 +366,57 @@ where
     let working_context = core
         .freeze_working_context(&context_ids)
         .map_err(|error| error.to_string())?;
+    run_message_with_context(core, verbatim, working_context)
+}
+
+fn send_message_with_retrieval<R, T, C>(
+    core: &mut MemoryCore<R, T, C>,
+    verbatim: String,
+) -> Result<ConversationTurnResult, String>
+where
+    R: MemoryRepository + RetrievalRepository,
+    <R as RetrievalRepository>::Error: std::fmt::Display,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    validate_message(&verbatim)?;
+    let prior_turns = core
+        .repository()
+        .all_evidence()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|turn| turn.session_id().as_str() == CONTINUOUS_SESSION_ID)
+        .collect::<Vec<_>>();
+    let context_ids = select_context_ids(&prior_turns);
+    let selected = core
+        .freeze_working_context(&context_ids)
+        .map_err(|error| error.to_string())?;
+    let frozen_at = selected.frozen_at();
+    let selected_evidence = selected.evidence().to_vec();
+    if search_terms(&verbatim).is_empty() {
+        return run_message_with_context(core, verbatim, selected);
+    }
+    let working_context = freeze_retrieval(
+        core.repository_mut(),
+        &RetrievalQuery::lexical(&verbatim),
+        TokenBudget::default(),
+        selected_evidence,
+        frozen_at,
+    )
+    .map_err(|error| error.to_string())?;
+    run_message_with_context(core, verbatim, working_context)
+}
+
+fn run_message_with_context<R, T, C>(
+    core: &mut MemoryCore<R, T, C>,
+    verbatim: String,
+    working_context: WorkingContext,
+) -> Result<ConversationTurnResult, String>
+where
+    R: MemoryRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
     let outcome = core
         .run_counterpart_turn(
             SessionId::new(CONTINUOUS_SESSION_ID),
@@ -604,10 +660,19 @@ mod tests {
         );
         let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(10_000));
 
-        let result = send_message_with_core(&mut core, "你会记得这句话吗？".to_owned()).unwrap();
+        let result =
+            send_message_with_retrieval(&mut core, "你会记得这句话吗？".to_owned()).unwrap();
         assert_eq!(result.person.verbatim, "你会记得这句话吗？");
         assert_eq!(result.counterpart.verbatim, "我会记得这段原话。");
         assert!(core.repository().all_claims().unwrap().is_empty());
+        assert_eq!(
+            core.runtime().seen_requests()[0]
+                .working_context()
+                .retrieval_snapshot()
+                .unwrap()
+                .retrieval_contract_version(),
+            eam_retrieval::RETRIEVAL_INDEX_VERSION
+        );
 
         let (repository, _, _) = core.into_parts();
         repository.close().unwrap();
@@ -622,6 +687,31 @@ mod tests {
         let restored = list_conversation_from_core(&core).unwrap();
         assert_eq!(restored, vec![result.person, result.counterpart]);
         assert!(core.repository().all_claims().unwrap().is_empty());
+        let (repository, _, _) = core.into_parts();
+        repository.close().unwrap();
+    }
+
+    #[test]
+    fn non_searchable_message_still_reaches_the_runtime_without_retrieval_failure() {
+        let _guard = sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let repository =
+            VaultRepository::open(directory.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+        let runtime = ScriptedRuntime::new(
+            [PersonTurnClassification::Question],
+            [RuntimeResponse::new("🙂")],
+        );
+        let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(25_000));
+
+        let result = send_message_with_retrieval(&mut core, "😊".to_owned()).unwrap();
+        assert_eq!(result.person.verbatim, "😊");
+        assert_eq!(result.counterpart.verbatim, "🙂");
+        assert!(
+            core.runtime().seen_requests()[0]
+                .working_context()
+                .retrieval_snapshot()
+                .is_none()
+        );
         let (repository, _, _) = core.into_parts();
         repository.close().unwrap();
     }

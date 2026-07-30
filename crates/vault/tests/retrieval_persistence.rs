@@ -1,6 +1,6 @@
 use eam_core::{
     ApplicableTime, Claim, ClaimOwner, ConversationEvidence, EvidenceCitation, MemoryRepository,
-    SessionId, Speaker, Timestamp,
+    RetrievedContextItem, SessionId, Speaker, Timestamp,
 };
 use eam_ingestion::{
     MarkdownProcessingOutcome, materialize_incremental_markdown, process_archived_markdown,
@@ -8,7 +8,7 @@ use eam_ingestion::{
 use eam_markdown::{CONTRACT_VERSION, ParseLimits};
 use eam_retrieval::{
     AuthoritativeCandidate, IndexDisposition, RetrievalQuery, SourceCurrentness, SourceScope,
-    TimeRange, retrieve,
+    TimeRange, TokenBudget, freeze_working_context, retrieve,
 };
 use eam_source_obsidian::{
     ObsidianSourceRepository, SourceArchiveInput, SourceFileKind, SourceRecordState,
@@ -20,6 +20,70 @@ const TEST_VAULT_KEY: [u8; 32] = [0x83; 32];
 const ALPHA: &str = "# Alpha Project\n\nI coordinate Aurora with [[Target Person]].\n";
 const TARGET: &str =
     "---\naliases: [Target Person]\n---\n# Target\n\nRelated biography evidence.\n";
+const VECTOR_SOURCE: &str =
+    "# Initiative\n\nI coordinate weekly launch reviews and prepare project summaries.\n";
+
+#[test]
+fn vector_windows_and_replay_digest_survive_sqlcipher_reopen() {
+    let vault = tempdir().unwrap();
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    let root = repository
+        .register_source_root("C:/notes/vector", 10)
+        .unwrap();
+    let receipt = archive_markdown(
+        &mut repository,
+        root.id(),
+        "Initiative.md",
+        VECTOR_SOURCE,
+        &["Initiative.md".to_owned()],
+        &[],
+        20,
+    );
+    repository
+        .finish_source_reconciliation(root.id(), &[receipt.source_record_id()], 30)
+        .unwrap();
+    accept_and_materialize(&mut repository, receipt.archive_id(), 40);
+    let query =
+        RetrievalQuery::lexical("coordination launching reviewed preparation projects summarizing");
+    let retrieved = retrieve(&mut repository, &query).unwrap();
+    assert!(retrieved.candidates().iter().any(|candidate| {
+        candidate.channels().contains_vector()
+            && !candidate.channels().contains_lexical()
+            && matches!(candidate.authority(), AuthoritativeCandidate::Evidence(_))
+    }));
+    let first = freeze_working_context(
+        &mut repository,
+        &query,
+        TokenBudget::new(256).unwrap(),
+        Vec::new(),
+        Timestamp::from_millis(100),
+    )
+    .unwrap();
+    let RetrievedContextItem::EvidenceWindow(window) = &first.retrieved()[0] else {
+        panic!("vector evidence must freeze as a retrieval window");
+    };
+    assert!(window.blocks().len() >= 2);
+    assert!(
+        window
+            .blocks()
+            .iter()
+            .any(|block| block.verbatim().contains("coordinate weekly launch"))
+    );
+    repository.close().unwrap();
+
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    let reopened = freeze_working_context(
+        &mut repository,
+        &query,
+        TokenBudget::new(256).unwrap(),
+        Vec::new(),
+        Timestamp::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(first, reopened);
+}
 
 #[test]
 fn authoritative_multi_channel_retrieval_survives_scope_changes_and_reopen() {

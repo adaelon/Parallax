@@ -302,6 +302,8 @@ pub enum PersonTurnClassification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingContext {
     evidence: Vec<ConversationEvidence>,
+    retrieved: Vec<RetrievedContextItem>,
+    retrieval_snapshot: Option<RetrievalSnapshot>,
     frozen_at: Timestamp,
 }
 
@@ -309,13 +311,67 @@ impl WorkingContext {
     pub(crate) fn new(evidence: Vec<ConversationEvidence>, frozen_at: Timestamp) -> Self {
         Self {
             evidence,
+            retrieved: Vec::new(),
+            retrieval_snapshot: None,
             frozen_at,
         }
+    }
+
+    /// Freezes already-selected conversation evidence without repository access.
+    #[must_use]
+    pub fn from_selected_evidence(
+        evidence: Vec<ConversationEvidence>,
+        frozen_at: Timestamp,
+    ) -> Self {
+        Self::new(evidence, frozen_at)
+    }
+
+    /// Attaches one already-authority-resolved retrieval snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkingContextError::BudgetExceeded`] when the frozen payload
+    /// claims more estimated tokens than its immutable budget.
+    pub fn with_retrieval(
+        mut self,
+        retrieved: Vec<RetrievedContextItem>,
+        snapshot: RetrievalSnapshot,
+    ) -> Result<Self, WorkingContextError> {
+        if snapshot.used_tokens() > snapshot.token_budget() {
+            return Err(WorkingContextError::BudgetExceeded);
+        }
+        let accounted = retrieved.iter().fold(0_usize, |total, item| {
+            total.saturating_add(item.estimated_tokens())
+        });
+        if accounted != snapshot.used_tokens() {
+            return Err(WorkingContextError::TokenAccountingMismatch);
+        }
+        if retrieved.iter().any(|item| {
+            matches!(
+                item,
+                RetrievedContextItem::EvidenceWindow(window) if window.blocks().is_empty()
+            )
+        }) {
+            return Err(WorkingContextError::EmptyEvidenceWindow);
+        }
+        self.retrieved = retrieved;
+        self.retrieval_snapshot = Some(snapshot);
+        Ok(self)
     }
 
     #[must_use]
     pub fn evidence(&self) -> &[ConversationEvidence] {
         &self.evidence
+    }
+
+    #[must_use]
+    pub fn retrieved(&self) -> &[RetrievedContextItem] {
+        &self.retrieved
+    }
+
+    #[must_use]
+    pub const fn retrieval_snapshot(&self) -> Option<&RetrievalSnapshot> {
+        self.retrieval_snapshot.as_ref()
     }
 
     #[must_use]
@@ -330,6 +386,243 @@ impl WorkingContext {
             .any(|evidence| evidence.id() == evidence_id)
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceCurrentness {
+    Present,
+    SourceRemoved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenEvidenceBlock {
+    evidence_id: u64,
+    block_id: u64,
+    ordinal: usize,
+    verbatim: String,
+    source_record_id: u64,
+    source_locator: String,
+    currentness: SourceCurrentness,
+    recorded_at: Timestamp,
+}
+
+impl FrozenEvidenceBlock {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        evidence_id: u64,
+        block_id: u64,
+        ordinal: usize,
+        verbatim: String,
+        source_record_id: u64,
+        source_locator: String,
+        currentness: SourceCurrentness,
+        recorded_at: Timestamp,
+    ) -> Self {
+        Self {
+            evidence_id,
+            block_id,
+            ordinal,
+            verbatim,
+            source_record_id,
+            source_locator,
+            currentness,
+            recorded_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn evidence_id(&self) -> u64 {
+        self.evidence_id
+    }
+
+    #[must_use]
+    pub const fn block_id(&self) -> u64 {
+        self.block_id
+    }
+
+    #[must_use]
+    pub const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub fn verbatim(&self) -> &str {
+        &self.verbatim
+    }
+
+    #[must_use]
+    pub const fn source_record_id(&self) -> u64 {
+        self.source_record_id
+    }
+
+    #[must_use]
+    pub fn source_locator(&self) -> &str {
+        &self.source_locator
+    }
+
+    #[must_use]
+    pub const fn currentness(&self) -> SourceCurrentness {
+        self.currentness
+    }
+
+    #[must_use]
+    pub const fn recorded_at(&self) -> Timestamp {
+        self.recorded_at
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenRetrievalWindow {
+    ordinal: usize,
+    blocks: Vec<FrozenEvidenceBlock>,
+    estimated_tokens: usize,
+}
+
+impl FrozenRetrievalWindow {
+    #[must_use]
+    pub const fn new(
+        ordinal: usize,
+        blocks: Vec<FrozenEvidenceBlock>,
+        estimated_tokens: usize,
+    ) -> Self {
+        Self {
+            ordinal,
+            blocks,
+            estimated_tokens,
+        }
+    }
+
+    #[must_use]
+    pub const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub fn blocks(&self) -> &[FrozenEvidenceBlock] {
+        &self.blocks
+    }
+
+    #[must_use]
+    pub const fn estimated_tokens(&self) -> usize {
+        self.estimated_tokens
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenLedgerClaim {
+    claim: Claim,
+    estimated_tokens: usize,
+}
+
+impl FrozenLedgerClaim {
+    #[must_use]
+    pub const fn new(claim: Claim, estimated_tokens: usize) -> Self {
+        Self {
+            claim,
+            estimated_tokens,
+        }
+    }
+
+    #[must_use]
+    pub const fn claim(&self) -> &Claim {
+        &self.claim
+    }
+
+    #[must_use]
+    pub const fn estimated_tokens(&self) -> usize {
+        self.estimated_tokens
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetrievedContextItem {
+    EvidenceWindow(FrozenRetrievalWindow),
+    LedgerClaim(FrozenLedgerClaim),
+}
+
+impl RetrievedContextItem {
+    #[must_use]
+    pub const fn estimated_tokens(&self) -> usize {
+        match self {
+            Self::EvidenceWindow(window) => window.estimated_tokens(),
+            Self::LedgerClaim(claim) => claim.estimated_tokens(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetrievalSnapshot {
+    retrieval_contract_version: String,
+    vector_model_version: String,
+    token_budget: usize,
+    used_tokens: usize,
+    replay_digest: [u8; 32],
+}
+
+impl RetrievalSnapshot {
+    #[must_use]
+    pub fn new(
+        retrieval_contract_version: impl Into<String>,
+        vector_model_version: impl Into<String>,
+        token_budget: usize,
+        used_tokens: usize,
+        replay_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            retrieval_contract_version: retrieval_contract_version.into(),
+            vector_model_version: vector_model_version.into(),
+            token_budget,
+            used_tokens,
+            replay_digest,
+        }
+    }
+
+    #[must_use]
+    pub fn retrieval_contract_version(&self) -> &str {
+        &self.retrieval_contract_version
+    }
+
+    #[must_use]
+    pub fn vector_model_version(&self) -> &str {
+        &self.vector_model_version
+    }
+
+    #[must_use]
+    pub const fn token_budget(&self) -> usize {
+        self.token_budget
+    }
+
+    #[must_use]
+    pub const fn used_tokens(&self) -> usize {
+        self.used_tokens
+    }
+
+    #[must_use]
+    pub const fn replay_digest(&self) -> &[u8; 32] {
+        &self.replay_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkingContextError {
+    BudgetExceeded,
+    TokenAccountingMismatch,
+    EmptyEvidenceWindow,
+}
+
+impl fmt::Display for WorkingContextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BudgetExceeded => "retrieved working context exceeds its frozen token budget",
+            Self::TokenAccountingMismatch => {
+                "retrieved working context token accounting does not match its frozen snapshot"
+            }
+            Self::EmptyEvidenceWindow => "retrieved working context contains an empty window",
+        })
+    }
+}
+
+impl std::error::Error for WorkingContextError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JudgmentProposal {

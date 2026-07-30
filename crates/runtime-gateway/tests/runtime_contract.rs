@@ -7,13 +7,15 @@ use std::{
 };
 
 use eam_core::{
-    ClaimOwner, CoreError, InMemoryRepository, IncrementingClock, MemoryCore, MemoryRepository,
-    PersonTurnClassification, RuntimeErrorKind, SessionId, StructuredOperationRejectionReason,
+    ClaimOwner, CoreError, FrozenEvidenceBlock, FrozenRetrievalWindow, InMemoryRepository,
+    IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification, RetrievalSnapshot,
+    RetrievedContextItem, RuntimeErrorKind, SessionId, SourceCurrentness,
+    StructuredOperationRejectionReason, Timestamp,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL,
-    OPENAI_LOCAL_MODEL, OpenAiResponsesRuntime, ResponsesTransport, RuntimeTarget,
-    RuntimeTargetKind, TransportError,
+    OPENAI_LOCAL_MODEL, OpenAiResponsesRuntime, OutboundContextSource, ResponsesTransport,
+    RuntimeTarget, RuntimeTargetKind, TransportError,
 };
 use eam_vault::{VaultKey, VaultRepository};
 use serde_json::Value;
@@ -314,6 +316,67 @@ fn response_payload_contains_only_prompt_and_core_selected_evidence() {
             .map(|id| id.get())
             .collect::<Vec<_>>(),
         [3, 1]
+    );
+}
+
+#[test]
+fn response_payload_and_disclosure_contain_only_the_frozen_retrieval_result() {
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(TURN_RESPONSE),
+    ]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(2_500),
+    );
+    let (selected, _) = core
+        .record_person_turn(SessionId::new("source"), "只选择这一条")
+        .unwrap();
+    core.record_person_turn(SessionId::new("hidden"), "绝不能外发的向量原始候选")
+        .unwrap();
+    let context = core
+        .freeze_working_context(&[selected])
+        .unwrap()
+        .with_retrieval(
+            vec![RetrievedContextItem::EvidenceWindow(
+                FrozenRetrievalWindow::new(
+                    0,
+                    vec![FrozenEvidenceBlock::new(
+                        900,
+                        901,
+                        0,
+                        "只外发冻结后的权威证据块".to_owned(),
+                        88,
+                        "notes/frozen.md".to_owned(),
+                        SourceCurrentness::Present,
+                        Timestamp::from_millis(2_400),
+                    )],
+                    40,
+                ),
+            )],
+            RetrievalSnapshot::new("eam-retrieval-v2", "model-v1", 128, 40, [9; 32]),
+        )
+        .unwrap();
+    core.run_counterpart_turn(SessionId::new("chat"), "请回答", context)
+        .unwrap();
+
+    let disclosure = core.runtime().disclosures().last().unwrap();
+    let request: Value = serde_json::from_str(disclosure.request_json()).unwrap();
+    let input = request["input"].as_str().unwrap();
+    assert!(input.contains("只外发冻结后的权威证据块"));
+    assert!(input.contains("notes/frozen.md"));
+    assert!(input.contains("eam-retrieval-v2"));
+    assert!(!input.contains("绝不能外发的向量原始候选"));
+    assert!(!input.contains("embedding"));
+    assert_eq!(
+        disclosure.retrieved_sources(),
+        [OutboundContextSource::EvidenceBlock {
+            evidence_id: 900,
+            block_id: 901,
+        }]
     );
 }
 

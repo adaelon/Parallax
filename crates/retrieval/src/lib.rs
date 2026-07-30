@@ -13,7 +13,19 @@ use std::{
 use eam_core::{Claim, ClaimId};
 use eam_ingestion::{EvidenceBlockRef, EvidenceBlockView};
 
-pub const RETRIEVAL_INDEX_VERSION: &str = "eam-retrieval-v1";
+mod context;
+mod vector;
+
+pub use context::{
+    DEFAULT_TOKEN_BUDGET, FreezeFailure, MAX_TOKEN_BUDGET, MIN_TOKEN_BUDGET, TokenBudget,
+    freeze_working_context,
+};
+pub use vector::{
+    EMBEDDING_MODEL_VERSION, EmbeddingError, VECTOR_BYTES, VECTOR_DIMENSIONS, VECTOR_MIN_SCORE_BPS,
+    VectorEmbedding, cosine_similarity_bps, embed_text,
+};
+
+pub const RETRIEVAL_INDEX_VERSION: &str = "eam-retrieval-v2";
 pub const DEFAULT_RESULT_LIMIT: usize = 20;
 pub const MAX_RESULT_LIMIT: usize = 100;
 
@@ -258,64 +270,82 @@ impl CandidateRef {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecallChannels {
-    lexical: bool,
-    temporal: bool,
-    relation: bool,
+    bits: u8,
 }
 
 impl RecallChannels {
+    const LEXICAL: u8 = 1 << 0;
+    const VECTOR: u8 = 1 << 1;
+    const TEMPORAL: u8 = 1 << 2;
+    const RELATION: u8 = 1 << 3;
+    const LONG_TERM_MEMORY: u8 = 1 << 4;
+
     #[must_use]
     pub const fn lexical() -> Self {
         Self {
-            lexical: true,
-            temporal: false,
-            relation: false,
+            bits: Self::LEXICAL,
         }
+    }
+
+    #[must_use]
+    pub const fn vector() -> Self {
+        Self { bits: Self::VECTOR }
     }
 
     #[must_use]
     pub const fn temporal() -> Self {
         Self {
-            lexical: false,
-            temporal: true,
-            relation: false,
+            bits: Self::TEMPORAL,
         }
     }
 
     #[must_use]
     pub const fn relation() -> Self {
         Self {
-            lexical: false,
-            temporal: false,
-            relation: true,
+            bits: Self::RELATION,
+        }
+    }
+
+    #[must_use]
+    pub const fn long_term_memory() -> Self {
+        Self {
+            bits: Self::LONG_TERM_MEMORY,
         }
     }
 
     #[must_use]
     pub const fn contains_lexical(self) -> bool {
-        self.lexical
+        self.bits & Self::LEXICAL != 0
+    }
+
+    #[must_use]
+    pub const fn contains_vector(self) -> bool {
+        self.bits & Self::VECTOR != 0
     }
 
     #[must_use]
     pub const fn contains_temporal(self) -> bool {
-        self.temporal
+        self.bits & Self::TEMPORAL != 0
     }
 
     #[must_use]
     pub const fn contains_relation(self) -> bool {
-        self.relation
+        self.bits & Self::RELATION != 0
+    }
+
+    #[must_use]
+    pub const fn contains_long_term_memory(self) -> bool {
+        self.bits & Self::LONG_TERM_MEMORY != 0
     }
 
     const fn merged(self, other: Self) -> Self {
         Self {
-            lexical: self.lexical || other.lexical,
-            temporal: self.temporal || other.temporal,
-            relation: self.relation || other.relation,
+            bits: self.bits | other.bits,
         }
     }
 
     fn count(self) -> u8 {
-        u8::from(self.lexical) + u8::from(self.temporal) + u8::from(self.relation)
+        u8::try_from(self.bits.count_ones()).unwrap_or(u8::MAX)
     }
 }
 
@@ -324,6 +354,7 @@ pub struct RecallHit {
     reference: CandidateRef,
     channels: RecallChannels,
     lexical_score: u32,
+    vector_score_bps: u16,
 }
 
 impl RecallHit {
@@ -337,6 +368,17 @@ impl RecallHit {
             reference,
             channels,
             lexical_score,
+            vector_score_bps: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn vector(reference: CandidateRef, vector_score_bps: u16) -> Self {
+        Self {
+            reference,
+            channels: RecallChannels::vector(),
+            lexical_score: 0,
+            vector_score_bps,
         }
     }
 
@@ -353,6 +395,11 @@ impl RecallHit {
     #[must_use]
     pub const fn lexical_score(self) -> u32 {
         self.lexical_score
+    }
+
+    #[must_use]
+    pub const fn vector_score_bps(self) -> u16 {
+        self.vector_score_bps
     }
 }
 
@@ -423,17 +470,34 @@ pub enum AuthoritativeCandidate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetrievalCandidate {
+    reference: CandidateRef,
     authority: AuthoritativeCandidate,
     channels: RecallChannels,
+    lexical_score: u32,
+    vector_score_bps: u16,
 }
 
 impl RetrievalCandidate {
     #[must_use]
-    pub const fn new(authority: AuthoritativeCandidate, channels: RecallChannels) -> Self {
+    pub const fn new(
+        reference: CandidateRef,
+        authority: AuthoritativeCandidate,
+        channels: RecallChannels,
+        lexical_score: u32,
+        vector_score_bps: u16,
+    ) -> Self {
         Self {
+            reference,
             authority,
             channels,
+            lexical_score,
+            vector_score_bps,
         }
+    }
+
+    #[must_use]
+    pub const fn reference(&self) -> CandidateRef {
+        self.reference
     }
 
     #[must_use]
@@ -444,6 +508,16 @@ impl RetrievalCandidate {
     #[must_use]
     pub const fn channels(&self) -> RecallChannels {
         self.channels
+    }
+
+    #[must_use]
+    pub const fn lexical_score(&self) -> u32 {
+        self.lexical_score
+    }
+
+    #[must_use]
+    pub const fn vector_score_bps(&self) -> u16 {
+        self.vector_score_bps
     }
 }
 
@@ -484,6 +558,33 @@ pub trait RetrievalRepository {
     /// Returns the adapter error when the encrypted index cannot be queried.
     fn recall_candidates(&self, query: &RetrievalQuery) -> Result<Vec<RecallHit>, Self::Error>;
 
+    /// Recalls authoritative source references selected by long-term memories.
+    /// S14 adapters return an empty set until S16 persists explicit memories.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when the memory index cannot be queried.
+    fn recall_long_term_memory_candidates(
+        &self,
+        _query: &RetrievalQuery,
+    ) -> Result<Vec<RecallHit>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Returns a bounded, non-recursive set of structural, temporal, and
+    /// relation neighbors for one already-ranked seed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when neighbor indexes cannot be queried.
+    fn recall_neighbors(
+        &self,
+        _reference: CandidateRef,
+        _scope: SourceScope,
+    ) -> Result<Vec<RecallHit>, Self::Error> {
+        Ok(Vec::new())
+    }
+
     /// Resolves a candidate to current authoritative evidence or a sourced
     /// ledger entry. `None` means the hit is outside the requested source scope.
     ///
@@ -510,9 +611,14 @@ pub fn retrieve<R: RetrievalRepository>(
     let index = repository
         .ensure_retrieval_index()
         .map_err(RetrievalFailure::Repository)?;
-    let hits = repository
+    let mut hits = repository
         .recall_candidates(query)
         .map_err(RetrievalFailure::Repository)?;
+    hits.extend(
+        repository
+            .recall_long_term_memory_candidates(query)
+            .map_err(RetrievalFailure::Repository)?,
+    );
 
     let mut merged = BTreeMap::<CandidateRef, RecallHit>::new();
     for hit in hits {
@@ -521,6 +627,7 @@ pub fn retrieve<R: RetrievalRepository>(
             .and_modify(|existing| {
                 existing.channels = existing.channels.merged(hit.channels);
                 existing.lexical_score = existing.lexical_score.saturating_add(hit.lexical_score);
+                existing.vector_score_bps = existing.vector_score_bps.max(hit.vector_score_bps);
             })
             .or_insert(hit);
     }
@@ -529,6 +636,7 @@ pub fn retrieve<R: RetrievalRepository>(
         (
             std::cmp::Reverse(hit.channels.count()),
             std::cmp::Reverse(hit.lexical_score),
+            std::cmp::Reverse(hit.vector_score_bps),
             hit.reference,
         )
     });
@@ -541,7 +649,13 @@ pub fn retrieve<R: RetrievalRepository>(
         else {
             continue;
         };
-        candidates.push(RetrievalCandidate::new(authority, hit.channels));
+        candidates.push(RetrievalCandidate::new(
+            hit.reference,
+            authority,
+            hit.channels,
+            hit.lexical_score,
+            hit.vector_score_bps,
+        ));
         if candidates.len() == query.limit() {
             break;
         }
@@ -590,6 +704,7 @@ pub enum RetrievalError {
     EmptyQuery,
     InvalidTimeRange,
     InvalidLimit,
+    InvalidTokenBudget,
 }
 
 impl fmt::Display for RetrievalError {
@@ -598,6 +713,7 @@ impl fmt::Display for RetrievalError {
             Self::EmptyQuery => "retrieval query has no lexical, temporal, or entity input",
             Self::InvalidTimeRange => "retrieval time range is reversed",
             Self::InvalidLimit => "retrieval result limit is outside 1..=100",
+            Self::InvalidTokenBudget => "retrieval token budget is outside 128..=32768",
         })
     }
 }

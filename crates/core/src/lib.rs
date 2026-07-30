@@ -12,10 +12,11 @@ mod scripted_runtime;
 
 pub use domain::{
     ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, EvidenceCitation, EvidenceId,
-    JudgmentProposal, JudgmentRejection, JudgmentRejectionReason, PersonTurnClassification,
-    RuntimeRequest, RuntimeResponse, SessionId, Speaker, StructuredOperationRejection,
-    StructuredOperationRejectionReason, Timestamp, TurnOutcome, Uncertainty,
-    UnsupportedStructuredOperation, WorkingContext,
+    FrozenEvidenceBlock, FrozenLedgerClaim, FrozenRetrievalWindow, JudgmentProposal,
+    JudgmentRejection, JudgmentRejectionReason, PersonTurnClassification, RetrievalSnapshot,
+    RetrievedContextItem, RuntimeRequest, RuntimeResponse, SessionId, SourceCurrentness, Speaker,
+    StructuredOperationRejection, StructuredOperationRejectionReason, Timestamp, TurnOutcome,
+    Uncertainty, UnsupportedStructuredOperation, WorkingContext, WorkingContextError,
 };
 pub use in_memory::InMemoryRepository;
 pub use memory_loop::{CoreError, MemoryCore};

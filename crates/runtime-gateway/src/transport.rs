@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, time::Duration};
 
-use eam_core::EvidenceId;
+use eam_core::{ClaimId, EvidenceId};
 use reqwest::{StatusCode, blocking::Client, redirect::Policy};
 use zeroize::Zeroizing;
 
@@ -69,6 +69,7 @@ pub struct OutboundDisclosureRecord {
     model: &'static str,
     invocation: InvocationKind,
     evidence_ids: Vec<EvidenceId>,
+    retrieved_sources: Vec<OutboundContextSource>,
     request_json: String,
 }
 
@@ -79,6 +80,7 @@ impl OutboundDisclosureRecord {
         model: &'static str,
         invocation: InvocationKind,
         evidence_ids: Vec<EvidenceId>,
+        retrieved_sources: Vec<OutboundContextSource>,
         request_json: String,
     ) -> Self {
         Self {
@@ -87,6 +89,7 @@ impl OutboundDisclosureRecord {
             model,
             invocation,
             evidence_ids,
+            retrieved_sources,
             request_json,
         }
     }
@@ -117,9 +120,20 @@ impl OutboundDisclosureRecord {
     }
 
     #[must_use]
+    pub fn retrieved_sources(&self) -> &[OutboundContextSource] {
+        &self.retrieved_sources
+    }
+
+    #[must_use]
     pub fn request_json(&self) -> &str {
         &self.request_json
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutboundContextSource {
+    EvidenceBlock { evidence_id: u64, block_id: u64 },
+    LedgerClaim { claim_id: ClaimId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

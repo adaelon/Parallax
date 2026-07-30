@@ -1,12 +1,43 @@
 use eam_core::{
-    ApplicableTime, ClaimOwner, CoreError, EvidenceCitation, InMemoryRepository, IncrementingClock,
-    JudgmentProposal, JudgmentRejectionReason, MemoryCore, MemoryRepository,
-    PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId, Speaker, Timestamp,
-    Uncertainty,
+    ApplicableTime, ClaimOwner, CoreError, EvidenceCitation, FrozenEvidenceBlock,
+    FrozenRetrievalWindow, InMemoryRepository, IncrementingClock, JudgmentProposal,
+    JudgmentRejectionReason, MemoryCore, MemoryRepository, PersonTurnClassification,
+    RetrievalSnapshot, RetrievedContextItem, RuntimeResponse, ScriptedRuntime, SessionId,
+    SourceCurrentness, Speaker, Timestamp, Uncertainty, WorkingContextError,
 };
 
 fn session(id: &str) -> SessionId {
     SessionId::new(id)
+}
+
+#[test]
+fn retrieved_context_rejects_budget_overflow_and_preserves_source_boundaries() {
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new([], []),
+        IncrementingClock::new(100),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let item = RetrievedContextItem::EvidenceWindow(FrozenRetrievalWindow::new(
+        0,
+        vec![FrozenEvidenceBlock::new(
+            7,
+            11,
+            0,
+            "逐字证据".to_owned(),
+            5,
+            "notes/source.md".to_owned(),
+            SourceCurrentness::Present,
+            Timestamp::from_millis(90),
+        )],
+        12,
+    ));
+    let snapshot = RetrievalSnapshot::new("eam-retrieval-v2", "model-v1", 11, 12, [3; 32]);
+
+    assert_eq!(
+        context.with_retrieval(vec![item], snapshot),
+        Err(WorkingContextError::BudgetExceeded)
+    );
 }
 
 #[test]

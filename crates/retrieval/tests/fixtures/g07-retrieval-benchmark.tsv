@@ -1,0 +1,8 @@
+# kind	id_or_expected	text
+document	aurora	I coordinate Project Aurora with Mina and prepare the weekly launch review.
+document	studio	We agreed to share the neighborhood studio for weekend ceramic practice.
+document	dawn_cn	我负责协调曙光计划，并与林舟准备每周发布复盘。
+document	bread	The sourdough starter rests beside the kitchen window before baking.
+query	aurora	coordinating Aurora launch
+query	studio	shared studio ceramics
+query	dawn_cn	曙光项目协调复盘

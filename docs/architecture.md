@@ -1,6 +1,6 @@
 # evrything-about-me 目标架构
 
-状态：目标设计；S01 已有可执行实现，后续切片尚未实现
+状态：目标设计；S01～S14 已有可执行实现，S15 起尚未实现
 
 本文件描述首版计划采用的组件边界和数据流。产品范围与验收标准见 [product-spec.md](product-spec.md)，领域语言见 [CONTEXT.md](../CONTEXT.md)。
 
@@ -40,7 +40,7 @@ flowchart LR
             Vault[Evidence Vault<br/>SQLCipher + 加密对象库]
             Ledgers[时间化三账本]
             Retrieval[检索领域契约与编排<br/>crates/retrieval]
-            Indexes[可重建检索索引<br/>SQLCipher schema v10+]
+            Indexes[可重建检索索引<br/>SQLCipher schema v11+]
             Understanding[选择性深度理解投影]
             SelfBundle[Self Bundle]
             Memory[长期记忆维护器]
@@ -266,6 +266,8 @@ S11 将 `self.db` schema 升至 v8：`source_records/source_record_versions` 把
 S12 将 `self.db` schema 升至 v9：`source_roots` 与不可变状态事件保存 `AVAILABLE/SOURCE_UNAVAILABLE`，稳定 `source_records` 增加 Obsidian 根、当前相对 locator、`PRESENT/SOURCE_REMOVED` 和时间边界；移动只更新当前 locator 并追加事件，证据版本继续挂在同一稳定记录。已接受 Obsidian Markdown 的 Properties、标签、别名和原始关系在解析接受事务内写入不可变表；内部目标解析单独保存为可重建投影，目标移除或重新出现后可刷新而不改写原关系文本。
 
 S13 将 `self.db` schema 升至 v10：`retrieval_*` 表保存 `eam-retrieval-v1` 的全文词项、账本有效期、实体词项、关系边和 `AVAILABLE` 派生投影。元数据同时保存权威输入摘要和索引摘要；缺失、过期或损坏时在一个事务内清空并从提取修订、证据块、三账本及 Obsidian 关系重建，绝不更新权威行。来源当前性不复制进索引，候选解析时实时读取 `source_records`，所以 `current` 只接受 `PRESENT` 的最新来源版本，`historical` 才返回旧版本或 `SOURCE_REMOVED`。
+
+S14 将 `self.db` schema 升至 v11：`retrieval_block_vectors` 保存 `eam-subword-hash-embedding-v1` 的 256 维定长派生向量，并由 `eam-retrieval-v2` 元数据摘要覆盖。向量表与全文、时间、关系索引在同一事务内重建；模型版本、维度、向量字节或摘要不一致均失败关闭并从规范证据重建，不修改证据块或账本。
 
 ### 4.2 逻辑数据模型
 
@@ -752,7 +754,9 @@ retrieve(intent):
 
 当前检索解析历史块引用时只能沿 `UNCHANGED` 或 `MOVED` 谱系前进，并同时保留原始引用；`MODIFIED`、`REMOVED` 或 `AMBIGUOUS` 只能返回历史证据和状态，不得把后继块当作同一引用。历史检索始终直接解析原始证据版本，不依赖谱系推断。
 
-S13 当前实现由 `crates/retrieval` 固定查询、通道、范围和权威候选契约，由 `VaultRepository` 实现本地多路召回。全文词项兼容 ASCII 大小写与 Unicode/CJK 字符、双字和整词；显式时间范围是所有通道的交集门禁，账本按 `At/Since/Between` 有效期召回，证据按记录时间召回；实体关系从当前 locator、别名、标签、Properties 和已解析内部关系产生候选。索引只返回 `EvidenceBlockRef | ClaimId`，随后必须认证回读规范文本或校验账本逐字来源；索引片段本身没有事实资格。S14 的向量通道、检索窗口编排和工作上下文冻结仍未实现。
+S13 当前实现由 `crates/retrieval` 固定查询、通道、范围和权威候选契约，由 `VaultRepository` 实现本地多路召回。全文词项兼容 ASCII 大小写与 Unicode/CJK 字符、双字和整词；显式时间范围是所有通道的交集门禁，账本按 `At/Since/Between` 有效期召回，证据按记录时间召回；实体关系从当前 locator、别名、标签、Properties 和已解析内部关系产生候选。索引只返回 `EvidenceBlockRef | ClaimId`，随后必须认证回读规范文本或校验账本逐字来源；索引片段本身没有事实资格。
+
+S14 以 [G07 Retrieval Contract v2](retrieval-contract-v2.md) 固定 256 维本地子词特征哈希模型、SQLCipher 精确余弦扫描、64 个向量初选、确定性跨通道重排和 128～32,768 estimated token budget。`freeze_working_context` 对种子执行前后各一块的结构邻域、7 天同来源时间邻域和一跳关系邻域，逐项权威回读后按预算保留完整块而不截断；最终冻结窗口、账本来源、归属、时间、当前性和 SHA-256 replay digest。长期记忆通道已有独立契约与排序位，但在 S16 写入显式长期记忆前，Vault 稳定返回空集，不把普通账本冒充记忆。桌面对话以本人当前消息调用该构造器，运行时与外发审计只接收冻结结果，不接收 repository、向量或未选候选。
 
 ```text
 validate_citation(block_ref, quoted_text):
@@ -931,7 +935,7 @@ self.db + objects + deletion state
 | Context Inbox 归档状态、延迟解析与重处理 | [ADR-0013：先归档后理解](adr/0013-archive-before-understanding.md) |
 | Obsidian 笔记库适配器、只读边界与结构提取 | [ADR-0015：只读 Obsidian 资料源](adr/0015-read-only-obsidian-source.md) |
 | Obsidian 来源当前性、历史保留与离线保护 | [ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md) |
-| `crates/retrieval`、schema v10 派生索引与权威候选回读 | [ADR-0003：时间化三账本](adr/0003-temporal-three-ledger-model.md)、[ADR-0004：核心访问边界](adr/0004-trusted-core-access-boundary.md)、[ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md)、[ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md)、[ADR-0019：稳定结构块与动态检索窗口](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md)、[ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md) |
+| `crates/retrieval`、schema v11 多路派生索引、动态窗口与权威回读 | [ADR-0003：时间化三账本](adr/0003-temporal-three-ledger-model.md)、[ADR-0004：核心访问边界](adr/0004-trusted-core-access-boundary.md)、[ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md)、[ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md)、[ADR-0019：稳定结构块与动态检索窗口](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md)、[ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md) |
 | Context Builder、多通道召回、深度理解投影与记忆边界 | [ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md) |
 | Core 解析输出、证据块身份、增量索引与永久引用 | [ADR-0019：稳定结构块与动态检索窗口](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md) |
 | 来源版本、历史块引用、当前投影与记忆复核 | [ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md) |
@@ -1361,3 +1365,35 @@ retrieve(query)
 ```
 
 S13 不实现向量候选、深度理解投影、相邻块检索窗口、token 预算或冻结工作上下文；这些仍属于 S14/S15。索引表可以删除和重建，不得被引用为事实或永久来源；`SOURCE_UNAVAILABLE` 不改写子来源状态，显式 Forget 的删除传播仍属于 S19。
+
+### 9.14 S14 向量召回与冻结工作上下文当前实现边界
+
+```text
+docs/retrieval-contract-v2.md
+  G07                              # 固定模型、索引、重排、邻域、预算和性能上限
+crates/retrieval/src/
+  vector.rs                        # 256 维本地子词特征哈希与精确余弦分数
+  context.rs                       # 邻域权威回读、动态组窗、预算和 replay digest
+  lib.rs                           # vector / long-term-memory 通道与确定性重排
+crates/core/src/domain.rs
+  WorkingContext                   # 会话选择 + 冻结窗口/账本项 + 检索快照
+crates/vault/src/
+  schema.rs                        # schema v11 定长加密向量表
+  repository.rs                    # 向量扫描、索引重建与有界邻域
+crates/runtime-gateway/src/
+  adapter.rs / transport.rs        # 只序列化冻结结果并审计稳定来源引用
+apps/desktop/src-tauri/src/state.rs
+  send_message_with_retrieval      # 当前消息 -> 冻结上下文 -> 推理运行时
+```
+
+```text
+send_message(verbatim)
+  -> eam-retrieval-v2 多通道候选（lexical | vector | temporal | relation | memory-slot）
+  -> current|historical 与显式时间交集门禁
+  -> 每个候选和邻域回读规范证据或带逐字来源账本
+  -> 按稳定重排顺序组成完整块窗口，超预算块整块跳过
+  -> 冻结来源、归属、时间、当前性、预算和 replay digest
+  -> RuntimeRequest 仅序列化 prompt、会话选择和冻结结果
+```
+
+S14 不建立长期记忆持久化、不实现争议记忆配对，也不建立选择性深度理解投影；分别留给 S16、S17 和 S15。固定子词模型是可替换的召回基线，不声称通用语义理解；真实资料覆盖率不足时必须提升模型/检索契约版本并重建派生索引，不得放宽权威回读、来源门禁或预算约束。
