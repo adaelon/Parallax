@@ -19,8 +19,10 @@ use eam_identity::{
 };
 use eam_ingestion::{
     ArchiveInput, ArchiveReceipt, ArchiveRepository, ArchiveStatus, ArchivedEvidence,
+    MarkdownArchiveRepository, MarkdownParseAttempt, MarkdownParseStart, MarkdownParseState,
     UnparsedReason,
 };
+use eam_markdown::{ParseResource, ParsedMarkdownV1};
 use fs4::{FileExt, TryLockError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
@@ -67,6 +69,7 @@ impl VaultRepository {
         verify_key_and_pages(&connection)?;
         configure_connection(&connection)?;
         migrate(&mut connection)?;
+        recover_interrupted_markdown_attempts(&mut connection)?;
 
         let object_store = ObjectStore::open(vault_root, vault_key.objects_key()?)?;
         object_store.cleanup_unreferenced(&referenced_object_ids(&connection)?)?;
@@ -168,6 +171,70 @@ impl VaultRepository {
             .optional()?
             .ok_or(VaultError::InvalidKeyOrCorrupt)?;
         self.object_store.read(&object_id)
+    }
+
+    /// Lists every versioned Markdown parse attempt in deterministic order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encrypted state cannot be decoded exactly.
+    pub fn markdown_parse_attempts(&self) -> Result<Vec<MarkdownParseAttempt>, VaultError> {
+        let mut statement = self.connection().prepare(
+            "SELECT archive_id, parser_version, state, failure_reason,
+                    started_at, finished_at
+             FROM markdown_parse_attempts ORDER BY archive_id, parser_version",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(
+                |(archive_id, parser_version, state, reason, started_at, finished_at)| {
+                    Ok(MarkdownParseAttempt {
+                        archive_id: u64::try_from(archive_id)
+                            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                        parser_version,
+                        state: decode_markdown_parse_state(state)?,
+                        failure_reason: reason.map(decode_unparsed_reason).transpose()?,
+                        started_at_millis: started_at,
+                        finished_at_millis: finished_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Restores one accepted encrypted Markdown parse artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact is missing or its contract payload is
+    /// corrupt.
+    pub fn read_markdown_artifact(
+        &self,
+        archive_id: u64,
+        parser_version: &str,
+    ) -> Result<ParsedMarkdownV1, VaultError> {
+        let encoded = self
+            .connection()
+            .query_row(
+                "SELECT parsed_json FROM markdown_parse_artifacts
+                 WHERE archive_id = ?1 AND parser_version = ?2",
+                params![to_vault_sql_id(archive_id)?, parser_version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        serde_json::from_str(&encoded).map_err(|_| VaultError::InvalidKeyOrCorrupt)
     }
 
     /// Checkpoints encrypted WAL state, closes `SQLCipher`, clears the owned
@@ -303,6 +370,149 @@ impl ArchiveRepository for VaultRepository {
 
     fn archive(&mut self, input: ArchiveInput<'_>) -> Result<ArchiveReceipt, Self::Error> {
         self.archive_with_hook(&input, |_| Ok(()))
+    }
+}
+
+impl MarkdownArchiveRepository for VaultRepository {
+    type Error = VaultError;
+
+    fn begin_markdown_parse(
+        &mut self,
+        archive_id: u64,
+        parser_version: &str,
+        started_at_millis: i64,
+    ) -> Result<MarkdownParseStart, Self::Error> {
+        if parser_version.trim().is_empty() {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let archive_id_sql = to_vault_sql_id(archive_id)?;
+        if let Some(state) = self
+            .connection()
+            .query_row(
+                "SELECT state FROM markdown_parse_attempts
+                 WHERE archive_id = ?1 AND parser_version = ?2",
+                params![archive_id_sql, parser_version],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            return Ok(MarkdownParseStart::AlreadyAttempted(
+                decode_markdown_parse_state(state)?,
+            ));
+        }
+
+        let source_locator = self
+            .connection()
+            .query_row(
+                "SELECT source_locator FROM archived_evidence WHERE id = ?1",
+                [archive_id_sql],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        if !std::path::Path::new(&source_locator)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+
+        self.connection().execute(
+            "INSERT INTO markdown_parse_attempts
+             (archive_id, parser_version, state, failure_reason, started_at, finished_at)
+             VALUES (?1, ?2, 0, NULL, ?3, NULL)",
+            params![archive_id_sql, parser_version, started_at_millis],
+        )?;
+        Ok(MarkdownParseStart::Started)
+    }
+
+    fn read_archived_content(&self, archive_id: u64) -> Result<Vec<u8>, Self::Error> {
+        VaultRepository::read_archived_content(self, archive_id)
+    }
+
+    fn accept_markdown_parse(
+        &mut self,
+        archive_id: u64,
+        parser_version: &str,
+        parsed: &ParsedMarkdownV1,
+        finished_at_millis: i64,
+    ) -> Result<(), Self::Error> {
+        if parsed.contract_version != parser_version {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let encoded = serde_json::to_string(parsed).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        let archive_id_sql = to_vault_sql_id(archive_id)?;
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        let changed = transaction.execute(
+            "UPDATE markdown_parse_attempts
+             SET state = 1, failure_reason = NULL, finished_at = ?1
+             WHERE archive_id = ?2 AND parser_version = ?3 AND state = 0",
+            params![finished_at_millis, archive_id_sql, parser_version],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        transaction.execute(
+            "INSERT INTO markdown_parse_artifacts
+             (archive_id, parser_version, parsed_json, accepted_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![archive_id_sql, parser_version, encoded, finished_at_millis],
+        )?;
+        transaction.execute(
+            "UPDATE archived_evidence
+             SET status = 2, unparsed_reason = NULL WHERE id = ?1",
+            [archive_id_sql],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn reject_markdown_parse(
+        &mut self,
+        archive_id: u64,
+        parser_version: &str,
+        reason: UnparsedReason,
+        finished_at_millis: i64,
+    ) -> Result<(), Self::Error> {
+        if matches!(
+            reason,
+            UnparsedReason::UnsupportedFormat | UnparsedReason::ParserInterrupted
+        ) {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let archive_id_sql = to_vault_sql_id(archive_id)?;
+        let reason_code = encode_unparsed_reason(reason);
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        let changed = transaction.execute(
+            "UPDATE markdown_parse_attempts
+             SET state = 2, failure_reason = ?1, finished_at = ?2
+             WHERE archive_id = ?3 AND parser_version = ?4 AND state = 0",
+            params![
+                reason_code,
+                finished_at_millis,
+                archive_id_sql,
+                parser_version
+            ],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        transaction.execute(
+            "UPDATE archived_evidence
+             SET status = 1, unparsed_reason = ?1 WHERE id = ?2",
+            params![reason_code, archive_id_sql],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 }
 
@@ -1179,6 +1389,26 @@ fn configure_connection(connection: &Connection) -> Result<(), VaultError> {
     Ok(())
 }
 
+fn recover_interrupted_markdown_attempts(connection: &mut Connection) -> Result<(), VaultError> {
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "UPDATE archived_evidence
+         SET status = 1, unparsed_reason = 8
+         WHERE id IN (
+             SELECT archive_id FROM markdown_parse_attempts WHERE state = 0
+         )",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE markdown_parse_attempts
+         SET state = 3, failure_reason = 8, finished_at = NULL
+         WHERE state = 0",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn referenced_object_ids(connection: &Connection) -> Result<HashSet<String>, VaultError> {
     let mut statement = connection.prepare("SELECT DISTINCT object_id FROM archived_evidence")?;
     statement
@@ -1190,7 +1420,8 @@ fn referenced_object_ids(connection: &Connection) -> Result<HashSet<String>, Vau
 const fn encode_archive_status(status: ArchiveStatus) -> (i64, Option<i64>) {
     match status {
         ArchiveStatus::Archived => (0, None),
-        ArchiveStatus::ArchivedUnparsed(UnparsedReason::UnsupportedFormat) => (1, Some(0)),
+        ArchiveStatus::ArchivedUnparsed(reason) => (1, Some(encode_unparsed_reason(reason))),
+        ArchiveStatus::Extracted => (2, None),
     }
 }
 
@@ -1200,9 +1431,49 @@ fn decode_archive_status(
 ) -> Result<ArchiveStatus, VaultError> {
     match (status, unparsed_reason) {
         (0, None) => Ok(ArchiveStatus::Archived),
-        (1, Some(0)) => Ok(ArchiveStatus::ArchivedUnparsed(
-            UnparsedReason::UnsupportedFormat,
-        )),
+        (1, Some(reason)) => Ok(ArchiveStatus::ArchivedUnparsed(decode_unparsed_reason(
+            reason,
+        )?)),
+        (2, None) => Ok(ArchiveStatus::Extracted),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+const fn encode_unparsed_reason(reason: UnparsedReason) -> i64 {
+    match reason {
+        UnparsedReason::UnsupportedFormat => 0,
+        UnparsedReason::InvalidEncoding => 1,
+        UnparsedReason::ResourceLimit(ParseResource::SourceBytes) => 2,
+        UnparsedReason::ResourceLimit(ParseResource::Blocks) => 3,
+        UnparsedReason::ResourceLimit(ParseResource::NestingDepth) => 4,
+        UnparsedReason::ResourceLimit(ParseResource::MetadataBytes) => 5,
+        UnparsedReason::ResourceLimit(ParseResource::Links) => 6,
+        UnparsedReason::InvalidStructure => 7,
+        UnparsedReason::ParserInterrupted => 8,
+    }
+}
+
+fn decode_unparsed_reason(value: i64) -> Result<UnparsedReason, VaultError> {
+    match value {
+        0 => Ok(UnparsedReason::UnsupportedFormat),
+        1 => Ok(UnparsedReason::InvalidEncoding),
+        2 => Ok(UnparsedReason::ResourceLimit(ParseResource::SourceBytes)),
+        3 => Ok(UnparsedReason::ResourceLimit(ParseResource::Blocks)),
+        4 => Ok(UnparsedReason::ResourceLimit(ParseResource::NestingDepth)),
+        5 => Ok(UnparsedReason::ResourceLimit(ParseResource::MetadataBytes)),
+        6 => Ok(UnparsedReason::ResourceLimit(ParseResource::Links)),
+        7 => Ok(UnparsedReason::InvalidStructure),
+        8 => Ok(UnparsedReason::ParserInterrupted),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+const fn decode_markdown_parse_state(value: i64) -> Result<MarkdownParseState, VaultError> {
+    match value {
+        0 => Ok(MarkdownParseState::Started),
+        1 => Ok(MarkdownParseState::Accepted),
+        2 => Ok(MarkdownParseState::Rejected),
+        3 => Ok(MarkdownParseState::Interrupted),
         _ => Err(VaultError::InvalidKeyOrCorrupt),
     }
 }

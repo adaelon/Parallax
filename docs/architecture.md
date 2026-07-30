@@ -247,6 +247,8 @@ S05 将 `self.db` schema 升至 v3：`self_bundle_versions` 追加完整不可�
 
 S07 将 `self.db` schema 升至 v4，保存宿主会话、心跳和运行空缺。S08 升至 v5：`archived_evidence` 只保存加密边界内的来源定位器、对象映射、长度、归档状态和原因；相同内容可被不同来源记录复用，同一来源同一对象幂等。
 
+S09 将 `self.db` schema 升至 v6：`markdown_parse_attempts` 以归档版本和解析器版本为联合主键保存 `STARTED/ACCEPTED/REJECTED/INTERRUPTED`，`markdown_parse_artifacts` 保存已接受的 `eam-markdown-v1` 加密 JSON 产物。解析接受、拒绝与归档状态更新各自在一个 SQLCipher 事务内完成；启动恢复先把遗留 `STARTED` 转为 `INTERRUPTED/PARSER_INTERRUPTED`。本片不创建 S10 的提取修订、权威证据块或索引。
+
 ### 4.2 逻辑数据模型
 
 以下是架构契约，不是最终数据库模式：
@@ -1197,3 +1199,35 @@ VaultRepository::open
 ```
 
 删除或移动投递原件不会删除已归档证据；同一来源同一内容幂等，不同来源相同内容复用一个密文对象并各自保留溯源记录。主窗口 capability 仍只有 `core:default`，WebView 只能调用领域 command，不能取得通用文件 API、repository、对象 ID、密钥或解密内容。当前 S08 不监视固定目录、不提供 Personal Library UI，也不理解 Markdown；这些分别留给后续宿主/资料源界面与 S09。该实现落实 [ADR-0007](adr/0007-context-inbox-import-semantics.md)、[ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0013](adr/0013-archive-before-understanding.md)、[ADR-0022](adr/0022-v1-markdown-only.md) 和 [ADR-0046](adr/0046-vault-cryptographic-profile.md)。
+
+### 9.9 S09 Core 内受限 Markdown 解析当前实现边界
+
+```text
+crates/markdown/
+  src/lib.rs            # eam-markdown-v1 事件流、硬上限、UTF-8 范围与保守扩展解析
+  tests/fixtures/       # 完整方言、未知语法、五类资源拒绝固定语料
+crates/ingestion/src/
+  domain.rs             # Markdown 尝试状态与归档重处理 port
+  service.rs            # STARTED 后读取、解析、原子接受/拒绝协调
+crates/vault/src/
+  schema.rs             # schema v6 尝试状态与加密解析产物
+  repository.rs         # SQLCipher 事务、认证对象读取与启动恢复
+```
+
+```text
+process_archived_markdown(archive_id, ParseLimits)
+  -> begin_markdown_parse(eam-markdown-v1)
+  -> 已有同版本尝试：NOT_RETRIED
+  -> 认证解密 S08 对象；无效 UTF-8：REJECTED(INVALID_ENCODING)
+  -> parse_markdown(&str, limits)
+  -> 资源/结构拒绝：尝试与 ARCHIVED_UNPARSED 原子提交
+  -> 完整结果：JSON 产物、ACCEPTED 与 EXTRACTED 原子提交
+
+VaultRepository::open
+  -> migrate schema v6
+  -> STARTED -> INTERRUPTED
+  -> ARCHIVED_UNPARSED(PARSER_INTERRUPTED)
+  -> 校准密文对象引用
+```
+
+S09 只产生解析器本地 `local_id`、来源字节范围、Properties、结构块、关系、标签和可选原生定位器；具体依赖、语法消歧和固定语料由 [G05 `eam-markdown-v1` 契约](markdown-contract-v1.md) 冻结。它不分配权威证据块 ID，不建立规范提取修订、块谱系、全文/向量索引或检索可用状态。桌面宿主没有新增解析 command 或 UI；S10 从已接受的加密解析产物继续建立权威证据块与逐字引用。

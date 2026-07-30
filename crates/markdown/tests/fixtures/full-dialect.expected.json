@@ -1,0 +1,43 @@
+{
+  "blocks": [
+    ["METADATA_BLOCK", null, 0, 213, null, null, null, null, null],
+    ["HEADING", null, 214, 228, 1, null, null, null, {"kind": "HEADING", "text": "标题 😀"}],
+    ["PARAGRAPH", null, 229, 472, null, null, null, null, {"kind": "BLOCK_ID", "id": "paragraph-id"}],
+    ["LIST", null, 473, 528, null, null, null, null, null],
+    ["LIST_ITEM", 4, 473, 489, null, null, true, null, null],
+    ["LIST_ITEM", 4, 489, 528, null, null, false, null, null],
+    ["BLOCK_QUOTE", null, 528, 546, null, null, null, null, null],
+    ["PARAGRAPH", 7, 530, 546, null, null, null, null, null],
+    ["CODE_BLOCK", null, 547, 599, null, null, null, "rust", null],
+    ["TABLE", null, 601, 647, null, null, null, null, {"kind": "BLOCK_ID", "id": "table-anchor"}],
+    ["TABLE_HEAD", 10, 601, 618, null, null, null, null, null],
+    ["TABLE_CELL", 11, 602, 608, null, null, null, null, null],
+    ["TABLE_CELL", 11, 609, 616, null, null, null, null, null],
+    ["TABLE_ROW", 10, 633, 647, null, null, null, null, null],
+    ["TABLE_CELL", 14, 634, 639, null, null, null, null, null],
+    ["TABLE_CELL", 14, 640, 645, null, null, null, null, null],
+    ["PARAGRAPH", null, 648, 662, null, null, null, null, null],
+    ["HTML_BLOCK", null, 663, 696, null, null, null, null, null]
+  ],
+  "properties": [
+    ["title", ["Contract fixture"], 0, 214],
+    ["tags", ["project/demo", "rust"], 0, 214],
+    ["aliases", ["Sample note", "样例"], 0, 214],
+    ["rating", ["5"], 0, 214],
+    ["active", ["true"], 0, 214]
+  ],
+  "relations": [
+    ["AUTOLINK", "https://example.test/angle", null, null, null, 280, 308],
+    ["AUTOLINK", "https://example.test/literal", null, null, null, 310, 338],
+    ["LINK", "notes/relative.md", null, null, null, 340, 369],
+    ["IMAGE", "asset.png", null, null, null, 371, 390],
+    ["WIKILINK", "Target note", "Alias", "Section", null, 392, 421],
+    ["EMBED", "asset.png", null, null, null, 423, 437],
+    ["WIKILINK", "", null, "Local heading", null, 508, 526]
+  ],
+  "tags": [
+    ["project/demo", 0, 214],
+    ["rust", 0, 214],
+    ["project/demo", 443, 456]
+  ]
+}

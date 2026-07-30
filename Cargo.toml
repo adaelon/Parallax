@@ -5,6 +5,7 @@ members = [
     "crates/desktop-host",
     "crates/identity",
     "crates/ingestion",
+    "crates/markdown",
     "crates/runtime-gateway",
     "crates/vault",
 ]

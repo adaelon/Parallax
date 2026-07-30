@@ -9,7 +9,11 @@ use std::{
 
 use crate::{
     ArchiveInput, ArchiveRepository, ArchiveStatus, CandidateKind, FileObservation, ImportOutcome,
-    ImportPolicy, IntakeDecision, UnparsedReason, evaluate_observations,
+    ImportPolicy, IntakeDecision, MarkdownArchiveRepository, MarkdownParseStart,
+    MarkdownParseState, UnparsedReason, evaluate_observations,
+};
+use eam_markdown::{
+    CONTRACT_VERSION, MarkdownParseError, ParseLimits, ParsedMarkdownV1, parse_markdown,
 };
 
 #[derive(Debug)]
@@ -34,6 +38,44 @@ impl<E: Error + 'static> Error for ImportError<E> {
             Self::Repository(error) => Some(error),
         }
     }
+}
+
+#[derive(Debug)]
+pub enum MarkdownProcessError<E> {
+    Repository(E),
+}
+
+impl<E: fmt::Display> fmt::Display for MarkdownProcessError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Repository(error) => write!(formatter, "Markdown persistence failed: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for MarkdownProcessError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Repository(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkdownProcessingOutcome {
+    Accepted {
+        archive_id: u64,
+        block_count: usize,
+        relation_count: usize,
+    },
+    Rejected {
+        archive_id: u64,
+        reason: UnparsedReason,
+    },
+    NotRetried {
+        archive_id: u64,
+        state: MarkdownParseState,
+    },
 }
 
 /// Observes, bounds, reads, and archives one Context Inbox path without parsing it.
@@ -111,6 +153,87 @@ pub fn ingest_inbox_file<R: ArchiveRepository>(
         })
         .map_err(ImportError::Repository)?;
     Ok(ImportOutcome::Archived(receipt))
+}
+
+/// Reprocesses one already encrypted Markdown archive under `eam-markdown-v1`.
+///
+/// `STARTED` is committed before authenticated plaintext is read. Every
+/// expected decode or parse failure is then committed as one atomic rejection;
+/// repository failures deliberately leave `STARTED` for startup recovery.
+///
+/// # Errors
+///
+/// Returns the repository error when attempt, object, acceptance, or rejection
+/// persistence fails.
+pub fn process_archived_markdown<R: MarkdownArchiveRepository>(
+    repository: &mut R,
+    archive_id: u64,
+    limits: ParseLimits,
+    started_at_millis: i64,
+    finished_at_millis: i64,
+) -> Result<MarkdownProcessingOutcome, MarkdownProcessError<R::Error>> {
+    match repository
+        .begin_markdown_parse(archive_id, CONTRACT_VERSION, started_at_millis)
+        .map_err(MarkdownProcessError::Repository)?
+    {
+        MarkdownParseStart::Started => {}
+        MarkdownParseStart::AlreadyAttempted(state) => {
+            return Ok(MarkdownProcessingOutcome::NotRetried { archive_id, state });
+        }
+    }
+
+    let content = repository
+        .read_archived_content(archive_id)
+        .map_err(MarkdownProcessError::Repository)?;
+    let Ok(source) = std::str::from_utf8(&content) else {
+        return reject_markdown(
+            repository,
+            archive_id,
+            UnparsedReason::InvalidEncoding,
+            finished_at_millis,
+        );
+    };
+    let parsed = match parse_markdown(source, limits) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let reason = match error {
+                MarkdownParseError::ResourceLimit(resource) => {
+                    UnparsedReason::ResourceLimit(resource)
+                }
+                MarkdownParseError::InvalidStructure => UnparsedReason::InvalidStructure,
+            };
+            return reject_markdown(repository, archive_id, reason, finished_at_millis);
+        }
+    };
+    accept_markdown(repository, archive_id, &parsed, finished_at_millis)
+}
+
+fn accept_markdown<R: MarkdownArchiveRepository>(
+    repository: &mut R,
+    archive_id: u64,
+    parsed: &ParsedMarkdownV1,
+    finished_at_millis: i64,
+) -> Result<MarkdownProcessingOutcome, MarkdownProcessError<R::Error>> {
+    repository
+        .accept_markdown_parse(archive_id, CONTRACT_VERSION, parsed, finished_at_millis)
+        .map_err(MarkdownProcessError::Repository)?;
+    Ok(MarkdownProcessingOutcome::Accepted {
+        archive_id,
+        block_count: parsed.blocks.len(),
+        relation_count: parsed.relations.len(),
+    })
+}
+
+fn reject_markdown<R: MarkdownArchiveRepository>(
+    repository: &mut R,
+    archive_id: u64,
+    reason: UnparsedReason,
+    finished_at_millis: i64,
+) -> Result<MarkdownProcessingOutcome, MarkdownProcessError<R::Error>> {
+    repository
+        .reject_markdown_parse(archive_id, CONTRACT_VERSION, reason, finished_at_millis)
+        .map_err(MarkdownProcessError::Repository)?;
+    Ok(MarkdownProcessingOutcome::Rejected { archive_id, reason })
 }
 
 fn observe_path(path: &Path) -> io::Result<FileObservation> {

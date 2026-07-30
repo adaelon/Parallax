@@ -3,6 +3,9 @@ name = "ingestion"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+eam_markdown = { package = "eam-markdown", path = "../markdown" }
+
 [lib]
 name = "eam_ingestion"
 

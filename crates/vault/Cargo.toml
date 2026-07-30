@@ -13,12 +13,14 @@ eam_core = { package = "core", path = "../core" }
 eam_desktop_host = { package = "desktop-host", path = "../desktop-host" }
 eam_identity = { package = "identity", path = "../identity" }
 eam_ingestion = { package = "ingestion", path = "../ingestion" }
+eam_markdown = { package = "eam-markdown", path = "../markdown" }
 fs4 = "=1.1.0"
 getrandom = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = "=0.13.0"
 rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 sha2 = "=0.11.0"
+serde_json = "=1.0.151"
 zeroize = "=1.9.0"
 
 [target.'cfg(windows)'.dependencies]

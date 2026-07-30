@@ -5,7 +5,11 @@ mod service;
 
 pub use domain::{
     ArchiveInput, ArchiveReceipt, ArchiveRepository, ArchiveStatus, ArchivedEvidence,
-    CandidateKind, FileObservation, ImportOutcome, ImportPolicy, IntakeDecision, RejectReason,
-    UnparsedReason, evaluate_observations,
+    CandidateKind, FileObservation, ImportOutcome, ImportPolicy, IntakeDecision,
+    MarkdownArchiveRepository, MarkdownParseAttempt, MarkdownParseStart, MarkdownParseState,
+    RejectReason, UnparsedReason, evaluate_observations,
 };
-pub use service::{ImportError, ingest_inbox_file};
+pub use service::{
+    ImportError, MarkdownProcessError, MarkdownProcessingOutcome, ingest_inbox_file,
+    process_archived_markdown,
+};

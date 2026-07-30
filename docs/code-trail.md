@@ -1,5 +1,39 @@
 # 代码链路
 
+## 2026-07-30 S09-3 加密解析尝试与归档重处理
+
+**触达**:
+- `crates/ingestion/src/domain.rs:MarkdownArchiveRepository` — 定义 `STARTED/ACCEPTED/REJECTED/INTERRUPTED` 尝试与原子接受、拒绝 port。
+- `crates/ingestion/src/service.rs:process_archived_markdown` — 在尝试落盘后认证读取归档对象，拒绝无效 UTF-8/解析失败，并阻止同来源版本与同解析器自动重试。
+- `crates/vault/src/schema.rs:MIGRATION_6` — 新增解析尝试、加密 JSON 产物和扩展归档状态约束。
+- `crates/vault/src/repository.rs:MarkdownArchiveRepository` — 事务化持久化解析结果，并在重开时把遗留 `STARTED` 恢复为 `INTERRUPTED/PARSER_INTERRUPTED`。
+- `crates/vault/tests/markdown_persistence.rs:accepted_parse_artifact_and_attempt_survive_sqlcipher_reopen` — 覆盖接受、拒绝、故障遗留恢复和跨重启不重试。
+- `apps/desktop/src-tauri/src/state.rs:import_context_file_view` — 穷举 S09 新归档终态，保持既有领域投影编译兼容且不暴露正文。
+
+**入口**：可信 Core 调用 `process_archived_markdown(repository, archive_id, limits, started_at, finished_at)`，只从 S08 已归档认证对象读取原文。
+**测试**：`cargo test --workspace --no-fail-fast` 87/87 通过，覆盖正向持久化、无效 UTF-8/资源拒绝、遗留尝试恢复与不自动重试；`cargo clippy --workspace --all-targets -- -D warnings` 通过。
+
+## 2026-07-30 S09-2 Core 内受限 Markdown 解析器
+
+**触达**:
+- `crates/markdown/src/lib.rs:parse_markdown` — 以私有硬上限、事件流、UTF-8 半开范围和原子错误实现 `eam-markdown-v1`。
+- `crates/markdown/src/lib.rs:parse_properties/parse_wikilink` — 保守规范化 Properties，并固定 Wikilink、嵌入、标签与块定位器消歧。
+- `crates/markdown/tests/contract.rs:full_dialect_has_stable_structure_and_verbatim_ranges` — 固定完整方言输出、未知语法降级、扩展隔离和五类资源拒绝。
+
+**入口**：可信 Core 调用 `parse_markdown(source_utf8, ParseLimits)`；类型不接收路径、I/O、repository、网络、运行时或工具句柄。
+**测试**：`cargo test -p eam-markdown` 6/6 通过；`cargo clippy -p eam-markdown --all-targets -- -D warnings` 通过。
+
+## 2026-07-30 S09-1 G05 Markdown 契约与固定语料
+
+**触达**:
+- `docs/markdown-contract-v1.md:eam-markdown-v1` — 冻结解析库、硬资源上限、块/关系结构、Wikilink 消歧、Properties 降级和定位器规则。
+- `crates/markdown/tests/fixtures/full-dialect.md` — 固定 CommonMark/GFM 与 Obsidian 子集正向语料。
+- `crates/markdown/tests/fixtures/unknown-syntax.md` — 固定未知语法逐字保留语料。
+- `crates/markdown/tests/fixtures/limits.md` — 固定五类资源拒绝语料。
+
+**入口**：S09 实现只允许通过 `parse_markdown(&str, ParseLimits)` 消费这些契约；依赖升级必须保持固定语料输出等价。
+**测试**：`git diff --check` 校验契约与语料补丁；解析结果和限额行为由下一子片的 `crates/markdown/tests/contract.rs` 固化。
+
 ## 2026-07-30 S08-3 宿主白名单归档入口
 
 **触达**:

@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 5;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 6;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -171,6 +171,69 @@ CREATE TABLE archived_evidence (
 CREATE INDEX archived_evidence_object_idx ON archived_evidence(object_id);
 ";
 
+const MIGRATION_6: &str = r"
+DROP INDEX archived_evidence_object_idx;
+ALTER TABLE archived_evidence RENAME TO archived_evidence_v5;
+
+CREATE TABLE archived_evidence (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    source_kind INTEGER NOT NULL CHECK (source_kind = 0),
+    source_locator TEXT NOT NULL CHECK (length(source_locator) > 0),
+    object_id TEXT NOT NULL CHECK (length(object_id) = 64),
+    content_length INTEGER NOT NULL CHECK (content_length >= 0),
+    status INTEGER NOT NULL CHECK (status IN (0, 1, 2)),
+    unparsed_reason INTEGER CHECK (
+        unparsed_reason IS NULL OR unparsed_reason BETWEEN 0 AND 8
+    ),
+    archived_at INTEGER NOT NULL,
+    CHECK (
+        (status IN (0, 2) AND unparsed_reason IS NULL)
+        OR (status = 1 AND unparsed_reason IS NOT NULL)
+    ),
+    UNIQUE (source_kind, source_locator, object_id)
+) STRICT;
+
+INSERT INTO archived_evidence
+    (id, source_kind, source_locator, object_id, content_length,
+     status, unparsed_reason, archived_at)
+SELECT id, source_kind, source_locator, object_id, content_length,
+       status, unparsed_reason, archived_at
+FROM archived_evidence_v5;
+
+DROP TABLE archived_evidence_v5;
+CREATE INDEX archived_evidence_object_idx ON archived_evidence(object_id);
+
+CREATE TABLE markdown_parse_attempts (
+    archive_id INTEGER NOT NULL
+        REFERENCES archived_evidence(id) ON DELETE RESTRICT,
+    parser_version TEXT NOT NULL CHECK (length(trim(parser_version)) > 0),
+    state INTEGER NOT NULL CHECK (state BETWEEN 0 AND 3),
+    failure_reason INTEGER CHECK (
+        failure_reason IS NULL OR failure_reason BETWEEN 1 AND 8
+    ),
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    PRIMARY KEY (archive_id, parser_version),
+    CHECK (
+        (state = 0 AND failure_reason IS NULL AND finished_at IS NULL)
+        OR (state = 1 AND failure_reason IS NULL AND finished_at IS NOT NULL)
+        OR (state = 2 AND failure_reason BETWEEN 1 AND 7 AND finished_at IS NOT NULL)
+        OR (state = 3 AND failure_reason = 8 AND finished_at IS NULL)
+    )
+) STRICT;
+
+CREATE TABLE markdown_parse_artifacts (
+    archive_id INTEGER NOT NULL,
+    parser_version TEXT NOT NULL,
+    parsed_json TEXT NOT NULL CHECK (length(parsed_json) > 0),
+    accepted_at INTEGER NOT NULL,
+    PRIMARY KEY (archive_id, parser_version),
+    FOREIGN KEY (archive_id, parser_version)
+        REFERENCES markdown_parse_attempts(archive_id, parser_version)
+        ON DELETE RESTRICT
+) STRICT;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -193,6 +256,7 @@ where
             3 => transaction.execute_batch(MIGRATION_3)?,
             4 => transaction.execute_batch(MIGRATION_4)?,
             5 => transaction.execute_batch(MIGRATION_5)?,
+            6 => transaction.execute_batch(MIGRATION_6)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -379,6 +443,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_markdown_migration_keeps_archive_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.execute_batch(MIGRATION_3).unwrap();
+        connection.execute_batch(MIGRATION_4).unwrap();
+        connection.execute_batch(MIGRATION_5).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 6 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(6))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        let archive_table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'archived_evidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let attempt_table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'markdown_parse_attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_table_count, 1);
+        assert_eq!(attempt_table_count, 0);
 
         migrate(&mut connection).unwrap();
         let version: i64 = connection

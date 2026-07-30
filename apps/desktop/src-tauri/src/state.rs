@@ -474,9 +474,10 @@ const fn import_context_file_view(outcome: ImportOutcome) -> ImportContextFileVi
         ImportOutcome::Archived(receipt) => {
             let (status, reason) = match receipt.status {
                 ArchiveStatus::Archived => ("archived", None),
-                ArchiveStatus::ArchivedUnparsed(UnparsedReason::UnsupportedFormat) => {
-                    ("archivedUnparsed", Some("UNSUPPORTED_FORMAT"))
+                ArchiveStatus::ArchivedUnparsed(reason) => {
+                    ("archivedUnparsed", Some(encode_unparsed_reason(reason)))
                 }
+                ArchiveStatus::Extracted => ("extracted", None),
             };
             ImportContextFileView {
                 status,
@@ -487,6 +488,16 @@ const fn import_context_file_view(outcome: ImportOutcome) -> ImportContextFileVi
                 source_version_reused: receipt.source_version_reused,
             }
         }
+    }
+}
+
+const fn encode_unparsed_reason(reason: UnparsedReason) -> &'static str {
+    match reason {
+        UnparsedReason::UnsupportedFormat => "UNSUPPORTED_FORMAT",
+        UnparsedReason::InvalidEncoding => "INVALID_ENCODING",
+        UnparsedReason::ResourceLimit(_) => "RESOURCE_LIMIT",
+        UnparsedReason::InvalidStructure => "INVALID_STRUCTURE",
+        UnparsedReason::ParserInterrupted => "PARSER_INTERRUPTED",
     }
 }
 
@@ -710,6 +721,27 @@ mod tests {
         assert_eq!(unsupported.status, "archivedUnparsed");
         assert_eq!(unsupported.archive_id, Some(2));
         assert_eq!(unsupported.reason, Some("UNSUPPORTED_FORMAT"));
+    }
+
+    #[test]
+    fn import_view_maps_s09_terminal_states_without_exposing_content() {
+        let extracted = import_context_file_view(ImportOutcome::Archived(ArchiveReceipt {
+            archive_id: 7,
+            status: ArchiveStatus::Extracted,
+            object_reused: false,
+            source_version_reused: false,
+        }));
+        let rejected = import_context_file_view(ImportOutcome::Archived(ArchiveReceipt {
+            archive_id: 8,
+            status: ArchiveStatus::ArchivedUnparsed(UnparsedReason::ParserInterrupted),
+            object_reused: false,
+            source_version_reused: false,
+        }));
+
+        assert_eq!(extracted.status, "extracted");
+        assert_eq!(extracted.reason, None);
+        assert_eq!(rejected.status, "archivedUnparsed");
+        assert_eq!(rejected.reason, Some("PARSER_INTERRUPTED"));
     }
 
     #[test]

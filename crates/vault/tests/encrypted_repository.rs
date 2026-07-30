@@ -35,7 +35,7 @@ fn preserves_exact_citations_and_separate_ledgers_across_reopen() {
     let marker = "S02-固定明文-不应出现在数据库字节中";
     let runtime = ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []);
     let repository = VaultRepository::open(directory.path(), key()).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 5);
+    assert_eq!(repository.schema_version().unwrap(), 6);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_000));
 
     let (source_id, classification) = core
