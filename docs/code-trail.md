@@ -1,5 +1,38 @@
 # 代码链路
 
+## 2026-07-30 S12-3 Obsidian 端到端校准
+
+**触达**:
+- `crates/source-obsidian/src/lib.rs:read_scanned_source_file` — 无跟随、有硬上限地读取扫描快照，并在长度/时间变化时终止本轮校准。
+- `crates/ingestion/src/service.rs:reconcile_obsidian_source` — 串联完整扫描、稳定归档、S09 解析、S10/S11 物化、移除确认和关系刷新。
+- `crates/source-obsidian/tests/fixtures/obsidian-vault` — 固定 Properties、标签、别名、Wikilink、嵌入、附件、配置目录与回收站样本。
+- `crates/vault/tests/obsidian_reconciliation.rs:fixed_obsidian_vault_reconciles_end_to_end_without_source_writes` — 覆盖新增、幂等、修改、移动、删除、根离线、恢复和源目录哈希不变。
+
+**入口**：可信宿主定期或收到文件通知后调用 `reconcile_obsidian_source(repository, root_id, root_path, limits, at)`。
+**测试**：固定样本端到端测试 1/1、`source-obsidian` 单测 4/4 及 source/ingestion/vault 目标 clippy 通过。
+
+## 2026-07-30 S12-2 Obsidian 来源状态与关系持久化
+
+**触达**:
+- `crates/source-obsidian/src/lib.rs:ObsidianSourceRepository` — 定义来源根、稳定记录、归档、离线/移除和关系刷新 port。
+- `crates/vault/src/schema.rs:MIGRATION_9` — 新增来源根/状态事件、Obsidian Properties、标签、别名、关系与可重建解析投影。
+- `crates/vault/src/repository.rs:ObsidianSourceRepository` — 原子保存移动、移除、恢复和版本，根离线不改变任何子记录。
+- `crates/vault/src/repository.rs:persist_obsidian_parse_projection` — 在接受 Markdown 产物的同一事务内保存可查询元数据与关系。
+- `crates/vault/tests/obsidian_source_persistence.rs` — 覆盖移动、离线、移除/恢复、跨重启、关系解析和 S11 谱系复用。
+
+**入口**：可信 Core 注册来源根后，通过 `archive_source_file` 与 `finish_source_reconciliation` 提交一次完整校准。
+**测试**：Obsidian 持久化集成测试 2/2 通过；schema v9 中断回滚与目标 clippy 通过。
+
+## 2026-07-30 S12-1 Obsidian 只读扫描边界
+
+**触达**:
+- `crates/source-obsidian/src/lib.rs:scan_obsidian_root` — 只读递归扫描普通文件，根不可访问时失败关闭为 `SOURCE_UNAVAILABLE`。
+- `crates/source-obsidian/src/lib.rs:is_excluded_directory` — 默认排除 `.obsidian` 与 `.trash`，且不跟随符号链接或重解析点。
+- `crates/source-obsidian/src/lib.rs::tests::scans_only_ordinary_source_files_without_modifying_the_root` — 固定 Markdown、附件、排除目录和源目录哈希不变。
+
+**入口**：可信 Core 对本人选择的 Obsidian 根目录调用 `scan_obsidian_root(root)`，只消费排序后的相对路径快照。
+**测试**：`cargo test -p source-obsidian --no-fail-fast` 3/3 通过；目标 clippy 通过。
+
 ## 2026-07-30 S11-2 谱系持久化与相邻修订编排
 
 **触达**:

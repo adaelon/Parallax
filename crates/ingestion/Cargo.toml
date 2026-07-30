@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 eam_markdown = { package = "eam-markdown", path = "../markdown" }
+eam_source_obsidian = { package = "source-obsidian", path = "../source-obsidian" }
 sha2 = "=0.11.0"
 
 [lib]

@@ -14,6 +14,7 @@ eam_desktop_host = { package = "desktop-host", path = "../desktop-host" }
 eam_identity = { package = "identity", path = "../identity" }
 eam_ingestion = { package = "ingestion", path = "../ingestion" }
 eam_markdown = { package = "eam-markdown", path = "../markdown" }
+eam_source_obsidian = { package = "source-obsidian", path = "../source-obsidian" }
 fs4 = "=1.1.0"
 getrandom = "=0.4.3"
 hkdf = "=0.13.0"

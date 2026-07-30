@@ -2049,6 +2049,7 @@ version = "0.1.0"
 dependencies = [
  "eam-markdown",
  "sha2 0.11.0",
+ "source-obsidian",
  "tempfile",
 ]
 
@@ -3830,6 +3831,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "source-obsidian"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+ "tempfile",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4859,6 +4868,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "sha2 0.11.0",
+ "source-obsidian",
  "tempfile",
  "windows-sys 0.61.2",
  "zeroize",

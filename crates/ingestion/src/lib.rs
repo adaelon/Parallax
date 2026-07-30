@@ -27,7 +27,8 @@ pub use lineage::{
 };
 pub use service::{
     EvidenceQueryError, ExtractionProcessError, ImportError, IncrementalMaterialization,
-    IncrementalProcessError, MarkdownProcessError, MarkdownProcessingOutcome, ingest_inbox_file,
+    IncrementalProcessError, MarkdownProcessError, MarkdownProcessingOutcome,
+    ObsidianReconcileError, ObsidianReconciliationOutcome, ReconciledSourceFile, ingest_inbox_file,
     materialize_accepted_markdown, materialize_incremental_markdown, open_evidence_block,
-    process_archived_markdown,
+    process_archived_markdown, reconcile_obsidian_source,
 };

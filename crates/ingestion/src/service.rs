@@ -19,6 +19,11 @@ use crate::{
 use eam_markdown::{
     CONTRACT_VERSION, MarkdownParseError, ParseLimits, ParsedMarkdownV1, parse_markdown,
 };
+use eam_source_obsidian::{
+    ObsidianSourceRepository, RejectedEntryReason, ScanError, SourceArchiveInput,
+    SourceAvailability, SourceFileKind, SourceReadOutcome, SourceRecord, SourceRoot,
+    SourceRootSnapshot, read_scanned_source_file, scan_obsidian_root,
+};
 
 #[derive(Debug)]
 pub enum ImportError<E> {
@@ -181,6 +186,106 @@ pub enum MarkdownProcessingOutcome {
     },
 }
 
+#[derive(Debug)]
+pub enum ObsidianReconcileError<E> {
+    Scan(ScanError),
+    Io(io::Error),
+    SourceChanged(String),
+    Rejected(String, RejectedEntryReason),
+    HardLimitExceeded(String),
+    Repository(E),
+    Evidence(EvidenceError),
+    Lineage(LineageError),
+}
+
+impl<E: fmt::Display> fmt::Display for ObsidianReconcileError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scan(error) => write!(formatter, "Obsidian scan failed: {error}"),
+            Self::Io(error) => write!(formatter, "Obsidian source read failed: {error}"),
+            Self::SourceChanged(path) => {
+                write!(
+                    formatter,
+                    "Obsidian source changed during reconciliation: {path}"
+                )
+            }
+            Self::Rejected(path, reason) => {
+                write!(
+                    formatter,
+                    "Obsidian source entry was rejected: {path} ({reason:?})"
+                )
+            }
+            Self::HardLimitExceeded(path) => {
+                write!(
+                    formatter,
+                    "Obsidian source entry exceeds the hard limit: {path}"
+                )
+            }
+            Self::Repository(error) => write!(formatter, "Obsidian persistence failed: {error}"),
+            Self::Evidence(error) => write!(formatter, "Obsidian evidence is invalid: {error}"),
+            Self::Lineage(error) => write!(formatter, "Obsidian lineage is invalid: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ObsidianReconcileError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Scan(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::Repository(error) => Some(error),
+            Self::Evidence(error) => Some(error),
+            Self::Lineage(error) => Some(error),
+            Self::SourceChanged(_) | Self::Rejected(_, _) | Self::HardLimitExceeded(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconciledSourceFile {
+    relative_path: String,
+    source_record_id: u64,
+    archive_id: u64,
+    source_version_reused: bool,
+    markdown_outcome: Option<MarkdownProcessingOutcome>,
+}
+
+impl ReconciledSourceFile {
+    #[must_use]
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub const fn source_record_id(&self) -> u64 {
+        self.source_record_id
+    }
+
+    #[must_use]
+    pub const fn archive_id(&self) -> u64 {
+        self.archive_id
+    }
+
+    #[must_use]
+    pub const fn source_version_reused(&self) -> bool {
+        self.source_version_reused
+    }
+
+    #[must_use]
+    pub const fn markdown_outcome(&self) -> Option<&MarkdownProcessingOutcome> {
+        self.markdown_outcome.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObsidianReconciliationOutcome {
+    SourceUnavailable(SourceRoot),
+    Completed {
+        snapshot: SourceRootSnapshot,
+        files: Vec<ReconciledSourceFile>,
+    },
+}
+
 /// Observes, bounds, reads, and archives one Context Inbox path without parsing it.
 ///
 /// # Errors
@@ -256,6 +361,180 @@ pub fn ingest_inbox_file<R: ArchiveRepository>(
         })
         .map_err(ImportError::Repository)?;
     Ok(ImportOutcome::Archived(receipt))
+}
+
+/// Reconciles one selected Obsidian root through the shared archive, Markdown,
+/// extraction, and S11 lineage pipeline.
+///
+/// A root-level unavailable scan commits only `SOURCE_UNAVAILABLE`. Child
+/// removals are committed only after every ordinary file from one complete scan
+/// has been read stably and archived.
+///
+/// # Errors
+///
+/// Returns a scan/read error without committing removals, or the shared
+/// repository/evidence/lineage error when a trusted persistence step fails.
+pub fn reconcile_obsidian_source<R>(
+    repository: &mut R,
+    root_id: u64,
+    root_path: &Path,
+    hard_limit_bytes: u64,
+    markdown_limits: ParseLimits,
+    observed_at_millis: i64,
+) -> Result<
+    ObsidianReconciliationOutcome,
+    ObsidianReconcileError<<R as ObsidianSourceRepository>::Error>,
+>
+where
+    R: ObsidianSourceRepository
+        + MarkdownArchiveRepository<Error = <R as ObsidianSourceRepository>::Error>
+        + EvidenceExtractionRepository<Error = <R as ObsidianSourceRepository>::Error>
+        + BlockLineageRepository<Error = <R as ObsidianSourceRepository>::Error>,
+{
+    let scan = scan_obsidian_root(root_path).map_err(ObsidianReconcileError::Scan)?;
+    if scan.availability() == SourceAvailability::SourceUnavailable {
+        let root = repository
+            .mark_source_unavailable(root_id, observed_at_millis)
+            .map_err(ObsidianReconcileError::Repository)?;
+        return Ok(ObsidianReconciliationOutcome::SourceUnavailable(root));
+    }
+    let previous = repository
+        .load_source_root(root_id)
+        .map_err(ObsidianReconcileError::Repository)?;
+    let existing_paths = previous
+        .records()
+        .iter()
+        .map(SourceRecord::relative_path)
+        .collect::<std::collections::HashSet<_>>();
+    let observed_paths = scan
+        .files()
+        .iter()
+        .map(|file| file.relative_path().to_owned())
+        .collect::<Vec<_>>();
+    let mut ordered_files = scan.files().iter().collect::<Vec<_>>();
+    ordered_files.sort_by_key(|file| {
+        (
+            !existing_paths.contains(file.relative_path()),
+            file.relative_path(),
+        )
+    });
+    let mut claimed = Vec::with_capacity(ordered_files.len());
+    let mut files = Vec::with_capacity(ordered_files.len());
+    for source_file in ordered_files {
+        let content = read_source_content(root_path, source_file, hard_limit_bytes)?;
+        let receipt = repository
+            .archive_source_file(SourceArchiveInput {
+                root_id,
+                relative_path: source_file.relative_path(),
+                observed_relative_paths: &observed_paths,
+                claimed_source_record_ids: &claimed,
+                content: &content,
+                kind: source_file.kind(),
+                observed_at_millis,
+            })
+            .map_err(ObsidianReconcileError::Repository)?;
+        let markdown_outcome = process_new_source_markdown(
+            repository,
+            source_file.kind(),
+            &receipt,
+            markdown_limits,
+            observed_at_millis,
+        )?;
+        claimed.push(receipt.source_record_id());
+        files.push(ReconciledSourceFile {
+            relative_path: source_file.relative_path().to_owned(),
+            source_record_id: receipt.source_record_id(),
+            archive_id: receipt.archive_id(),
+            source_version_reused: receipt.source_version_reused(),
+            markdown_outcome,
+        });
+    }
+    let confirmation = scan_obsidian_root(root_path).map_err(ObsidianReconcileError::Scan)?;
+    if confirmation.availability() == SourceAvailability::SourceUnavailable {
+        let root = repository
+            .mark_source_unavailable(root_id, observed_at_millis)
+            .map_err(ObsidianReconcileError::Repository)?;
+        return Ok(ObsidianReconciliationOutcome::SourceUnavailable(root));
+    }
+    if confirmation != scan {
+        return Err(ObsidianReconcileError::SourceChanged(
+            "<source-root>".to_owned(),
+        ));
+    }
+    let snapshot = repository
+        .finish_source_reconciliation(root_id, &claimed, observed_at_millis)
+        .map_err(ObsidianReconcileError::Repository)?;
+    repository
+        .refresh_source_relations(root_id)
+        .map_err(ObsidianReconcileError::Repository)?;
+    Ok(ObsidianReconciliationOutcome::Completed { snapshot, files })
+}
+
+fn read_source_content<E>(
+    root_path: &Path,
+    source_file: &eam_source_obsidian::SourceFile,
+    hard_limit_bytes: u64,
+) -> Result<Vec<u8>, ObsidianReconcileError<E>> {
+    match read_scanned_source_file(root_path, source_file, hard_limit_bytes)
+        .map_err(ObsidianReconcileError::Io)?
+    {
+        SourceReadOutcome::Stable(content) => Ok(content),
+        SourceReadOutcome::Changed => Err(ObsidianReconcileError::SourceChanged(
+            source_file.relative_path().to_owned(),
+        )),
+        SourceReadOutcome::Rejected(reason) => Err(ObsidianReconcileError::Rejected(
+            source_file.relative_path().to_owned(),
+            reason,
+        )),
+        SourceReadOutcome::HardLimitExceeded => Err(ObsidianReconcileError::HardLimitExceeded(
+            source_file.relative_path().to_owned(),
+        )),
+    }
+}
+
+fn process_new_source_markdown<R>(
+    repository: &mut R,
+    kind: SourceFileKind,
+    receipt: &eam_source_obsidian::SourceArchiveReceipt,
+    markdown_limits: ParseLimits,
+    observed_at_millis: i64,
+) -> Result<
+    Option<MarkdownProcessingOutcome>,
+    ObsidianReconcileError<<R as ObsidianSourceRepository>::Error>,
+>
+where
+    R: ObsidianSourceRepository
+        + MarkdownArchiveRepository<Error = <R as ObsidianSourceRepository>::Error>
+        + EvidenceExtractionRepository<Error = <R as ObsidianSourceRepository>::Error>
+        + BlockLineageRepository<Error = <R as ObsidianSourceRepository>::Error>,
+{
+    if kind != SourceFileKind::Markdown || receipt.source_version_reused() {
+        return Ok(None);
+    }
+    let outcome = process_archived_markdown(
+        repository,
+        receipt.archive_id(),
+        markdown_limits,
+        observed_at_millis,
+        observed_at_millis,
+    )
+    .map_err(|error| match error {
+        MarkdownProcessError::Repository(error) => ObsidianReconcileError::Repository(error),
+    })?;
+    if matches!(outcome, MarkdownProcessingOutcome::Accepted { .. }) {
+        materialize_incremental_markdown(
+            repository,
+            receipt.archive_id(),
+            CONTRACT_VERSION,
+            observed_at_millis,
+        )
+        .map_err(|error| match error {
+            IncrementalProcessError::Repository(error) => ObsidianReconcileError::Repository(error),
+            IncrementalProcessError::Evidence(error) => ObsidianReconcileError::Evidence(error),
+            IncrementalProcessError::Lineage(error) => ObsidianReconcileError::Lineage(error),
+        })?;
+    }
+    Ok(Some(outcome))
 }
 
 /// Reprocesses one already encrypted Markdown archive under `eam-markdown-v1`.

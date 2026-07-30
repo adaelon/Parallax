@@ -28,7 +28,12 @@ use eam_ingestion::{
     MarkdownParseStart, MarkdownParseState, MaterializedExtraction, SourceAnchor, UnparsedReason,
     ValidatedExtraction,
 };
-use eam_markdown::{MarkdownBlockKind, ParseResource, ParsedMarkdownV1};
+use eam_markdown::{MarkdownBlockKind, MarkdownRelationKind, ParseResource, ParsedMarkdownV1};
+use eam_source_obsidian::{
+    ObsidianSourceRepository, SourceArchiveInput, SourceArchiveReceipt, SourceAvailability,
+    SourceDocumentProjection, SourceFileKind, SourceRecord, SourceRecordState, SourceRelation,
+    SourceRelationKind, SourceRoot, SourceRootSnapshot,
+};
 use fs4::{FileExt, TryLockError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -242,6 +247,93 @@ impl VaultRepository {
             .optional()?
             .ok_or(VaultError::InvalidKeyOrCorrupt)?;
         serde_json::from_str(&encoded).map_err(|_| VaultError::InvalidKeyOrCorrupt)
+    }
+
+    /// Loads the queryable Obsidian metadata and relation projection for one
+    /// accepted evidence version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence is not an Obsidian document or its
+    /// encrypted projection is structurally invalid.
+    pub fn source_document_projection(
+        &self,
+        evidence_id: u64,
+    ) -> Result<SourceDocumentProjection, VaultError> {
+        let evidence_id_sql = to_vault_sql_id(evidence_id)?;
+        let is_obsidian = self
+            .connection()
+            .query_row(
+                "SELECT 1
+                 FROM source_record_versions v
+                 JOIN source_records s ON s.id = v.source_record_id
+                 WHERE v.evidence_id = ?1 AND s.origin_kind = 1",
+                [evidence_id_sql],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_obsidian {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let properties = load_string_pairs(
+            self.connection(),
+            "SELECT name, value FROM obsidian_properties
+             WHERE evidence_id = ?1 ORDER BY property_ordinal, value_ordinal",
+            evidence_id_sql,
+        )?;
+        let tags = load_strings(
+            self.connection(),
+            "SELECT value FROM obsidian_tags WHERE evidence_id = ?1 ORDER BY ordinal",
+            evidence_id_sql,
+        )?;
+        let aliases = load_strings(
+            self.connection(),
+            "SELECT value FROM obsidian_aliases WHERE evidence_id = ?1 ORDER BY ordinal",
+            evidence_id_sql,
+        )?;
+        let mut statement = self.connection().prepare(
+            "SELECT r.relation_kind, r.target, r.alias, r.heading, r.block_id,
+                    x.resolved_source_record_id
+             FROM obsidian_relations r
+             LEFT JOIN obsidian_relation_resolutions x
+               ON x.evidence_id = r.evidence_id
+              AND x.relation_ordinal = r.ordinal
+             WHERE r.evidence_id = ?1 ORDER BY r.ordinal",
+        )?;
+        let relations = statement
+            .query_map([evidence_id_sql], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(kind, target, alias, heading, block_id, resolved)| {
+                Ok(SourceRelation::new(
+                    decode_source_relation_kind(kind)?,
+                    target,
+                    alias,
+                    heading,
+                    block_id,
+                    resolved
+                        .map(|id| u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt))
+                        .transpose()?,
+                ))
+            })
+            .collect::<Result<Vec<_>, VaultError>>()?;
+        Ok(SourceDocumentProjection::new(
+            evidence_id,
+            properties,
+            tags,
+            aliases,
+            relations,
+        ))
     }
 
     /// Restores one complete immutable S10 extraction and its ordered blocks.
@@ -621,11 +713,17 @@ impl MarkdownArchiveRepository for VaultRepository {
         let source_locator = self
             .connection()
             .query_row(
-                "SELECT source_locator FROM archived_evidence WHERE id = ?1",
+                "SELECT CASE WHEN s.origin_kind = 1 THEN s.current_locator
+                             ELSE a.source_locator END
+                 FROM archived_evidence a
+                 JOIN source_record_versions v ON v.evidence_id = a.id
+                 JOIN source_records s ON s.id = v.source_record_id
+                 WHERE a.id = ?1",
                 [archive_id_sql],
-                |row| row.get::<_, String>(0),
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
+            .flatten()
             .ok_or(VaultError::InvalidKeyOrCorrupt)?;
         if !std::path::Path::new(&source_locator)
             .extension()
@@ -680,6 +778,7 @@ impl MarkdownArchiveRepository for VaultRepository {
              VALUES (?1, ?2, ?3, ?4)",
             params![archive_id_sql, parser_version, encoded, finished_at_millis],
         )?;
+        persist_obsidian_parse_projection(&transaction, archive_id_sql, parsed)?;
         transaction.execute(
             "UPDATE archived_evidence
              SET status = 2, unparsed_reason = NULL WHERE id = ?1",
@@ -880,6 +979,229 @@ impl BlockLineageRepository for VaultRepository {
         rule_version: &str,
     ) -> Result<Option<LineageBatch>, Self::Error> {
         load_lineage_batch(self.connection(), to_revision_id, rule_version)
+    }
+}
+
+impl ObsidianSourceRepository for VaultRepository {
+    type Error = VaultError;
+
+    fn register_source_root(
+        &mut self,
+        root_locator: &str,
+        observed_at_millis: i64,
+    ) -> Result<SourceRoot, Self::Error> {
+        if root_locator.trim().is_empty() {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        if let Some(root_id) = self
+            .connection()
+            .query_row(
+                "SELECT id FROM source_roots WHERE root_kind = 0 AND root_locator = ?1",
+                [root_locator],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            return load_source_root_snapshot(
+                self.connection(),
+                u64::try_from(root_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            )
+            .map(|snapshot| snapshot.root().clone());
+        }
+        let root_id = next_identifier(self.connection(), "source_roots")?;
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        transaction.execute(
+            "INSERT INTO source_roots
+             (id, root_kind, root_locator, availability, first_seen_at, last_reconciled_at)
+             VALUES (?1, 0, ?2, 0, ?3, NULL)",
+            params![to_vault_sql_id(root_id)?, root_locator, observed_at_millis],
+        )?;
+        insert_source_root_event(
+            &transaction,
+            root_id,
+            SourceAvailability::Available,
+            observed_at_millis,
+        )?;
+        transaction.commit()?;
+        load_source_root_snapshot(self.connection(), root_id)
+            .map(|snapshot| snapshot.root().clone())
+    }
+
+    fn load_source_root(&self, root_id: u64) -> Result<SourceRootSnapshot, Self::Error> {
+        load_source_root_snapshot(self.connection(), root_id)
+    }
+
+    fn mark_source_unavailable(
+        &mut self,
+        root_id: u64,
+        observed_at_millis: i64,
+    ) -> Result<SourceRoot, Self::Error> {
+        let root_id_sql = to_vault_sql_id(root_id)?;
+        let current = self
+            .connection()
+            .query_row(
+                "SELECT availability FROM source_roots WHERE id = ?1",
+                [root_id_sql],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        if current != encode_source_availability(SourceAvailability::SourceUnavailable) {
+            let transaction = self
+                .connection
+                .as_mut()
+                .expect("an open vault always owns a database connection")
+                .transaction()?;
+            transaction.execute(
+                "UPDATE source_roots SET availability = 1 WHERE id = ?1",
+                [root_id_sql],
+            )?;
+            insert_source_root_event(
+                &transaction,
+                root_id,
+                SourceAvailability::SourceUnavailable,
+                observed_at_millis,
+            )?;
+            transaction.commit()?;
+        }
+        load_source_root_snapshot(self.connection(), root_id)
+            .map(|snapshot| snapshot.root().clone())
+    }
+
+    fn archive_source_file(
+        &mut self,
+        input: SourceArchiveInput<'_>,
+    ) -> Result<SourceArchiveReceipt, Self::Error> {
+        if !is_normalized_source_locator(input.relative_path) || input.root_id == 0 {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let stored = self.object_store.store(input.content)?;
+        let selected = select_source_record(
+            self.connection(),
+            &input,
+            stored.id.as_str(),
+            next_identifier(self.connection(), "source_records")?,
+        )?;
+        let existing_version =
+            find_source_version(self.connection(), selected.id, stored.id.as_str())?;
+        let archive_id = commit_source_file_observation(
+            self.connection
+                .as_mut()
+                .expect("an open vault always owns a database connection"),
+            &input,
+            &selected,
+            &stored.id,
+            existing_version,
+            self.next_archive_id,
+        )?;
+        if existing_version.is_none() {
+            self.next_archive_id = archive_id
+                .checked_add(1)
+                .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        }
+        Ok(SourceArchiveReceipt::new(
+            selected.id,
+            archive_id,
+            selected.previous_locator,
+            stored.reused,
+            existing_version.is_some(),
+        ))
+    }
+
+    fn finish_source_reconciliation(
+        &mut self,
+        root_id: u64,
+        observed_source_record_ids: &[u64],
+        observed_at_millis: i64,
+    ) -> Result<SourceRootSnapshot, Self::Error> {
+        let root_id_sql = to_vault_sql_id(root_id)?;
+        let observed = observed_source_record_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        if observed.len() != observed_source_record_ids.len() {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let mut statement = self.connection().prepare(
+            "SELECT id, current_locator, record_state FROM source_records
+             WHERE origin_kind = 1 AND root_id = ?1 ORDER BY id",
+        )?;
+        let records = statement
+            .query_map([root_id_sql], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let known = records
+            .iter()
+            .map(|(id, _, _)| u64::try_from(*id))
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        if !observed.is_subset(&known) {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let availability = self
+            .connection()
+            .query_row(
+                "SELECT availability FROM source_roots WHERE id = ?1",
+                [root_id_sql],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        if availability != encode_source_availability(SourceAvailability::Available) {
+            insert_source_root_event(
+                &transaction,
+                root_id,
+                SourceAvailability::Available,
+                observed_at_millis,
+            )?;
+        }
+        transaction.execute(
+            "UPDATE source_roots
+             SET availability = 0, last_reconciled_at = ?1 WHERE id = ?2",
+            params![observed_at_millis, root_id_sql],
+        )?;
+        for (id, locator, state) in records {
+            let id = u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+            if !observed.contains(&id)
+                && state != encode_source_record_state(SourceRecordState::SourceRemoved)
+            {
+                transaction.execute(
+                    "UPDATE source_records SET record_state = 1 WHERE id = ?1",
+                    [to_vault_sql_id(id)?],
+                )?;
+                insert_source_record_event(
+                    &transaction,
+                    id,
+                    SourceRecordState::SourceRemoved,
+                    &locator,
+                    observed_at_millis,
+                )?;
+            }
+        }
+        transaction.commit()?;
+        load_source_root_snapshot(self.connection(), root_id)
+    }
+
+    fn refresh_source_relations(&mut self, root_id: u64) -> Result<(), Self::Error> {
+        refresh_obsidian_relation_resolutions(
+            self.connection.as_mut().expect("open vault"),
+            root_id,
+        )
     }
 }
 
@@ -1782,6 +2104,699 @@ fn referenced_object_ids(connection: &Connection) -> Result<HashSet<String>, Vau
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<HashSet<_>, _>>()
         .map_err(VaultError::from)
+}
+
+struct SelectedSourceRecord {
+    id: u64,
+    is_new: bool,
+    previous_locator: Option<String>,
+}
+
+fn select_source_record(
+    connection: &Connection,
+    input: &SourceArchiveInput<'_>,
+    object_id: &str,
+    next_source_record_id: u64,
+) -> Result<SelectedSourceRecord, VaultError> {
+    let root_id_sql = to_vault_sql_id(input.root_id)?;
+    let root_exists = connection
+        .query_row(
+            "SELECT 1 FROM source_roots WHERE id = ?1",
+            [root_id_sql],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !root_exists {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    let exact = connection
+        .query_row(
+            "SELECT id FROM source_records
+             WHERE origin_kind = 1 AND root_id = ?1 AND current_locator = ?2",
+            params![root_id_sql, input.relative_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|id| u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt))
+        .transpose()?;
+    if let Some(id) = exact {
+        return Ok(SelectedSourceRecord {
+            id,
+            is_new: false,
+            previous_locator: None,
+        });
+    }
+    let observed = input
+        .observed_relative_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let claimed = input
+        .claimed_source_record_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut statement = connection.prepare(
+        "SELECT s.id, s.current_locator
+         FROM source_records s
+         JOIN source_record_versions v ON v.source_record_id = s.id
+         JOIN archived_evidence a ON a.id = v.evidence_id
+         WHERE s.origin_kind = 1 AND s.root_id = ?1
+           AND a.object_id = ?2
+           AND v.version_ordinal = (
+               SELECT MAX(v2.version_ordinal)
+               FROM source_record_versions v2
+               WHERE v2.source_record_id = s.id
+           )",
+    )?;
+    let mut move_candidates = statement
+        .query_map(params![root_id_sql, object_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|(id, locator)| {
+            let id = u64::try_from(id).ok()?;
+            (!claimed.contains(&id) && !observed.contains(locator.as_str()))
+                .then_some((id, locator))
+        })
+        .collect::<Vec<_>>();
+    if move_candidates.len() == 1 {
+        let (id, previous_locator) = move_candidates.pop().expect("one move candidate");
+        return Ok(SelectedSourceRecord {
+            id,
+            is_new: false,
+            previous_locator: Some(previous_locator),
+        });
+    }
+    Ok(SelectedSourceRecord {
+        id: next_source_record_id,
+        is_new: true,
+        previous_locator: None,
+    })
+}
+
+fn find_source_version(
+    connection: &Connection,
+    source_record_id: u64,
+    object_id: &str,
+) -> Result<Option<u64>, VaultError> {
+    connection
+        .query_row(
+            "SELECT a.id
+             FROM source_record_versions v
+             JOIN archived_evidence a ON a.id = v.evidence_id
+             WHERE v.source_record_id = ?1 AND a.object_id = ?2",
+            params![to_vault_sql_id(source_record_id)?, object_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|id| u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt))
+        .transpose()
+}
+
+fn commit_source_file_observation(
+    connection: &mut Connection,
+    input: &SourceArchiveInput<'_>,
+    selected: &SelectedSourceRecord,
+    object_id: &str,
+    existing_version: Option<u64>,
+    next_archive_id: u64,
+) -> Result<u64, VaultError> {
+    let transaction = connection.transaction()?;
+    commit_source_record_state(&transaction, input, selected)?;
+    let archive_id = if let Some(existing) = existing_version {
+        existing
+    } else {
+        insert_source_archive_version(
+            &transaction,
+            input,
+            selected.id,
+            object_id,
+            next_archive_id,
+        )?;
+        next_archive_id
+    };
+    transaction.commit()?;
+    Ok(archive_id)
+}
+
+fn commit_source_record_state(
+    transaction: &rusqlite::Transaction<'_>,
+    input: &SourceArchiveInput<'_>,
+    selected: &SelectedSourceRecord,
+) -> Result<(), VaultError> {
+    if selected.is_new {
+        let stable_locator = format!("obsidian:{}:{}", input.root_id, selected.id);
+        transaction.execute(
+            "INSERT INTO source_records
+             (id, source_kind, source_locator, origin_kind, root_id,
+              current_locator, record_state, first_seen_at, last_seen_at)
+             VALUES (?1, 0, ?2, 1, ?3, ?4, 0, ?5, ?5)",
+            params![
+                to_vault_sql_id(selected.id)?,
+                stable_locator,
+                to_vault_sql_id(input.root_id)?,
+                input.relative_path,
+                input.observed_at_millis,
+            ],
+        )?;
+        return insert_source_record_event(
+            transaction,
+            selected.id,
+            SourceRecordState::Present,
+            input.relative_path,
+            input.observed_at_millis,
+        );
+    }
+    let (state, old_locator) = transaction.query_row(
+        "SELECT record_state, current_locator FROM source_records WHERE id = ?1",
+        [to_vault_sql_id(selected.id)?],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    transaction.execute(
+        "UPDATE source_records
+         SET current_locator = ?1, record_state = 0, last_seen_at = ?2
+         WHERE id = ?3",
+        params![
+            input.relative_path,
+            input.observed_at_millis,
+            to_vault_sql_id(selected.id)?
+        ],
+    )?;
+    if state != encode_source_record_state(SourceRecordState::Present)
+        || old_locator != input.relative_path
+    {
+        insert_source_record_event(
+            transaction,
+            selected.id,
+            SourceRecordState::Present,
+            input.relative_path,
+            input.observed_at_millis,
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_source_archive_version(
+    transaction: &rusqlite::Transaction<'_>,
+    input: &SourceArchiveInput<'_>,
+    source_record_id: u64,
+    object_id: &str,
+    archive_id: u64,
+) -> Result<(), VaultError> {
+    let archive_status = match input.kind {
+        SourceFileKind::Markdown => ArchiveStatus::Archived,
+        SourceFileKind::Attachment => {
+            ArchiveStatus::ArchivedUnparsed(UnparsedReason::UnsupportedFormat)
+        }
+    };
+    let (status, unparsed_reason) = encode_archive_status(archive_status);
+    let stable_locator = format!("obsidian:{}:{source_record_id}", input.root_id);
+    transaction.execute(
+        "INSERT INTO archived_evidence
+         (id, source_kind, source_locator, object_id, content_length,
+          status, unparsed_reason, archived_at)
+         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            to_vault_sql_id(archive_id)?,
+            stable_locator,
+            object_id,
+            i64::try_from(input.content.len()).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            status,
+            unparsed_reason,
+            input.observed_at_millis,
+        ],
+    )?;
+    let version_ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(version_ordinal), -1) + 1
+         FROM source_record_versions WHERE source_record_id = ?1",
+        [to_vault_sql_id(source_record_id)?],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO source_record_versions
+         (source_record_id, evidence_id, version_ordinal) VALUES (?1, ?2, ?3)",
+        params![
+            to_vault_sql_id(source_record_id)?,
+            to_vault_sql_id(archive_id)?,
+            version_ordinal,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_source_root_snapshot(
+    connection: &Connection,
+    root_id: u64,
+) -> Result<SourceRootSnapshot, VaultError> {
+    let root_id_sql = to_vault_sql_id(root_id)?;
+    let root = connection
+        .query_row(
+            "SELECT root_locator, availability, first_seen_at, last_reconciled_at
+             FROM source_roots WHERE id = ?1",
+            [root_id_sql],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let root = SourceRoot::new(
+        root_id,
+        root.0,
+        decode_source_availability(root.1)?,
+        root.2,
+        root.3,
+    )
+    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let mut statement = connection.prepare(
+        "SELECT s.id, s.current_locator, s.record_state, s.first_seen_at,
+                s.last_seen_at,
+                (SELECT v.evidence_id FROM source_record_versions v
+                 WHERE v.source_record_id = s.id
+                 ORDER BY v.version_ordinal DESC LIMIT 1)
+         FROM source_records s
+         WHERE s.origin_kind = 1 AND s.root_id = ?1 ORDER BY s.id",
+    )?;
+    let records = statement
+        .query_map([root_id_sql], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(id, locator, state, first_seen, last_seen, evidence_id)| {
+            SourceRecord::new(
+                u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                root_id,
+                locator.ok_or(VaultError::InvalidKeyOrCorrupt)?,
+                decode_source_record_state(state)?,
+                first_seen,
+                last_seen,
+                evidence_id
+                    .map(|value| u64::try_from(value).map_err(|_| VaultError::InvalidKeyOrCorrupt))
+                    .transpose()?,
+            )
+            .map_err(|_| VaultError::InvalidKeyOrCorrupt)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SourceRootSnapshot::new(root, records))
+}
+
+fn insert_source_root_event(
+    transaction: &rusqlite::Transaction<'_>,
+    root_id: u64,
+    availability: SourceAvailability,
+    occurred_at_millis: i64,
+) -> Result<(), VaultError> {
+    let ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(ordinal), -1) + 1
+         FROM source_root_state_events WHERE root_id = ?1",
+        [to_vault_sql_id(root_id)?],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO source_root_state_events
+         (root_id, ordinal, availability, occurred_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            to_vault_sql_id(root_id)?,
+            ordinal,
+            encode_source_availability(availability),
+            occurred_at_millis,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_source_record_event(
+    transaction: &rusqlite::Transaction<'_>,
+    source_record_id: u64,
+    state: SourceRecordState,
+    locator: &str,
+    occurred_at_millis: i64,
+) -> Result<(), VaultError> {
+    let ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(ordinal), -1) + 1
+         FROM source_record_state_events WHERE source_record_id = ?1",
+        [to_vault_sql_id(source_record_id)?],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO source_record_state_events
+         (source_record_id, ordinal, record_state, locator, occurred_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            to_vault_sql_id(source_record_id)?,
+            ordinal,
+            encode_source_record_state(state),
+            locator,
+            occurred_at_millis,
+        ],
+    )?;
+    Ok(())
+}
+
+fn persist_obsidian_parse_projection(
+    transaction: &rusqlite::Transaction<'_>,
+    evidence_id: i64,
+    parsed: &ParsedMarkdownV1,
+) -> Result<(), VaultError> {
+    let is_obsidian = transaction
+        .query_row(
+            "SELECT 1
+             FROM source_record_versions v
+             JOIN source_records s ON s.id = v.source_record_id
+             WHERE v.evidence_id = ?1 AND s.origin_kind = 1",
+            [evidence_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !is_obsidian {
+        return Ok(());
+    }
+    let mut alias_ordinal = 0_i64;
+    for (property_ordinal, property) in parsed.properties.iter().enumerate() {
+        for (value_ordinal, value) in property.values.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO obsidian_properties
+                 (evidence_id, property_ordinal, value_ordinal, name, value)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    evidence_id,
+                    i64::try_from(property_ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    i64::try_from(value_ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    property.name,
+                    value,
+                ],
+            )?;
+            if property.name.eq_ignore_ascii_case("aliases") {
+                transaction.execute(
+                    "INSERT INTO obsidian_aliases (evidence_id, ordinal, value)
+                     VALUES (?1, ?2, ?3)",
+                    params![evidence_id, alias_ordinal, value],
+                )?;
+                alias_ordinal += 1;
+            }
+        }
+    }
+    for (ordinal, tag) in parsed.tags.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO obsidian_tags (evidence_id, ordinal, value)
+             VALUES (?1, ?2, ?3)",
+            params![
+                evidence_id,
+                i64::try_from(ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                tag.value,
+            ],
+        )?;
+    }
+    for (ordinal, relation) in parsed.relations.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO obsidian_relations
+             (evidence_id, ordinal, relation_kind, target, alias, heading,
+              block_id, start_byte, end_byte)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                evidence_id,
+                i64::try_from(ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                encode_markdown_relation_kind(relation.kind),
+                relation.target,
+                relation.alias,
+                relation.heading,
+                relation.block_id,
+                i64::try_from(relation.source_span.start_byte)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                i64::try_from(relation.source_span.end_byte)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RelationTargetCandidate {
+    id: u64,
+    locator: String,
+    aliases: Vec<String>,
+}
+
+fn refresh_obsidian_relation_resolutions(
+    connection: &mut Connection,
+    root_id: u64,
+) -> Result<(), VaultError> {
+    let root_id_sql = to_vault_sql_id(root_id)?;
+    let mut candidate_statement = connection.prepare(
+        "SELECT s.id, s.current_locator,
+                (SELECT v.evidence_id FROM source_record_versions v
+                 WHERE v.source_record_id = s.id
+                 ORDER BY v.version_ordinal DESC LIMIT 1)
+         FROM source_records s
+         WHERE s.origin_kind = 1 AND s.root_id = ?1 AND s.record_state = 0
+         ORDER BY s.id",
+    )?;
+    let candidate_rows = candidate_statement
+        .query_map([root_id_sql], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(candidate_statement);
+    let mut candidates = Vec::with_capacity(candidate_rows.len());
+    for (id, locator, evidence_id) in candidate_rows {
+        let aliases = if let Some(evidence_id) = evidence_id {
+            load_strings(
+                connection,
+                "SELECT value FROM obsidian_aliases
+                 WHERE evidence_id = ?1 ORDER BY ordinal",
+                evidence_id,
+            )?
+        } else {
+            Vec::new()
+        };
+        candidates.push(RelationTargetCandidate {
+            id: u64::try_from(id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            locator,
+            aliases,
+        });
+    }
+    let mut relation_statement = connection.prepare(
+        "SELECT r.evidence_id, r.ordinal, r.target, s.id, s.current_locator
+         FROM obsidian_relations r
+         JOIN source_record_versions v ON v.evidence_id = r.evidence_id
+         JOIN source_records s ON s.id = v.source_record_id
+         WHERE s.root_id = ?1 ORDER BY r.evidence_id, r.ordinal",
+    )?;
+    let relations = relation_statement
+        .query_map([root_id_sql], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(relation_statement);
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "DELETE FROM obsidian_relation_resolutions
+         WHERE evidence_id IN (
+             SELECT v.evidence_id
+             FROM source_record_versions v
+             JOIN source_records s ON s.id = v.source_record_id
+             WHERE s.root_id = ?1
+         )",
+        [root_id_sql],
+    )?;
+    for (evidence_id, ordinal, target, source_record_id, source_locator) in relations {
+        let source_record_id =
+            u64::try_from(source_record_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+        if let Some(resolved) =
+            resolve_relation_target(&target, source_record_id, &source_locator, &candidates)
+        {
+            transaction.execute(
+                "INSERT INTO obsidian_relation_resolutions
+                 (evidence_id, relation_ordinal, resolved_source_record_id)
+                 VALUES (?1, ?2, ?3)",
+                params![evidence_id, ordinal, to_vault_sql_id(resolved)?],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn resolve_relation_target(
+    target: &str,
+    source_record_id: u64,
+    source_locator: &str,
+    candidates: &[RelationTargetCandidate],
+) -> Option<u64> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Some(source_record_id);
+    }
+    let lower = target.to_lowercase();
+    if lower.contains("://") || lower.starts_with("mailto:") || lower.starts_with("data:") {
+        return None;
+    }
+    let target_variants = relation_target_variants(source_locator, target);
+    let mut matches = candidates
+        .iter()
+        .filter(|candidate| {
+            let locator = candidate.locator.to_lowercase();
+            let without_markdown = locator.strip_suffix(".md").unwrap_or(&locator);
+            let stem = locator
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".md"))
+                .unwrap_or_else(|| locator.rsplit('/').next().unwrap_or(&locator));
+            target_variants
+                .iter()
+                .any(|target| target == &locator || target == without_markdown || target == stem)
+                || candidate
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.to_lowercase() == lower)
+        })
+        .map(|candidate| candidate.id)
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches.dedup();
+    (matches.len() == 1).then(|| matches[0])
+}
+
+fn relation_target_variants(source_locator: &str, target: &str) -> HashSet<String> {
+    let target = target.replace('\\', "/");
+    let mut variants = HashSet::from([target.trim_start_matches('/').to_lowercase()]);
+    let parent = source_locator
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent);
+    let joined = if parent.is_empty() {
+        target.clone()
+    } else {
+        format!("{parent}/{target}")
+    };
+    if let Some(normalized) = normalize_relative_segments(&joined) {
+        variants.insert(normalized.to_lowercase());
+    }
+    variants
+}
+
+fn normalize_relative_segments(value: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in value.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            value => parts.push(value),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn load_strings(connection: &Connection, query: &str, id: i64) -> Result<Vec<String>, VaultError> {
+    let mut statement = connection.prepare(query)?;
+    statement
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(VaultError::from)
+}
+
+fn load_string_pairs(
+    connection: &Connection,
+    query: &str,
+    id: i64,
+) -> Result<Vec<(String, String)>, VaultError> {
+    let mut statement = connection.prepare(query)?;
+    statement
+        .query_map([id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(VaultError::from)
+}
+
+const fn encode_source_availability(value: SourceAvailability) -> i64 {
+    match value {
+        SourceAvailability::Available => 0,
+        SourceAvailability::SourceUnavailable => 1,
+    }
+}
+
+const fn decode_source_availability(value: i64) -> Result<SourceAvailability, VaultError> {
+    match value {
+        0 => Ok(SourceAvailability::Available),
+        1 => Ok(SourceAvailability::SourceUnavailable),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+const fn encode_source_record_state(value: SourceRecordState) -> i64 {
+    match value {
+        SourceRecordState::Present => 0,
+        SourceRecordState::SourceRemoved => 1,
+    }
+}
+
+const fn decode_source_record_state(value: i64) -> Result<SourceRecordState, VaultError> {
+    match value {
+        0 => Ok(SourceRecordState::Present),
+        1 => Ok(SourceRecordState::SourceRemoved),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+const fn encode_markdown_relation_kind(value: MarkdownRelationKind) -> i64 {
+    match value {
+        MarkdownRelationKind::Link => 0,
+        MarkdownRelationKind::Image => 1,
+        MarkdownRelationKind::Autolink => 2,
+        MarkdownRelationKind::Wikilink => 3,
+        MarkdownRelationKind::Embed => 4,
+    }
+}
+
+const fn decode_source_relation_kind(value: i64) -> Result<SourceRelationKind, VaultError> {
+    match value {
+        0 => Ok(SourceRelationKind::Link),
+        1 => Ok(SourceRelationKind::Image),
+        2 => Ok(SourceRelationKind::Autolink),
+        3 => Ok(SourceRelationKind::Wikilink),
+        4 => Ok(SourceRelationKind::Embed),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+fn is_normalized_source_locator(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn ensure_source_record_version(

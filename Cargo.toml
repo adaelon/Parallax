@@ -7,6 +7,7 @@ members = [
     "crates/ingestion",
     "crates/markdown",
     "crates/runtime-gateway",
+    "crates/source-obsidian",
     "crates/vault",
 ]
 resolver = "2"

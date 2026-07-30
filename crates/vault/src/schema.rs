@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 8;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 9;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -455,6 +455,151 @@ BEGIN
 END;
 ";
 
+const MIGRATION_9: &str = r"
+CREATE TABLE source_roots (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    root_kind INTEGER NOT NULL CHECK (root_kind = 0),
+    root_locator TEXT NOT NULL CHECK (length(trim(root_locator)) > 0),
+    availability INTEGER NOT NULL CHECK (availability IN (0, 1)),
+    first_seen_at INTEGER NOT NULL,
+    last_reconciled_at INTEGER,
+    UNIQUE (root_kind, root_locator)
+) STRICT;
+
+ALTER TABLE source_records ADD COLUMN origin_kind INTEGER NOT NULL DEFAULT 0
+    CHECK (origin_kind IN (0, 1));
+ALTER TABLE source_records ADD COLUMN root_id INTEGER
+    REFERENCES source_roots(id) ON DELETE RESTRICT;
+ALTER TABLE source_records ADD COLUMN current_locator TEXT;
+ALTER TABLE source_records ADD COLUMN record_state INTEGER NOT NULL DEFAULT 0
+    CHECK (record_state IN (0, 1));
+ALTER TABLE source_records ADD COLUMN first_seen_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE source_records ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0;
+
+UPDATE source_records
+SET current_locator = source_locator,
+    first_seen_at = COALESCE((
+        SELECT MIN(a.archived_at)
+        FROM source_record_versions v
+        JOIN archived_evidence a ON a.id = v.evidence_id
+        WHERE v.source_record_id = source_records.id
+    ), 0),
+    last_seen_at = COALESCE((
+        SELECT MAX(a.archived_at)
+        FROM source_record_versions v
+        JOIN archived_evidence a ON a.id = v.evidence_id
+        WHERE v.source_record_id = source_records.id
+    ), 0);
+
+CREATE UNIQUE INDEX obsidian_source_records_current_locator_unique
+    ON source_records(root_id, current_locator)
+    WHERE origin_kind = 1;
+
+CREATE TABLE source_root_state_events (
+    root_id INTEGER NOT NULL REFERENCES source_roots(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    availability INTEGER NOT NULL CHECK (availability IN (0, 1)),
+    occurred_at INTEGER NOT NULL,
+    PRIMARY KEY (root_id, ordinal)
+) STRICT;
+
+CREATE TABLE source_record_state_events (
+    source_record_id INTEGER NOT NULL
+        REFERENCES source_records(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    record_state INTEGER NOT NULL CHECK (record_state IN (0, 1)),
+    locator TEXT NOT NULL CHECK (length(locator) > 0),
+    occurred_at INTEGER NOT NULL,
+    PRIMARY KEY (source_record_id, ordinal)
+) STRICT;
+
+CREATE TABLE obsidian_properties (
+    evidence_id INTEGER NOT NULL
+        REFERENCES archived_evidence(id) ON DELETE RESTRICT,
+    property_ordinal INTEGER NOT NULL CHECK (property_ordinal >= 0),
+    value_ordinal INTEGER NOT NULL CHECK (value_ordinal >= 0),
+    name TEXT NOT NULL CHECK (length(name) > 0),
+    value TEXT NOT NULL,
+    PRIMARY KEY (evidence_id, property_ordinal, value_ordinal)
+) STRICT;
+
+CREATE TABLE obsidian_tags (
+    evidence_id INTEGER NOT NULL
+        REFERENCES archived_evidence(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    value TEXT NOT NULL CHECK (length(value) > 0),
+    PRIMARY KEY (evidence_id, ordinal)
+) STRICT;
+
+CREATE TABLE obsidian_aliases (
+    evidence_id INTEGER NOT NULL
+        REFERENCES archived_evidence(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    value TEXT NOT NULL CHECK (length(value) > 0),
+    PRIMARY KEY (evidence_id, ordinal)
+) STRICT;
+
+CREATE TABLE obsidian_relations (
+    evidence_id INTEGER NOT NULL
+        REFERENCES archived_evidence(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    relation_kind INTEGER NOT NULL CHECK (relation_kind BETWEEN 0 AND 4),
+    target TEXT NOT NULL,
+    alias TEXT,
+    heading TEXT,
+    block_id TEXT,
+    start_byte INTEGER NOT NULL CHECK (start_byte >= 0),
+    end_byte INTEGER NOT NULL CHECK (end_byte >= start_byte),
+    PRIMARY KEY (evidence_id, ordinal)
+) STRICT;
+
+CREATE TABLE obsidian_relation_resolutions (
+    evidence_id INTEGER NOT NULL,
+    relation_ordinal INTEGER NOT NULL,
+    resolved_source_record_id INTEGER NOT NULL
+        REFERENCES source_records(id) ON DELETE RESTRICT,
+    PRIMARY KEY (evidence_id, relation_ordinal),
+    FOREIGN KEY (evidence_id, relation_ordinal)
+        REFERENCES obsidian_relations(evidence_id, ordinal) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TRIGGER source_root_state_events_immutable
+BEFORE UPDATE ON source_root_state_events
+BEGIN
+    SELECT RAISE(ABORT, 'source root state events are immutable');
+END;
+
+CREATE TRIGGER source_record_state_events_immutable
+BEFORE UPDATE ON source_record_state_events
+BEGIN
+    SELECT RAISE(ABORT, 'source record state events are immutable');
+END;
+
+CREATE TRIGGER obsidian_properties_immutable
+BEFORE UPDATE ON obsidian_properties
+BEGIN
+    SELECT RAISE(ABORT, 'Obsidian properties are immutable');
+END;
+
+CREATE TRIGGER obsidian_tags_immutable
+BEFORE UPDATE ON obsidian_tags
+BEGIN
+    SELECT RAISE(ABORT, 'Obsidian tags are immutable');
+END;
+
+CREATE TRIGGER obsidian_aliases_immutable
+BEFORE UPDATE ON obsidian_aliases
+BEGIN
+    SELECT RAISE(ABORT, 'Obsidian aliases are immutable');
+END;
+
+CREATE TRIGGER obsidian_relations_immutable
+BEFORE UPDATE ON obsidian_relations
+BEGIN
+    SELECT RAISE(ABORT, 'Obsidian relations are immutable');
+END;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -480,6 +625,7 @@ where
             6 => transaction.execute_batch(MIGRATION_6)?,
             7 => transaction.execute_batch(MIGRATION_7)?,
             8 => transaction.execute_batch(MIGRATION_8)?,
+            9 => transaction.execute_batch(MIGRATION_9)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -853,5 +999,52 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(versions, vec![(1, 0), (2, 1)]);
+    }
+
+    #[test]
+    fn interrupted_obsidian_migration_keeps_lineage_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 8).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 9 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(9))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        let root_table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'source_roots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
     }
 }

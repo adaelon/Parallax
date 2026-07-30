@@ -131,6 +131,8 @@ Rust Core 内嵌在 Tauri 宿主中，负责采集、保险库、账本、索引
 
 `eam-markdown-v1` 提取结果额外保留 Properties、标签、别名、标题、块标识、Wikilink 与 Markdown 内部链接以及嵌入目标。内部目标解析为同一资料源中的关系边；目标尚不存在时保留未解析关系，目标以后出现再增量解析。库内非 Markdown 附件独立进入通用文件摄取状态机，首版只归档并标记为不支持理解。
 
+S12 的 `source-obsidian` crate 只公开扫描、稳定读取和来源状态 port，不公开写 API。完整扫描成功后，摄取协调器才提交本轮未见记录的 `SOURCE_REMOVED`；根元数据不可读、扫描后文件变化、子目录遍历失败或读取越限都会在移除提交前终止。匹配现有 locator 的文件先处理，剩余新路径只在同内容旧路径唯一且未被本轮占用时识别为移动，重复内容不唯一时失败关闭为新记录。
+
 ### 3.5 Core 内 Markdown 解析
 
 Markdown 解析器是 Rust Core 内的纯 Rust 模块，不是进程、服务或通用格式适配器。Core 只在加密原件提交后调用它；解析函数只接收有效 UTF-8 原文和不可放宽的资源上限，不接收路径、数据库、保险库、网络、模型运行时或工具句柄。原始 HTML、代码块、链接、嵌入和插件语法只产生结构或证据文本，不能触发执行或获取。
@@ -256,6 +258,8 @@ S09 将 `self.db` schema 升至 v6：`markdown_parse_attempts` 以归档版本�
 S10 将 `self.db` schema 升至 v7：`extraction_revisions` 通过复合外键绑定一个 S09 已接受产物及其规范摘要，`evidence_blocks` 保存 Core-owned 块 ID、父子顺序、唯一 UTF-8 范围、结构元数据和可选 `eam-markdown-locator-v1`。修订与全部块在一个 SQLCipher 事务内提交并由数据库拒绝原地更新；重复物化只恢复同一修订和块引用，不生成新身份。正文不重复持久化，读取引用时认证解密同一归档 Markdown、复核摘要并临时投影 UTF-16 UI 范围。
 
 S11 将 `self.db` schema 升至 v8：`source_records/source_record_versions` 把同一收件箱定位器的不可变证据版本绑定到稳定来源；`block_lineage_batches/block_lineages` 保存相邻提取修订的规则版本、连续性状态和确定性依据，歧义候选单独有序保存。`incremental_work_items` 持久化当前投影、索引复用/重建和记忆复核计划；谱系、候选与全部工作项在一个事务内提交并拒绝原地更新。旧 `EvidenceBlockRef` 仍只解析原证据和原块，不被当前来源投影改写。
+
+S12 将 `self.db` schema 升至 v9：`source_roots` 与不可变状态事件保存 `AVAILABLE/SOURCE_UNAVAILABLE`，稳定 `source_records` 增加 Obsidian 根、当前相对 locator、`PRESENT/SOURCE_REMOVED` 和时间边界；移动只更新当前 locator 并追加事件，证据版本继续挂在同一稳定记录。已接受 Obsidian Markdown 的 Properties、标签、别名和原始关系在解析接受事务内写入不可变表；内部目标解析单独保存为可重建投影，目标移除或重新出现后可刷新而不改写原关系文本。
 
 ### 4.2 逻辑数据模型
 
@@ -551,6 +555,8 @@ Obsidian 校准
 ```
 
 `SOURCE_REMOVED` 只改变来源当前性，不改变 Evidence 的解析可用性，也不等同于 Forget。每次转换记录发生时间；只有在根目录可访问且完成校准后才能确认缺失，避免同步盘离线、权限故障或磁盘断开造成批量误判。
+
+当前实现以 `reconcile_obsidian_source` 作为同一协调入口：按现有 locator 优先归档固定扫描中的普通文件，对新 Markdown 版本运行 S09 解析、S10 物化和 S11 相邻谱系，随后在一次成功的全根校准末尾提交来源当前性并重建内部关系解析。任何中途失败都可留下已安全归档的新版本，但绝不提交本轮批量移除；下一次完整扫描通过内容与来源幂等恢复。
 
 ### 5.3 Windows 与浏览器活动采集
 
@@ -1303,3 +1309,19 @@ materialize_incremental_markdown(evidence_id, contract_version)
 ```
 
 S11 不实现真实全文索引、记忆维护、`AVAILABLE` 推进、Obsidian 来源移除或人工消歧 UI；这些消费者只接收 schema v8 中可重放的确定性工作计划。只有 `UNCHANGED/MOVED` 工作项允许前移当前投影，`MODIFIED/REMOVED/AMBIGUOUS` 均保留历史并触发后续复核。
+
+### 9.12 S12 只读 Obsidian 资料源当前实现边界
+
+```text
+crates/source-obsidian/src/lib.rs
+  scan_obsidian_root              # 排除配置/回收站，不跟随重解析点
+  read_scanned_source_file        # 稳定、无跟随、有硬上限的只读读取
+  ObsidianSourceRepository        # 根/记录/归档/关系刷新 port
+crates/ingestion/src/service.rs
+  reconcile_obsidian_source       # 扫描 -> 归档 -> S09 -> S10/S11 -> 当前性 -> 关系
+crates/vault/src/
+  schema.rs                       # schema v9 来源状态事件与 Obsidian 投影
+  repository.rs                   # 移动/移除/恢复、元数据与内部关系持久化
+```
+
+S12 不提供桌面选目录 UI、操作系统通知订阅、S13 的真实当前/历史检索消费者或长期记忆维护器；宿主可用启动/定期校准或未来文件通知调用同一协调入口。来源当前性已持久化为后续检索门禁，`SOURCE_REMOVED` 不删除任何 Evidence、提取修订、证据块或谱系；只有未来显式 Forget 链路可以执行删除传播。
