@@ -40,6 +40,12 @@ use eam_source_obsidian::{
     SourceDocumentProjection, SourceFileKind, SourceRecord, SourceRecordState, SourceRelation,
     SourceRelationKind, SourceRoot, SourceRootSnapshot,
 };
+use eam_understanding::{
+    ProjectionBuild, ProjectionContent, ProjectionId, ProjectionKind, ProjectionRecipe,
+    ProjectionSource, ProjectionStatus, ProjectionTrigger, ProjectionTriggerKind, SourcedStatement,
+    StoredProjection, StoredProjectionRecipe, UNDERSTANDING_CONTRACT_VERSION,
+    UnderstandingRepository,
+};
 use fs4::{FileExt, TryLockError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -54,6 +60,7 @@ const MAX_VECTOR_CANDIDATES: usize = 64;
 const TEMPORAL_NEIGHBOR_RADIUS_MILLIS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_TEMPORAL_NEIGHBORS: usize = 4;
 const MAX_RELATION_NEIGHBORS: usize = 8;
+const MAX_UNDERSTANDING_CANDIDATES: usize = 128;
 
 pub struct VaultRepository {
     connection: Option<Connection>,
@@ -403,6 +410,40 @@ impl VaultRepository {
             .map_err(|_| VaultError::InvalidKeyOrCorrupt)
     }
 
+    /// Deletes only the disposable artifact for one understanding projection.
+    /// The durable recipe and authoritative references remain rebuildable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error or `InvalidKeyOrCorrupt` for an unknown id.
+    pub fn delete_understanding_artifact(&mut self, id: ProjectionId) -> Result<(), VaultError> {
+        let changed = self.connection().execute(
+            "DELETE FROM understanding_projection_artifacts WHERE projection_id = ?1",
+            [to_vault_sql_id(id.get())?],
+        )?;
+        if changed == 0 {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        Ok(())
+    }
+
+    /// Reports whether the disposable projection artifact is currently present.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encrypted database query error.
+    pub fn understanding_artifact_present(&self, id: ProjectionId) -> Result<bool, VaultError> {
+        self.connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM understanding_projection_artifacts WHERE projection_id = ?1
+                 )",
+                [to_vault_sql_id(id.get())?],
+                |row| row.get(0),
+            )
+            .map_err(VaultError::from)
+    }
+
     /// Checkpoints encrypted WAL state, closes `SQLCipher`, clears the owned
     /// Vault Key, and releases the writer lock.
     ///
@@ -642,6 +683,7 @@ impl VaultRepository {
         for (ordinal, item) in batch.work_plan().items().iter().enumerate() {
             insert_incremental_work_item(&transaction, batch_id, ordinal, item)?;
         }
+        reconcile_understanding_projections(&transaction, &self.object_store, batch)?;
         before_commit(&transaction)?;
         transaction.commit()?;
         Ok(batch.clone())
@@ -1274,12 +1316,91 @@ impl RetrievalRepository for VaultRepository {
         recall_retrieval_neighbors(self.connection(), reference)
     }
 
+    fn recall_understanding_candidates(
+        &self,
+        query: &RetrievalQuery,
+    ) -> Result<Vec<RecallHit>, Self::Error> {
+        recall_understanding_candidates(self.connection(), query)
+    }
+
     fn resolve_authoritative(
         &self,
         reference: CandidateRef,
         scope: SourceScope,
     ) -> Result<Option<AuthoritativeCandidate>, Self::Error> {
         resolve_retrieval_candidate(self, reference, scope)
+    }
+}
+
+impl UnderstandingRepository for VaultRepository {
+    type Error = VaultError;
+
+    fn resolve_projection_source(
+        &self,
+        reference: EvidenceBlockRef,
+    ) -> Result<Option<ProjectionSource>, Self::Error> {
+        resolve_understanding_source(self.connection(), &self.object_store, reference)
+    }
+
+    fn commit_projection(
+        &mut self,
+        build: &ProjectionBuild,
+    ) -> Result<StoredProjection, Self::Error> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        let projection_id = next_identifier(&transaction, "understanding_projections")?;
+        insert_understanding_projection(&transaction, projection_id, build)?;
+        transaction.commit()?;
+        stored_projection(
+            projection_id,
+            1,
+            ProjectionStatus::Active,
+            build.material_digest(),
+        )
+    }
+
+    fn load_projection_recipe(
+        &self,
+        id: ProjectionId,
+    ) -> Result<Option<StoredProjectionRecipe>, Self::Error> {
+        load_understanding_projection(self.connection(), id)
+    }
+
+    fn replace_projection_artifact(
+        &mut self,
+        id: ProjectionId,
+        build: &ProjectionBuild,
+    ) -> Result<StoredProjection, Self::Error> {
+        let stored = load_understanding_projection(self.connection(), id)?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        if stored.projection().status() != ProjectionStatus::Active
+            || stored.recipe() != build.recipe()
+        {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        transaction.execute(
+            "UPDATE understanding_projections SET material_digest = ?1 WHERE id = ?2",
+            params![
+                build.material_digest().as_slice(),
+                to_vault_sql_id(id.get())?
+            ],
+        )?;
+        replace_understanding_artifact(&transaction, id.get(), build)?;
+        transaction.commit()?;
+        stored_projection(
+            id.get(),
+            stored.projection().generation(),
+            ProjectionStatus::Active,
+            build.material_digest(),
+        )
     }
 }
 
@@ -2181,6 +2302,536 @@ struct RetrievalRelationAuthority {
     relation_kind: i64,
 }
 
+fn insert_understanding_projection(
+    transaction: &rusqlite::Transaction<'_>,
+    projection_id: u64,
+    build: &ProjectionBuild,
+) -> Result<(), VaultError> {
+    let recipe = build.recipe();
+    transaction.execute(
+        "INSERT INTO understanding_projections
+         (id, contract_version, trigger_kind, trigger_detail, recall_count,
+          projection_kind, subject, requested_at, generation, status, material_digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 0, ?9)",
+        params![
+            to_vault_sql_id(projection_id)?,
+            UNDERSTANDING_CONTRACT_VERSION,
+            encode_projection_trigger_kind(recipe.trigger().kind()),
+            recipe.trigger().detail(),
+            recipe.trigger().recall_count().map(i64::from),
+            encode_projection_kind(recipe.content().kind()),
+            recipe.subject(),
+            recipe.requested_at_millis(),
+            build.material_digest().as_slice(),
+        ],
+    )?;
+    let source_ordinals = recipe
+        .sources()
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, reference)| (reference, ordinal))
+        .collect::<HashMap<_, _>>();
+    for (reference, ordinal) in &source_ordinals {
+        transaction.execute(
+            "INSERT INTO understanding_projection_sources
+             (projection_id, ordinal, evidence_id, block_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                to_vault_sql_id(projection_id)?,
+                i64::try_from(*ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                to_vault_sql_id(reference.evidence_id())?,
+                to_vault_sql_id(reference.block_id().get())?,
+            ],
+        )?;
+    }
+    for (statement_ordinal, statement) in recipe.content().statements().iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO understanding_projection_statements
+             (projection_id, ordinal, statement) VALUES (?1, ?2, ?3)",
+            params![
+                to_vault_sql_id(projection_id)?,
+                i64::try_from(statement_ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                statement.text(),
+            ],
+        )?;
+        for reference in statement.sources() {
+            let source_ordinal = source_ordinals
+                .get(reference)
+                .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+            transaction.execute(
+                "INSERT INTO understanding_projection_statement_sources
+                 (projection_id, statement_ordinal, source_ordinal)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    to_vault_sql_id(projection_id)?,
+                    i64::try_from(statement_ordinal)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    i64::try_from(*source_ordinal).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                ],
+            )?;
+        }
+    }
+    replace_understanding_artifact(transaction, projection_id, build)?;
+    insert_understanding_event(
+        transaction,
+        projection_id,
+        ProjectionStatus::Active,
+        None,
+        recipe.requested_at_millis(),
+    )
+}
+
+fn replace_understanding_artifact(
+    transaction: &rusqlite::Transaction<'_>,
+    projection_id: u64,
+    build: &ProjectionBuild,
+) -> Result<(), VaultError> {
+    transaction.execute(
+        "DELETE FROM understanding_projection_artifacts WHERE projection_id = ?1",
+        [to_vault_sql_id(projection_id)?],
+    )?;
+    transaction.execute(
+        "INSERT INTO understanding_projection_artifacts
+         (projection_id, contract_version, material_digest, built_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            to_vault_sql_id(projection_id)?,
+            UNDERSTANDING_CONTRACT_VERSION,
+            build.material_digest().as_slice(),
+            build.recipe().requested_at_millis(),
+        ],
+    )?;
+    let mut terms = BTreeSet::new();
+    terms.extend(search_terms(build.recipe().subject()));
+    terms.extend(search_terms(build.recipe().trigger().detail()));
+    for statement in build.recipe().content().statements() {
+        terms.extend(search_terms(statement.text()));
+    }
+    for term in terms {
+        transaction.execute(
+            "INSERT INTO understanding_projection_terms (projection_id, term) VALUES (?1, ?2)",
+            params![to_vault_sql_id(projection_id)?, term],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_understanding_event(
+    transaction: &rusqlite::Transaction<'_>,
+    projection_id: u64,
+    status: ProjectionStatus,
+    reason: Option<EvidenceBlockRef>,
+    occurred_at_millis: i64,
+) -> Result<(), VaultError> {
+    let ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(ordinal) + 1, 0)
+         FROM understanding_projection_events WHERE projection_id = ?1",
+        [to_vault_sql_id(projection_id)?],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO understanding_projection_events
+         (projection_id, ordinal, status, reason_evidence_id, reason_block_id, occurred_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            to_vault_sql_id(projection_id)?,
+            ordinal,
+            encode_projection_status(status),
+            reason
+                .map(|reference| to_vault_sql_id(reference.evidence_id()))
+                .transpose()?,
+            reason
+                .map(|reference| to_vault_sql_id(reference.block_id().get()))
+                .transpose()?,
+            occurred_at_millis,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_understanding_projection(
+    connection: &Connection,
+    id: ProjectionId,
+) -> Result<Option<StoredProjectionRecipe>, VaultError> {
+    let stored = connection
+        .query_row(
+            "SELECT contract_version, trigger_kind, trigger_detail, recall_count,
+                    projection_kind, subject, requested_at, generation, status, material_digest
+             FROM understanding_projections WHERE id = ?1",
+            [to_vault_sql_id(id.get())?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        contract,
+        trigger_kind,
+        trigger_detail,
+        recall_count,
+        projection_kind,
+        subject,
+        requested_at_millis,
+        generation,
+        status,
+        digest,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    if contract != UNDERSTANDING_CONTRACT_VERSION {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    let trigger = decode_projection_trigger(trigger_kind, trigger_detail, recall_count)?;
+    let statements = load_understanding_statements(connection, id.get())?;
+    let content = match decode_projection_kind(projection_kind)? {
+        ProjectionKind::EventChain => ProjectionContent::EventChain(statements),
+        ProjectionKind::PersonTopicRelations => ProjectionContent::PersonTopicRelations(statements),
+        ProjectionKind::PhaseSummary => {
+            let [statement] = <[SourcedStatement; 1]>::try_from(statements)
+                .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+            ProjectionContent::PhaseSummary(statement)
+        }
+    };
+    let recipe = ProjectionRecipe::new(trigger, subject, content, requested_at_millis)
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let source_count: i64 = connection.query_row(
+        "SELECT count(*) FROM understanding_projection_sources WHERE projection_id = ?1",
+        [to_vault_sql_id(id.get())?],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(source_count).ok() != Some(recipe.sources().len()) {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    let digest: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let projection = StoredProjection::new(
+        id,
+        u64::try_from(generation).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        decode_projection_status(status)?,
+        digest,
+    );
+    Ok(Some(StoredProjectionRecipe::new(projection, recipe)))
+}
+
+fn load_understanding_statements(
+    connection: &Connection,
+    projection_id: u64,
+) -> Result<Vec<SourcedStatement>, VaultError> {
+    let projection_id_sql = to_vault_sql_id(projection_id)?;
+    let mut statement = connection.prepare(
+        "SELECT ordinal, statement FROM understanding_projection_statements
+         WHERE projection_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement
+        .query_map([projection_id_sql], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    rows.into_iter()
+        .enumerate()
+        .map(|(expected_ordinal, (ordinal, text))| {
+            if usize::try_from(ordinal).ok() != Some(expected_ordinal) {
+                return Err(VaultError::InvalidKeyOrCorrupt);
+            }
+            let mut source_statement = connection.prepare(
+                "SELECT s.evidence_id, s.block_id
+                 FROM understanding_projection_statement_sources x
+                 JOIN understanding_projection_sources s
+                   ON s.projection_id = x.projection_id AND s.ordinal = x.source_ordinal
+                 WHERE x.projection_id = ?1 AND x.statement_ordinal = ?2
+                 ORDER BY x.source_ordinal",
+            )?;
+            let sources = source_statement
+                .query_map(params![projection_id_sql, ordinal], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(evidence_id, block_id)| decode_evidence_block_ref(evidence_id, block_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            SourcedStatement::new(text, sources).map_err(|_| VaultError::InvalidKeyOrCorrupt)
+        })
+        .collect()
+}
+
+fn resolve_understanding_source(
+    connection: &Connection,
+    object_store: &ObjectStore,
+    reference: EvidenceBlockRef,
+) -> Result<Option<ProjectionSource>, VaultError> {
+    let stored = connection
+        .query_row(
+            "SELECT b.start_byte, b.end_byte, r.canonical_digest,
+                    v.source_record_id,
+                    CASE WHEN s.origin_kind = 1 THEN s.current_locator
+                         ELSE s.source_locator END,
+                    a.archived_at, a.object_id
+             FROM evidence_blocks b
+             JOIN extraction_revisions r ON r.id = b.extraction_revision_id
+             JOIN source_record_versions v ON v.evidence_id = b.evidence_id
+             JOIN source_records s ON s.id = v.source_record_id
+             JOIN archived_evidence a ON a.id = b.evidence_id
+             WHERE b.evidence_id = ?1 AND b.id = ?2",
+            params![
+                to_vault_sql_id(reference.evidence_id())?,
+                to_vault_sql_id(reference.block_id().get())?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((start, end, canonical_digest, source_record_id, locator, recorded_at, object_id)) =
+        stored
+    else {
+        return Ok(None);
+    };
+    let canonical = object_store.read(&object_id)?;
+    let actual_digest: [u8; 32] = Sha256::digest(&canonical).into();
+    if canonical_digest.as_slice() != actual_digest {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    let canonical = std::str::from_utf8(&canonical).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let start = usize::try_from(start).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let end = usize::try_from(end).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let verbatim = canonical
+        .get(start..end)
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?
+        .to_owned();
+    Ok(Some(ProjectionSource::new(
+        reference,
+        verbatim,
+        u64::try_from(source_record_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        locator.ok_or(VaultError::InvalidKeyOrCorrupt)?,
+        recorded_at,
+    )))
+}
+
+fn stored_projection(
+    projection_id: u64,
+    generation: u64,
+    status: ProjectionStatus,
+    material_digest: &[u8; 32],
+) -> Result<StoredProjection, VaultError> {
+    Ok(StoredProjection::new(
+        ProjectionId::new(projection_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        generation,
+        status,
+        *material_digest,
+    ))
+}
+
+const fn encode_projection_trigger_kind(kind: ProjectionTriggerKind) -> i64 {
+    match kind {
+        ProjectionTriggerKind::PersonDesignated => 0,
+        ProjectionTriggerKind::RepeatedRecall => 1,
+        ProjectionTriggerKind::ImportantChange => 2,
+        ProjectionTriggerKind::CurrentTask => 3,
+    }
+}
+
+fn decode_projection_trigger(
+    kind: i64,
+    detail: String,
+    recall_count: Option<i64>,
+) -> Result<ProjectionTrigger, VaultError> {
+    match (kind, recall_count) {
+        (0, None) => Ok(ProjectionTrigger::PersonDesignated { reason: detail }),
+        (1, Some(count)) => Ok(ProjectionTrigger::RepeatedRecall {
+            query: detail,
+            recall_count: u32::try_from(count).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+        }),
+        (2, None) => Ok(ProjectionTrigger::ImportantChange {
+            description: detail,
+        }),
+        (3, None) => Ok(ProjectionTrigger::CurrentTask { task: detail }),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+const fn encode_projection_kind(kind: ProjectionKind) -> i64 {
+    match kind {
+        ProjectionKind::EventChain => 0,
+        ProjectionKind::PersonTopicRelations => 1,
+        ProjectionKind::PhaseSummary => 2,
+    }
+}
+
+const fn decode_projection_kind(value: i64) -> Result<ProjectionKind, VaultError> {
+    match value {
+        0 => Ok(ProjectionKind::EventChain),
+        1 => Ok(ProjectionKind::PersonTopicRelations),
+        2 => Ok(ProjectionKind::PhaseSummary),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+const fn encode_projection_status(status: ProjectionStatus) -> i64 {
+    match status {
+        ProjectionStatus::Active => 0,
+        ProjectionStatus::Invalidated => 1,
+    }
+}
+
+const fn decode_projection_status(value: i64) -> Result<ProjectionStatus, VaultError> {
+    match value {
+        0 => Ok(ProjectionStatus::Active),
+        1 => Ok(ProjectionStatus::Invalidated),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
+    }
+}
+
+fn reconcile_understanding_projections(
+    transaction: &rusqlite::Transaction<'_>,
+    object_store: &ObjectStore,
+    batch: &LineageBatch,
+) -> Result<(), VaultError> {
+    let mut affected = HashMap::<u64, Vec<&BlockLineage>>::new();
+    for lineage in batch.lineages() {
+        let mut statement = transaction.prepare(
+            "SELECT projection_id FROM understanding_projection_sources s
+             JOIN understanding_projections p ON p.id = s.projection_id
+             WHERE s.evidence_id = ?1 AND s.block_id = ?2 AND p.status = 0
+             ORDER BY projection_id",
+        )?;
+        for projection_id in statement
+            .query_map(
+                params![
+                    to_vault_sql_id(lineage.from_ref().evidence_id())?,
+                    to_vault_sql_id(lineage.from_ref().block_id().get())?,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            affected
+                .entry(u64::try_from(projection_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?)
+                .or_default()
+                .push(lineage);
+        }
+    }
+
+    let projection_ids = affected.keys().copied().collect::<BTreeSet<_>>();
+    for projection_id in projection_ids {
+        let lineages = affected
+            .get(&projection_id)
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        reconcile_one_understanding_projection(
+            transaction,
+            object_store,
+            projection_id,
+            lineages,
+            batch.decided_at_millis(),
+        )?;
+    }
+    Ok(())
+}
+
+fn reconcile_one_understanding_projection(
+    transaction: &rusqlite::Transaction<'_>,
+    object_store: &ObjectStore,
+    projection_id: u64,
+    lineages: &[&BlockLineage],
+    decided_at_millis: i64,
+) -> Result<(), VaultError> {
+    let first_unsafe = lineages.iter().find(|lineage| {
+        !matches!(
+            lineage.status(),
+            BlockLineageStatus::Unchanged | BlockLineageStatus::Moved
+        )
+    });
+    if let Some(lineage) = first_unsafe {
+        transaction.execute(
+            "UPDATE understanding_projections
+             SET generation = generation + 1, status = 1 WHERE id = ?1 AND status = 0",
+            [to_vault_sql_id(projection_id)?],
+        )?;
+        transaction.execute(
+            "DELETE FROM understanding_projection_artifacts WHERE projection_id = ?1",
+            [to_vault_sql_id(projection_id)?],
+        )?;
+        return insert_understanding_event(
+            transaction,
+            projection_id,
+            ProjectionStatus::Invalidated,
+            Some(lineage.from_ref()),
+            decided_at_millis,
+        );
+    }
+
+    for lineage in lineages {
+        let to_ref = lineage.to_ref().ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        let changed = transaction.execute(
+            "UPDATE understanding_projection_sources
+             SET evidence_id = ?1, block_id = ?2
+             WHERE projection_id = ?3 AND evidence_id = ?4 AND block_id = ?5",
+            params![
+                to_vault_sql_id(to_ref.evidence_id())?,
+                to_vault_sql_id(to_ref.block_id().get())?,
+                to_vault_sql_id(projection_id)?,
+                to_vault_sql_id(lineage.from_ref().evidence_id())?,
+                to_vault_sql_id(lineage.from_ref().block_id().get())?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+    }
+    let id = ProjectionId::new(projection_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    let recipe = load_understanding_projection(transaction, id)?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?
+        .recipe()
+        .clone();
+    let mut sources = Vec::with_capacity(recipe.sources().len());
+    for reference in recipe.sources() {
+        sources.push(
+            resolve_understanding_source(transaction, object_store, reference)?
+                .ok_or(VaultError::InvalidKeyOrCorrupt)?,
+        );
+    }
+    let build = ProjectionBuild::from_resolved_sources(recipe, sources)
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    transaction.execute(
+        "UPDATE understanding_projections
+         SET generation = generation + 1, status = 0, material_digest = ?1
+         WHERE id = ?2 AND status = 0",
+        params![
+            build.material_digest().as_slice(),
+            to_vault_sql_id(projection_id)?
+        ],
+    )?;
+    replace_understanding_artifact(transaction, projection_id, &build)?;
+    insert_understanding_event(
+        transaction,
+        projection_id,
+        ProjectionStatus::Active,
+        lineages.first().map(|lineage| lineage.from_ref()),
+        decided_at_millis,
+    )
+}
+
 struct RetrievalAuthority {
     digest: [u8; 32],
     blocks: Vec<RetrievalBlockAuthority>,
@@ -2853,6 +3504,64 @@ fn hash_retrieval_graph_index(
         }
     }
     Ok(())
+}
+
+fn recall_understanding_candidates(
+    connection: &Connection,
+    query: &RetrievalQuery,
+) -> Result<Vec<RecallHit>, VaultError> {
+    let mut terms = BTreeSet::new();
+    if let Some(text) = query.text() {
+        terms.extend(search_terms(text));
+    }
+    for entity in query.entities() {
+        terms.extend(search_terms(entity));
+    }
+    let mut references = BTreeSet::new();
+    for term in terms {
+        let mut statement = connection.prepare(
+            "SELECT s.evidence_id, s.block_id
+             FROM understanding_projection_terms t
+             JOIN understanding_projection_artifacts a
+               ON a.projection_id = t.projection_id
+             JOIN understanding_projections p
+               ON p.id = a.projection_id
+              AND p.status = 0
+              AND p.contract_version = a.contract_version
+              AND p.material_digest = a.material_digest
+             JOIN understanding_projection_sources s
+               ON s.projection_id = p.id
+             JOIN retrieval_block_documents d
+               ON d.evidence_id = s.evidence_id AND d.block_id = s.block_id
+             WHERE t.term = ?1
+               AND (?2 IS NULL OR d.recorded_at BETWEEN ?2 AND ?3)
+             ORDER BY p.id, s.ordinal",
+        )?;
+        let start = query.time().map(eam_retrieval::TimeRange::start_millis);
+        let end = query.time().map(eam_retrieval::TimeRange::end_millis);
+        for (evidence_id, block_id) in statement
+            .query_map(params![term, start, end], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            references.insert(CandidateRef::Evidence {
+                evidence_id: u64::try_from(evidence_id)
+                    .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                block_id: u64::try_from(block_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+            });
+            if references.len() == MAX_UNDERSTANDING_CANDIDATES {
+                break;
+            }
+        }
+        if references.len() == MAX_UNDERSTANDING_CANDIDATES {
+            break;
+        }
+    }
+    Ok(references
+        .into_iter()
+        .map(|reference| RecallHit::new(reference, RecallChannels::understanding(), 0))
+        .collect())
 }
 
 fn recall_retrieval_candidates(

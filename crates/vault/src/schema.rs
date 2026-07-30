@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 11;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 12;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -711,6 +711,98 @@ CREATE INDEX retrieval_block_vectors_model
     ON retrieval_block_vectors(model_version);
 ";
 
+const MIGRATION_12: &str = r"
+CREATE TABLE understanding_projections (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    contract_version TEXT NOT NULL CHECK (length(trim(contract_version)) > 0),
+    trigger_kind INTEGER NOT NULL CHECK (trigger_kind BETWEEN 0 AND 3),
+    trigger_detail TEXT NOT NULL CHECK (length(trim(trigger_detail)) > 0),
+    recall_count INTEGER CHECK (recall_count IS NULL OR recall_count >= 2),
+    projection_kind INTEGER NOT NULL CHECK (projection_kind BETWEEN 0 AND 2),
+    subject TEXT NOT NULL CHECK (length(trim(subject)) > 0),
+    requested_at INTEGER NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    status INTEGER NOT NULL CHECK (status IN (0, 1)),
+    material_digest BLOB NOT NULL CHECK (length(material_digest) = 32),
+    CHECK (
+        (trigger_kind = 1 AND recall_count IS NOT NULL)
+        OR
+        (trigger_kind != 1 AND recall_count IS NULL)
+    )
+) STRICT;
+
+CREATE TABLE understanding_projection_sources (
+    projection_id INTEGER NOT NULL
+        REFERENCES understanding_projections(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    evidence_id INTEGER NOT NULL,
+    block_id INTEGER NOT NULL,
+    PRIMARY KEY (projection_id, ordinal),
+    UNIQUE (projection_id, evidence_id, block_id),
+    FOREIGN KEY (block_id, evidence_id)
+        REFERENCES evidence_blocks(id, evidence_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE understanding_projection_statements (
+    projection_id INTEGER NOT NULL
+        REFERENCES understanding_projections(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    statement TEXT NOT NULL CHECK (length(trim(statement)) > 0),
+    PRIMARY KEY (projection_id, ordinal)
+) STRICT;
+
+CREATE TABLE understanding_projection_statement_sources (
+    projection_id INTEGER NOT NULL,
+    statement_ordinal INTEGER NOT NULL,
+    source_ordinal INTEGER NOT NULL,
+    PRIMARY KEY (projection_id, statement_ordinal, source_ordinal),
+    FOREIGN KEY (projection_id, statement_ordinal)
+        REFERENCES understanding_projection_statements(projection_id, ordinal)
+        ON DELETE CASCADE,
+    FOREIGN KEY (projection_id, source_ordinal)
+        REFERENCES understanding_projection_sources(projection_id, ordinal)
+        ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE understanding_projection_artifacts (
+    projection_id INTEGER PRIMARY KEY
+        REFERENCES understanding_projections(id) ON DELETE CASCADE,
+    contract_version TEXT NOT NULL CHECK (length(trim(contract_version)) > 0),
+    material_digest BLOB NOT NULL CHECK (length(material_digest) = 32),
+    built_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE understanding_projection_terms (
+    projection_id INTEGER NOT NULL
+        REFERENCES understanding_projection_artifacts(projection_id) ON DELETE CASCADE,
+    term TEXT NOT NULL CHECK (length(term) > 0),
+    PRIMARY KEY (projection_id, term)
+) STRICT;
+
+CREATE TABLE understanding_projection_events (
+    projection_id INTEGER NOT NULL
+        REFERENCES understanding_projections(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    status INTEGER NOT NULL CHECK (status IN (0, 1)),
+    reason_evidence_id INTEGER,
+    reason_block_id INTEGER,
+    occurred_at INTEGER NOT NULL,
+    PRIMARY KEY (projection_id, ordinal),
+    FOREIGN KEY (reason_block_id, reason_evidence_id)
+        REFERENCES evidence_blocks(id, evidence_id) ON DELETE RESTRICT,
+    CHECK (
+        (reason_evidence_id IS NULL AND reason_block_id IS NULL)
+        OR
+        (reason_evidence_id IS NOT NULL AND reason_block_id IS NOT NULL)
+    )
+) STRICT;
+
+CREATE INDEX understanding_projection_terms_lookup
+    ON understanding_projection_terms(term);
+CREATE INDEX understanding_projection_sources_lookup
+    ON understanding_projection_sources(evidence_id, block_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -739,6 +831,7 @@ where
             9 => transaction.execute_batch(MIGRATION_9)?,
             10 => transaction.execute_batch(MIGRATION_10)?,
             11 => transaction.execute_batch(MIGRATION_11)?,
+            12 => transaction.execute_batch(MIGRATION_12)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1245,6 +1338,56 @@ mod tests {
         let table_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'retrieval_block_vectors'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_understanding_migration_keeps_vector_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 11).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 12 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(12))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'understanding_projections'",
                 [],
                 |row| row.get(0),
             )

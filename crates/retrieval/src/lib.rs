@@ -279,6 +279,7 @@ impl RecallChannels {
     const TEMPORAL: u8 = 1 << 2;
     const RELATION: u8 = 1 << 3;
     const LONG_TERM_MEMORY: u8 = 1 << 4;
+    const UNDERSTANDING: u8 = 1 << 5;
 
     #[must_use]
     pub const fn lexical() -> Self {
@@ -314,6 +315,13 @@ impl RecallChannels {
     }
 
     #[must_use]
+    pub const fn understanding() -> Self {
+        Self {
+            bits: Self::UNDERSTANDING,
+        }
+    }
+
+    #[must_use]
     pub const fn contains_lexical(self) -> bool {
         self.bits & Self::LEXICAL != 0
     }
@@ -336,6 +344,11 @@ impl RecallChannels {
     #[must_use]
     pub const fn contains_long_term_memory(self) -> bool {
         self.bits & Self::LONG_TERM_MEMORY != 0
+    }
+
+    #[must_use]
+    pub const fn contains_understanding(self) -> bool {
+        self.bits & Self::UNDERSTANDING != 0
     }
 
     const fn merged(self, other: Self) -> Self {
@@ -571,6 +584,20 @@ pub trait RetrievalRepository {
         Ok(Vec::new())
     }
 
+    /// Recalls authority references selected by active deep-understanding
+    /// projections. Projection text itself never leaves the routing layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when the disposable projection index cannot
+    /// be queried.
+    fn recall_understanding_candidates(
+        &self,
+        _query: &RetrievalQuery,
+    ) -> Result<Vec<RecallHit>, Self::Error> {
+        Ok(Vec::new())
+    }
+
     /// Returns a bounded, non-recursive set of structural, temporal, and
     /// relation neighbors for one already-ranked seed.
     ///
@@ -617,6 +644,11 @@ pub fn retrieve<R: RetrievalRepository>(
     hits.extend(
         repository
             .recall_long_term_memory_candidates(query)
+            .map_err(RetrievalFailure::Repository)?,
+    );
+    hits.extend(
+        repository
+            .recall_understanding_candidates(query)
             .map_err(RetrievalFailure::Repository)?,
     );
 

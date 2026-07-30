@@ -1,5 +1,47 @@
 # 代码链路
 
+## 2026-07-30 S15-4 架构对齐与全仓门禁
+
+**触达**:
+- `docs/architecture.md:§2/§4.1/§5.5/§8/§9.15` — 对齐 understanding 组件、schema v12、活动投影路由、谱系失效、权威回读和长期记忆隔离边界。
+- `docs/code-trail.md:S15-1..S15-4` — 保留契约、持久化、召回和最终验收四个可独立接手的实现切片。
+
+**入口**：陌生会话先从架构 S15 当前实现边界定位 `crates/understanding`、Vault 和 retrieval 的完整调用链，再按前三个 S15 条目回到精确符号与测试。
+**测试**：全仓 Rust 138/138、fmt、workspace clippy、desktop check、release build、前端 2/2、typecheck、production build、2 个变更 Markdown 的 94 个本地链接及 `git diff --check` 全部通过。
+
+## 2026-07-30 S15-3 投影候选路由与权威回读
+
+**触达**:
+- `crates/retrieval/src/lib.rs:RecallChannels/RetrievalRepository` — 增加 understanding 候选通道，投影正文不进入检索结果类型。
+- `crates/vault/src/repository.rs:recall_understanding_candidates` — 只从活动且 artifact 摘要一致的投影召回来源块，并应用显式时间交集和 128 候选上限。
+- `crates/retrieval/tests/context_freeze.rs:vector_memory_and_neighbors_freeze_to_one_replayable_budgeted_snapshot` — 验证理解候选与其他通道合并后仍只冻结权威值。
+- `crates/vault/tests/understanding_persistence.rs:active_projection_routes_only_authoritative_evidence_and_invalidated_projection_stops` — 验证投影独有词命中逐字证据、安全前移延续和失效后停止。
+
+**入口**：`retrieve` 在索引候选与长期记忆候选之外请求活动理解候选，随后统一调用 `resolve_authoritative`；运行时出口不接收投影 recipe 或解释文本。
+**测试**：retrieval 9/9、understanding persistence 2/2 与 retrieval/vault/understanding 目标 clippy 通过。
+
+## 2026-07-30 S15-2 schema v12 投影持久化与局部失效
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_12` — 在 SQLCipher 内保存投影 recipe、来源、语句、状态事件和可删除路由 artifact。
+- `crates/vault/src/repository.rs:UnderstandingRepository` — 认证回读规范证据，原子提交投影，并从 durable recipe 重建缺失 artifact。
+- `crates/vault/src/repository.rs:reconcile_understanding_projections` — 只触达引用变化块的活动投影；`UNCHANGED/MOVED` 前移并重建，其余谱系状态失效关闭。
+- `crates/vault/tests/understanding_persistence.rs` — 覆盖跨重启、删除重建、安全前移、相关失效和无关投影不变。
+
+**入口**：`materialize_projection` 经 `UnderstandingRepository` 写入；S11 `commit_lineage_batch` 在同一事务内协调受影响投影。
+**测试**：Vault 49 个单元/集成测试、understanding 4/4 与两 crate 目标 clippy 通过；schema v12 中断迁移保持 v11 可重开。
+
+## 2026-07-30 S15-1 选择性深度理解投影契约
+
+**触达**:
+- `crates/understanding/src/lib.rs:ProjectionTrigger/ProjectionRecipe` — 固定本人指定、反复召回、重要变化、当前任务四类触发及 64 个权威块的有限范围。
+- `crates/understanding/src/lib.rs:ProjectionContent/SourcedStatement` — 固定事件链、人物/主题关系和阶段概括三类带来源投影，不授予事实或长期记忆资格。
+- `crates/understanding/src/lib.rs:materialize_projection/rebuild_projection` — 只解析显式引用，并以版本化摘要支持派生物删除后同版本重建。
+- `crates/understanding/tests/selective_projection.rs` — 覆盖四触发、三投影、非触发拒绝、有限来源和删除重建。
+
+**入口**：可信 Core 以一个已校验 `ProjectionRecipe` 调用 `materialize_projection`；仓储只向构建器暴露点查证据块，不提供全库枚举。
+**测试**：`cargo test -p understanding --no-fail-fast` 4/4 与目标 clippy 通过。
+
 ## 2026-07-30 S14-4 冻结上下文最小出口与桌面入口
 
 **触达**:

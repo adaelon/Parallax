@@ -4739,6 +4739,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "understanding"
+version = "0.1.0"
+dependencies = [
+ "ingestion",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "unic-char-property"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4882,6 +4890,7 @@ dependencies = [
  "sha2 0.11.0",
  "source-obsidian",
  "tempfile",
+ "understanding",
  "windows-sys 0.61.2",
  "zeroize",
 ]

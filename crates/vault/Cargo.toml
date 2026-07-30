@@ -16,6 +16,7 @@ eam_ingestion = { package = "ingestion", path = "../ingestion" }
 eam_markdown = { package = "eam-markdown", path = "../markdown" }
 eam_retrieval = { package = "retrieval", path = "../retrieval" }
 eam_source_obsidian = { package = "source-obsidian", path = "../source-obsidian" }
+eam_understanding = { package = "understanding", path = "../understanding" }
 fs4 = "=1.1.0"
 getrandom = "=0.4.3"
 hkdf = "=0.13.0"

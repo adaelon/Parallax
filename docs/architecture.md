@@ -40,7 +40,7 @@ flowchart LR
             Vault[Evidence Vault<br/>SQLCipher + 加密对象库]
             Ledgers[时间化三账本]
             Retrieval[检索领域契约与编排<br/>crates/retrieval]
-            Indexes[可重建检索索引<br/>SQLCipher schema v11+]
+            Indexes[可重建检索与理解投影<br/>SQLCipher schema v12+]
             Understanding[选择性深度理解投影]
             SelfBundle[Self Bundle]
             Memory[长期记忆维护器]
@@ -268,6 +268,8 @@ S12 将 `self.db` schema 升至 v9：`source_roots` 与不可变状态事件保�
 S13 将 `self.db` schema 升至 v10：`retrieval_*` 表保存 `eam-retrieval-v1` 的全文词项、账本有效期、实体词项、关系边和 `AVAILABLE` 派生投影。元数据同时保存权威输入摘要和索引摘要；缺失、过期或损坏时在一个事务内清空并从提取修订、证据块、三账本及 Obsidian 关系重建，绝不更新权威行。来源当前性不复制进索引，候选解析时实时读取 `source_records`，所以 `current` 只接受 `PRESENT` 的最新来源版本，`historical` 才返回旧版本或 `SOURCE_REMOVED`。
 
 S14 将 `self.db` schema 升至 v11：`retrieval_block_vectors` 保存 `eam-subword-hash-embedding-v1` 的 256 维定长派生向量，并由 `eam-retrieval-v2` 元数据摘要覆盖。向量表与全文、时间、关系索引在同一事务内重建；模型版本、维度、向量字节或摘要不一致均失败关闭并从规范证据重建，不修改证据块或账本。
+
+S15 将 `self.db` schema 升至 v12：`understanding_projections` 保存 `eam-understanding-v1` 的有限触发 recipe、投影类型、代次、状态与物化摘要，来源块和结构化语句分别保持精确引用；`understanding_projection_artifacts/terms` 是可删除、可重建的路由派生物。相邻修订只查询引用变化块的活动投影：`UNCHANGED/MOVED` 前移引用并提升代次后重建，`MODIFIED/REMOVED/AMBIGUOUS` 只使相关投影失效并移除路由 artifact。
 
 ### 4.2 逻辑数据模型
 
@@ -758,6 +760,8 @@ S13 当前实现由 `crates/retrieval` 固定查询、通道、范围和权威�
 
 S14 以 [G07 Retrieval Contract v2](retrieval-contract-v2.md) 固定 256 维本地子词特征哈希模型、SQLCipher 精确余弦扫描、64 个向量初选、确定性跨通道重排和 128～32,768 estimated token budget。`freeze_working_context` 对种子执行前后各一块的结构邻域、7 天同来源时间邻域和一跳关系邻域，逐项权威回读后按预算保留完整块而不截断；最终冻结窗口、账本来源、归属、时间、当前性和 SHA-256 replay digest。长期记忆通道已有独立契约与排序位，但在 S16 写入显式长期记忆前，Vault 稳定返回空集，不把普通账本冒充记忆。桌面对话以本人当前消息调用该构造器，运行时与外发审计只接收冻结结果，不接收 repository、向量或未选候选。
 
+S15 以 `eam-understanding-v1` 固定本人指定、反复召回（至少两次）、重要变化和当前任务四类显式触发，以及事件链、人物/主题关系和阶段概括三类结构化投影。单个 recipe 最多引用 64 个权威证据块；活动且 artifact 摘要一致的投影只能用主题、触发说明和解释语句贡献候选块引用，随后与其他通道共同经过时间交集、来源范围、权威回读、邻域和预算门禁。投影 recipe、解释文本、代次和状态不进入 `WorkingContext` 或运行时请求，因此投影不能取得事实或长期记忆资格。
+
 ```text
 validate_citation(block_ref, quoted_text):
   revision = load_extraction_revision(block_ref)
@@ -936,7 +940,7 @@ self.db + objects + deletion state
 | Obsidian 笔记库适配器、只读边界与结构提取 | [ADR-0015：只读 Obsidian 资料源](adr/0015-read-only-obsidian-source.md) |
 | Obsidian 来源当前性、历史保留与离线保护 | [ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md) |
 | `crates/retrieval`、schema v11 多路派生索引、动态窗口与权威回读 | [ADR-0003：时间化三账本](adr/0003-temporal-three-ledger-model.md)、[ADR-0004：核心访问边界](adr/0004-trusted-core-access-boundary.md)、[ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md)、[ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md)、[ADR-0019：稳定结构块与动态检索窗口](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md)、[ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md) |
-| Context Builder、多通道召回、深度理解投影与记忆边界 | [ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md) |
+| `crates/understanding`、Context Builder、多通道召回、深度理解投影与记忆边界 | [ADR-0018：混合 RAG 与选择性深度理解](adr/0018-hybrid-rag-selective-deep-understanding.md) |
 | Core 解析输出、证据块身份、增量索引与永久引用 | [ADR-0019：稳定结构块与动态检索窗口](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md) |
 | 来源版本、历史块引用、当前投影与记忆复核 | [ADR-0020：不可变块引用与显式谱系](adr/0020-immutable-block-references-explicit-lineage.md) |
 | 规范文本、Markdown 原文引用坐标、WebView 范围与原文件导航 | [ADR-0021：规范文本锚点与可选原生定位](adr/0021-canonical-text-anchors-optional-native-locators.md) |
@@ -1397,3 +1401,32 @@ send_message(verbatim)
 ```
 
 S14 不建立长期记忆持久化、不实现争议记忆配对，也不建立选择性深度理解投影；分别留给 S16、S17 和 S15。固定子词模型是可替换的召回基线，不声称通用语义理解；真实资料覆盖率不足时必须提升模型/检索契约版本并重建派生索引，不得放宽权威回读、来源门禁或预算约束。
+
+### 9.15 S15 选择性深度理解投影当前实现边界
+
+```text
+crates/understanding/src/lib.rs
+  ProjectionTrigger/Recipe            # 四类显式触发与最多 64 个来源块
+  ProjectionContent/SourcedStatement  # 事件链、人物/主题关系、阶段概括
+  materialize/rebuild_projection      # 权威点查、版本摘要、删除后重建
+crates/vault/src/
+  schema.rs                            # schema v12 recipe、状态事件与可删 artifact
+  repository.rs                        # 加密持久化、谱系协调与活动投影候选
+crates/retrieval/src/lib.rs
+  RecallChannels::understanding       # 只携带候选引用的路由通道
+```
+
+```text
+eligible trigger + finite sourced content
+  -> 点查并认证每个 EvidenceBlockRef
+  -> 原子保存 durable recipe + disposable route artifact
+  -> 查询词命中活动 artifact 后只产出 EvidenceBlockRef
+  -> 统一 resolve_authoritative -> 邻域/预算 -> WorkingContext
+
+adjacent lineage batch
+  -> 仅查引用 from_ref 的活动投影
+  -> UNCHANGED/MOVED: 前移 to_ref + generation++ + 重建 artifact
+  -> MODIFIED/REMOVED/AMBIGUOUS: generation++ + INVALIDATED + 删除 artifact
+```
+
+S15 不创建长期记忆、不把投影解释文本外发、不自动扫描非触发证据，也不自动复核失效的变化语义；S16 才定义长期记忆提议与版本维护。投影删除只移除可重建 artifact，durable recipe 和不可变证据引用仍留在加密边界内；来源语义变化则失败关闭，必须由后续合格触发形成新投影。

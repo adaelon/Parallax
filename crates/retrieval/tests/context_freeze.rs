@@ -19,6 +19,7 @@ use eam_retrieval::{
 struct FixtureRepository {
     hits: Vec<RecallHit>,
     memories: Vec<RecallHit>,
+    understanding: Vec<RecallHit>,
     neighbors: BTreeMap<CandidateRef, Vec<RecallHit>>,
     authority: BTreeMap<CandidateRef, AuthoritativeCandidate>,
 }
@@ -39,6 +40,13 @@ impl RetrievalRepository for FixtureRepository {
         _query: &RetrievalQuery,
     ) -> Result<Vec<RecallHit>, Self::Error> {
         Ok(self.memories.clone())
+    }
+
+    fn recall_understanding_candidates(
+        &self,
+        _query: &RetrievalQuery,
+    ) -> Result<Vec<RecallHit>, Self::Error> {
+        Ok(self.understanding.clone())
     }
 
     fn recall_neighbors(
@@ -71,6 +79,12 @@ fn vector_memory_and_neighbors_freeze_to_one_replayable_budgeted_snapshot() {
             .candidates()
             .iter()
             .any(|candidate| candidate.channels().contains_long_term_memory())
+    );
+    assert!(
+        result
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.channels().contains_understanding())
     );
 
     let first = freeze_working_context(
@@ -121,6 +135,7 @@ fn one_oversized_authoritative_block_is_skipped_without_truncation() {
     let mut repository = FixtureRepository {
         hits: vec![RecallHit::vector(reference, 9_000)],
         memories: Vec::new(),
+        understanding: Vec::new(),
         neighbors: BTreeMap::new(),
         authority: BTreeMap::from([(reference, authority)]),
     };
@@ -170,6 +185,7 @@ fn fixture_repository() -> FixtureRepository {
             RecallChannels::long_term_memory(),
             0,
         )],
+        understanding: vec![RecallHit::new(relation, RecallChannels::understanding(), 0)],
         neighbors: BTreeMap::from([(
             primary,
             vec![
