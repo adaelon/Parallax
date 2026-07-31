@@ -8,8 +8,8 @@ use std::{
 use eam_core::{
     ClaimId, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
     MemoryCore, MemoryRepository, SessionId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementResolution, SharedExperienceKind,
-    SharedExperienceRepository, Speaker, SystemClock, WorkingContext,
+    SharedAgreementDecision, SharedAgreementResolution, SharedAgreementRevision,
+    SharedExperienceKind, SharedExperienceRepository, Speaker, SystemClock, WorkingContext,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_ingestion::{
@@ -99,6 +99,11 @@ pub struct SharedExperienceCeremonyView {
     experience_kind: &'static str,
     admission: &'static str,
     statement: String,
+    candidate_version: Option<u64>,
+    scope: Option<String>,
+    effective_from_millis: Option<i64>,
+    effective_until_millis: Option<i64>,
+    end_condition: Option<String>,
     evidence: Vec<SharedExperienceCeremonyEvidenceView>,
 }
 
@@ -108,6 +113,14 @@ pub struct SharedAgreementResolutionView {
     candidate_id: u64,
     status: &'static str,
     claim_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedAgreementRevisionView {
+    candidate_id: u64,
+    version: u64,
+    status: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -241,6 +254,32 @@ impl ManagedHost {
             HostSlot::Ready(host) => {
                 resolve_shared_agreement_from_core(&mut host.core, candidate_id, confirm)
             }
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn revise_shared_agreement(
+        &self,
+        candidate_id: u64,
+        statement: String,
+        scope: String,
+        effective_from_millis: i64,
+        effective_until_millis: Option<i64>,
+        end_condition: Option<String>,
+    ) -> Result<SharedAgreementRevisionView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => revise_shared_agreement_from_core(
+                &mut host.core,
+                candidate_id,
+                statement,
+                scope,
+                effective_from_millis,
+                effective_until_millis,
+                end_condition,
+            ),
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -523,6 +562,15 @@ where
             experience_kind: "agreement",
             admission: "confirmationRequired",
             statement: candidate.statement().to_owned(),
+            candidate_version: Some(candidate.version()),
+            scope: candidate.scope().map(str::to_owned),
+            effective_from_millis: candidate
+                .effective_from()
+                .map(eam_core::Timestamp::as_millis),
+            effective_until_millis: candidate
+                .effective_until()
+                .map(eam_core::Timestamp::as_millis),
+            end_condition: candidate.end_condition().map(str::to_owned),
             evidence: ceremony_evidence(repository, candidate.support())?,
         });
     }
@@ -540,6 +588,11 @@ where
             experience_kind: encode_shared_experience_kind(experience.kind()),
             admission: "nonVetoNotice",
             statement: experience.claim().statement().to_owned(),
+            candidate_version: None,
+            scope: None,
+            effective_from_millis: None,
+            effective_until_millis: None,
+            end_condition: None,
             evidence: ceremony_evidence(repository, experience.claim().support())?,
         });
     }
@@ -594,6 +647,46 @@ where
     Ok(SharedAgreementResolutionView::from(resolution))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn revise_shared_agreement_from_core<R, T, C>(
+    core: &mut MemoryCore<R, T, C>,
+    candidate_id: u64,
+    statement: String,
+    scope: String,
+    effective_from_millis: i64,
+    effective_until_millis: Option<i64>,
+    end_condition: Option<String>,
+) -> Result<SharedAgreementRevisionView, String>
+where
+    R: SharedExperienceRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    let candidate_id = core
+        .revise_shared_agreement(
+            eam_core::SharedAgreementCandidateId::from_raw(candidate_id),
+            SessionId::new(CONTINUOUS_SESSION_ID),
+            SharedAgreementRevision::new(
+                statement,
+                scope,
+                eam_core::Timestamp::from_millis(effective_from_millis),
+                effective_until_millis.map(eam_core::Timestamp::from_millis),
+                end_condition,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+    let candidate = core
+        .repository()
+        .shared_agreement_candidate(candidate_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("revised candidate {} is missing", candidate_id.get()))?;
+    Ok(SharedAgreementRevisionView {
+        candidate_id: candidate.id().get(),
+        version: candidate.version(),
+        status: "awaitingCounterpart",
+    })
+}
+
 fn dismiss_shared_experience_ceremony_from_core<R, T, C>(
     core: &mut MemoryCore<R, T, C>,
     claim_id: u64,
@@ -630,6 +723,7 @@ impl From<SharedAgreementResolution> for SharedAgreementResolutionView {
         Self {
             candidate_id: value.candidate_id().get(),
             status: match value.status() {
+                SharedAgreementCandidateStatus::AwaitingCounterpart => "awaitingCounterpart",
                 SharedAgreementCandidateStatus::AwaitingPerson => "awaitingPerson",
                 SharedAgreementCandidateStatus::Deferred => "deferred",
                 SharedAgreementCandidateStatus::Confirmed => "confirmed",
@@ -816,7 +910,8 @@ mod tests {
 
     use eam_core::{
         ClaimOwner, InMemoryRepository, IncrementingClock, PersonTurnClassification,
-        RuntimeResponse, ScriptedRuntime, SharedExperienceProposal, Timestamp,
+        RuntimeResponse, ScriptedRuntime, SharedAgreementAssent, SharedExperienceProposal,
+        Timestamp,
     };
     use eam_ingestion::{ArchiveInput, ArchiveReceipt};
     use eam_vault::VaultKey;
@@ -982,6 +1077,12 @@ mod tests {
                 )],
                 "我也同意直接指出关键逃避",
                 Timestamp::from_millis(50_000),
+            )
+            .with_agreement_terms(
+                "双方的重要议题讨论",
+                Timestamp::from_millis(51_000),
+                None,
+                None,
             ),
         );
         let mut core = MemoryCore::new(
@@ -996,6 +1097,11 @@ mod tests {
         let ceremony = &result.ceremonies[0];
         assert_eq!(ceremony.target_kind, "agreementCandidate");
         assert_eq!(ceremony.admission, "confirmationRequired");
+        assert_eq!(ceremony.candidate_version, Some(1));
+        assert_eq!(ceremony.scope.as_deref(), Some("双方的重要议题讨论"));
+        assert_eq!(ceremony.effective_from_millis, Some(51_000));
+        assert_eq!(ceremony.effective_until_millis, None);
+        assert_eq!(ceremony.end_condition, None);
         assert_eq!(ceremony.evidence.len(), 2);
         assert!(core.repository().all_claims().unwrap().is_empty());
 
@@ -1016,6 +1122,75 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn person_revision_waits_for_counterpart_before_returning_as_a_signable_ceremony() {
+        let initial = RuntimeResponse::new("我同意第一版。").with_shared_experience(
+            SharedExperienceProposal::new(
+                SharedExperienceKind::Agreement,
+                "复盘时直接指出关键逃避",
+                vec![EvidenceCitation::new(
+                    EvidenceId::from_raw(1),
+                    "我同意第一版",
+                )],
+                "我同意第一版",
+                Timestamp::from_millis(70_000),
+            )
+            .with_agreement_terms(
+                "共同项目复盘",
+                Timestamp::from_millis(71_000),
+                None,
+                None,
+            ),
+        );
+        let assent = RuntimeResponse::new("我明确接受第二版全部边界。")
+            .with_shared_agreement_assent(SharedAgreementAssent::new(
+                eam_core::SharedAgreementCandidateId::from_raw(2),
+                2,
+                "我明确接受第二版全部边界",
+            ));
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            ScriptedRuntime::new(
+                [
+                    PersonTurnClassification::Question,
+                    PersonTurnClassification::Question,
+                ],
+                [initial, assent],
+            ),
+            IncrementingClock::new(70_000),
+        );
+
+        let first = send_message_with_core(&mut core, "我同意第一版。".to_owned()).unwrap();
+        let first_id = first.ceremonies[0].target_id;
+        let revision = revise_shared_agreement_from_core(
+            &mut core,
+            first_id,
+            "只在正式复盘时直接指出关键逃避".to_owned(),
+            "双方共同项目的正式复盘".to_owned(),
+            72_000,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(revision.candidate_id, 2);
+        assert_eq!(revision.version, 2);
+        assert_eq!(revision.status, "awaitingCounterpart");
+        assert!(
+            list_shared_experience_ceremonies_from_core(&core)
+                .unwrap()
+                .is_empty()
+        );
+
+        let second = send_message_with_core(&mut core, "请核对第二版。".to_owned()).unwrap();
+        assert_eq!(second.ceremonies.len(), 1);
+        let ceremony = &second.ceremonies[0];
+        assert_eq!(ceremony.target_id, 2);
+        assert_eq!(ceremony.candidate_version, Some(2));
+        assert_eq!(ceremony.scope.as_deref(), Some("双方共同项目的正式复盘"));
+        assert_eq!(ceremony.effective_from_millis, Some(72_000));
+        assert_eq!(ceremony.evidence.len(), 2);
     }
 
     #[test]

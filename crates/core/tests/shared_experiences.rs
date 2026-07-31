@@ -1,10 +1,10 @@
 use eam_core::{
     ApplicableTime, Claim, ClaimId, ClaimOwner, EvidenceCitation, EvidenceId, ForgetRequest,
     ForgetTarget, InMemoryRepository, IncrementingClock, MemoryCore, MemoryRepository,
-    PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedExperience,
-    SharedExperienceKind, SharedExperienceProposal, SharedExperienceRejectionReason,
-    SharedExperienceRepository, Timestamp,
+    PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId, SharedAgreementAssent,
+    SharedAgreementAssentRejectionReason, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    SharedAgreementRevision, SharedExperience, SharedExperienceKind, SharedExperienceProposal,
+    SharedExperienceRejectionReason, SharedExperienceRepository, Timestamp,
 };
 
 fn session() -> SessionId {
@@ -17,13 +17,23 @@ fn proposal(
     person_quote: &str,
     counterpart_quote: &str,
 ) -> SharedExperienceProposal {
-    SharedExperienceProposal::new(
+    let proposal = SharedExperienceProposal::new(
         kind,
         statement,
         vec![EvidenceCitation::new(EvidenceId::from_raw(1), person_quote)],
         counterpart_quote,
         Timestamp::from_millis(1_000),
-    )
+    );
+    if kind == SharedExperienceKind::Agreement {
+        proposal.with_agreement_terms(
+            "双方关于重要议题的持续对话",
+            Timestamp::from_millis(2_000),
+            None,
+            None,
+        )
+    } else {
+        proposal
+    }
 }
 
 #[test]
@@ -106,6 +116,202 @@ fn shared_agreement_waits_for_person_ceremony_before_ledger_entry() {
         SharedAgreementCandidateStatus::AwaitingPerson
     );
     assert_eq!(candidate.support().len(), 2);
+    assert_eq!(candidate.version(), 1);
+    assert_eq!(candidate.scope(), Some("双方关于重要议题的持续对话"));
+    assert_eq!(
+        candidate.effective_from(),
+        Some(Timestamp::from_millis(2_000))
+    );
+    assert_eq!(candidate.effective_until(), None);
+    assert_eq!(candidate.end_condition(), None);
+}
+
+#[test]
+fn agreement_without_scope_or_effective_time_is_rejected_before_signing() {
+    let missing_scope = RuntimeResponse::new("我同意，但还没有边界。").with_shared_experience(
+        SharedExperienceProposal::new(
+            SharedExperienceKind::Agreement,
+            "边界不完整的约定",
+            vec![EvidenceCitation::new(
+                EvidenceId::from_raw(1),
+                "我先同意内容",
+            )],
+            "我同意",
+            Timestamp::from_millis(1_000),
+        ),
+    );
+    let missing_time = RuntimeResponse::new("我同意范围，但没有生效时间。").with_shared_experience(
+        SharedExperienceProposal::new(
+            SharedExperienceKind::Agreement,
+            "仍不完整的约定",
+            vec![EvidenceCitation::new(EvidenceId::from_raw(3), "我同意范围")],
+            "我同意范围",
+            Timestamp::from_millis(2_000),
+        )
+        .with_agreement_scope("重要议题"),
+    );
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new(
+            [
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+            ],
+            [missing_scope, missing_time],
+        ),
+        IncrementingClock::new(1_000),
+    );
+
+    let first_context = core.freeze_working_context(&[]).unwrap();
+    let first = core
+        .run_counterpart_turn(session(), "我先同意内容。", first_context)
+        .unwrap();
+    assert_eq!(
+        first.rejected_shared_experiences()[0].reason(),
+        &SharedExperienceRejectionReason::MissingAgreementScope
+    );
+
+    let second_context = core.freeze_working_context(&[]).unwrap();
+    let second = core
+        .run_counterpart_turn(session(), "我同意范围。", second_context)
+        .unwrap();
+    assert_eq!(
+        second.rejected_shared_experiences()[0].reason(),
+        &SharedExperienceRejectionReason::MissingAgreementEffectiveFrom
+    );
+    assert!(
+        core.repository()
+            .all_shared_agreement_candidates()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end state-machine test keeps every transition visible.
+fn person_revision_creates_new_version_that_requires_exact_counterpart_assent() {
+    let initial = RuntimeResponse::new("我同意第一版。").with_shared_experience(proposal(
+        SharedExperienceKind::Agreement,
+        "第一版约定",
+        "我同意第一版",
+        "我同意第一版",
+    ));
+    let wrong_version = RuntimeResponse::new("我接受修改后的约定。").with_shared_agreement_assent(
+        SharedAgreementAssent::new(
+            eam_core::SharedAgreementCandidateId::from_raw(2),
+            1,
+            "我接受修改后的约定",
+        ),
+    );
+    let exact_version = RuntimeResponse::new("我明确接受第二版约定。")
+        .with_shared_agreement_assent(SharedAgreementAssent::new(
+            eam_core::SharedAgreementCandidateId::from_raw(2),
+            2,
+            "我明确接受第二版约定",
+        ));
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new(
+            [
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+            ],
+            [initial, wrong_version, exact_version],
+        ),
+        IncrementingClock::new(1_000),
+    );
+
+    let context = core.freeze_working_context(&[]).unwrap();
+    let initial_outcome = core
+        .run_counterpart_turn(session(), "我同意第一版。", context)
+        .unwrap();
+    let first_id = initial_outcome.pending_agreement_candidate_ids()[0];
+    let second_id = core
+        .revise_shared_agreement(
+            first_id,
+            session(),
+            SharedAgreementRevision::new(
+                "第二版约定",
+                "只适用于共同项目复盘",
+                Timestamp::from_millis(5_000),
+                Some(Timestamp::from_millis(9_000)),
+                None,
+            ),
+        )
+        .unwrap();
+
+    let candidates = core.repository().all_shared_agreement_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].statement(), "第一版约定");
+    assert_eq!(
+        candidates[0].status(),
+        SharedAgreementCandidateStatus::Deferred
+    );
+    assert_eq!(candidates[1].id(), second_id);
+    assert_eq!(candidates[1].version(), 2);
+    assert_eq!(candidates[1].predecessor_candidate_id(), Some(first_id));
+    assert_eq!(
+        candidates[1].status(),
+        SharedAgreementCandidateStatus::AwaitingCounterpart
+    );
+    assert_eq!(candidates[1].support().len(), 1);
+    assert!(
+        core.resolve_shared_agreement(second_id, SharedAgreementDecision::Confirm)
+            .is_err()
+    );
+
+    let context = core.freeze_working_context(&[]).unwrap();
+    let wrong = core
+        .run_counterpart_turn(session(), "请核对修改版。", context)
+        .unwrap();
+    assert_eq!(
+        wrong.rejected_agreement_assents()[0].reason(),
+        &SharedAgreementAssentRejectionReason::VersionMismatch {
+            candidate_id: second_id,
+            expected: 2,
+            actual: 1,
+        }
+    );
+    assert_eq!(
+        core.runtime().seen_requests()[1].pending_agreement_candidates()[0].id(),
+        second_id
+    );
+
+    let context = core.freeze_working_context(&[]).unwrap();
+    let exact = core
+        .run_counterpart_turn(session(), "再确认精确版本。", context)
+        .unwrap();
+    assert_eq!(exact.assented_agreement_candidate_ids(), &[second_id]);
+    let second = core
+        .repository()
+        .shared_agreement_candidate(second_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        SharedAgreementCandidateStatus::AwaitingPerson
+    );
+    assert_eq!(second.support().len(), 2);
+
+    let resolution = core
+        .resolve_shared_agreement(second_id, SharedAgreementDecision::Confirm)
+        .unwrap();
+    let claim = core
+        .repository()
+        .all_claims()
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.id() == resolution.claim_id().unwrap())
+        .unwrap();
+    assert_eq!(
+        claim.applicable_time(),
+        ApplicableTime::Between {
+            start: Timestamp::from_millis(5_000),
+            end: Timestamp::from_millis(9_000),
+        }
+    );
+    assert_eq!(claim.support(), second.support());
 }
 
 #[test]
@@ -116,14 +322,16 @@ fn person_confirmation_admits_agreement_while_deferral_keeps_it_out() {
         "我同意 A",
         "我同意 A",
     ));
-    let deferred =
-        RuntimeResponse::new("我同意 B。").with_shared_experience(SharedExperienceProposal::new(
+    let deferred = RuntimeResponse::new("我同意 B。").with_shared_experience(
+        SharedExperienceProposal::new(
             SharedExperienceKind::Agreement,
             "共同决定 B",
             vec![EvidenceCitation::new(EvidenceId::from_raw(3), "我同意 B")],
             "我同意 B",
             Timestamp::from_millis(2_000),
-        ));
+        )
+        .with_agreement_terms("共同项目 B", Timestamp::from_millis(2_000), None, None),
+    );
     let runtime = ScriptedRuntime::new(
         [
             PersonTurnClassification::Question,

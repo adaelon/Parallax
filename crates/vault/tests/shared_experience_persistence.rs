@@ -1,8 +1,9 @@
 use eam_core::{
     ClaimOwner, EvidenceCitation, EvidenceId, ForgetRequest, ForgetTarget, IncrementingClock,
     MemoryCore, MemoryRepository, PersonTurnClassification, RuntimeResponse, ScriptedRuntime,
-    SessionId, SharedAgreementCandidateStatus, SharedAgreementDecision, SharedExperienceKind,
-    SharedExperienceProposal, SharedExperienceRepository, Timestamp,
+    SessionId, SharedAgreementAssent, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    SharedAgreementRevision, SharedExperienceKind, SharedExperienceProposal,
+    SharedExperienceRepository, Timestamp,
 };
 use eam_vault::{VaultKey, VaultRepository};
 use tempfile::tempdir;
@@ -20,6 +21,12 @@ fn agreement_response() -> RuntimeResponse {
             )],
             "我也同意以后直接指出关键逃避",
             Timestamp::from_millis(1_000),
+        )
+        .with_agreement_terms(
+            "双方的重要议题讨论",
+            Timestamp::from_millis(2_000),
+            None,
+            None,
         ),
     )
 }
@@ -68,10 +75,16 @@ fn agreement_candidate_survives_reopen_without_entering_shared_ledger_until_conf
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 17);
+    assert_eq!(repository.schema_version().unwrap(), 18);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].id(), candidate_id);
+    assert_eq!(candidates[0].version(), 1);
+    assert_eq!(candidates[0].scope(), Some("双方的重要议题讨论"));
+    assert_eq!(
+        candidates[0].effective_from(),
+        Some(Timestamp::from_millis(2_000))
+    );
     assert_eq!(
         candidates[0].status(),
         SharedAgreementCandidateStatus::AwaitingPerson
@@ -218,5 +231,117 @@ fn forgetting_support_removes_an_unconfirmed_candidate_without_foreign_key_leaka
             .all_shared_agreement_candidates()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Reopen checkpoints make the persistence lifecycle explicit.
+fn revised_candidate_and_exact_dual_signatures_survive_reopen_and_forget_as_a_chain() {
+    let vault = tempdir().unwrap();
+    let repository = VaultRepository::open(vault.path(), VaultKey::new([0xB7; 32])).unwrap();
+    let mut core = MemoryCore::new(
+        repository,
+        ScriptedRuntime::new([PersonTurnClassification::Question], [agreement_response()]),
+        IncrementingClock::new(1_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let first = core
+        .run_counterpart_turn(
+            SessionId::new("shared"),
+            "我同意以后直接指出关键逃避。",
+            context,
+        )
+        .unwrap();
+    let first_id = first.pending_agreement_candidate_ids()[0];
+    let second_id = core
+        .revise_shared_agreement(
+            first_id,
+            SessionId::new("shared"),
+            SharedAgreementRevision::new(
+                "只在复盘时直接指出关键逃避",
+                "双方共同项目的复盘",
+                Timestamp::from_millis(5_000),
+                None,
+                Some("任一方退出或双方签署替代约定".to_owned()),
+            ),
+        )
+        .unwrap();
+    let (repository, _, _) = core.into_parts();
+    repository.close().unwrap();
+
+    let repository = VaultRepository::open(vault.path(), VaultKey::new([0xB7; 32])).unwrap();
+    let candidates = repository.all_shared_agreement_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        candidates[0].status(),
+        SharedAgreementCandidateStatus::Deferred
+    );
+    assert_eq!(candidates[0].statement(), "发现关键逃避时直接指出");
+    assert_eq!(candidates[1].id(), second_id);
+    assert_eq!(candidates[1].version(), 2);
+    assert_eq!(candidates[1].predecessor_candidate_id(), Some(first_id));
+    assert_eq!(
+        candidates[1].status(),
+        SharedAgreementCandidateStatus::AwaitingCounterpart
+    );
+    assert_eq!(candidates[1].support().len(), 1);
+
+    let assent = RuntimeResponse::new("我明确接受第二版的全部边界。").with_shared_agreement_assent(
+        SharedAgreementAssent::new(second_id, 2, "我明确接受第二版的全部边界"),
+    );
+    let mut core = MemoryCore::new(
+        repository,
+        ScriptedRuntime::new([PersonTurnClassification::Question], [assent]),
+        IncrementingClock::new(3_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let outcome = core
+        .run_counterpart_turn(SessionId::new("shared"), "请核对第二版。", context)
+        .unwrap();
+    assert_eq!(outcome.assented_agreement_candidate_ids(), &[second_id]);
+    let resolution = core
+        .resolve_shared_agreement(second_id, SharedAgreementDecision::Confirm)
+        .unwrap();
+    assert!(resolution.claim_id().is_some());
+    let (repository, _, _) = core.into_parts();
+    repository.close().unwrap();
+
+    let repository = VaultRepository::open(vault.path(), VaultKey::new([0xB7; 32])).unwrap();
+    let second = repository
+        .shared_agreement_candidate(second_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.status(), SharedAgreementCandidateStatus::Confirmed);
+    assert_eq!(second.support().len(), 2);
+    assert_eq!(repository.all_shared_experiences().unwrap().len(), 1);
+
+    let mut core = MemoryCore::new(
+        repository,
+        ScriptedRuntime::default(),
+        IncrementingClock::new(4_000),
+    );
+    core.forget(ForgetRequest::new(
+        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
+        true,
+    ))
+    .unwrap();
+    assert!(
+        core.repository()
+            .all_shared_agreement_candidates()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        core.repository()
+            .all_shared_experiences()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        core.repository()
+            .all_claims()
+            .unwrap()
+            .iter()
+            .all(|claim| claim.owner() != ClaimOwner::Shared)
     );
 }

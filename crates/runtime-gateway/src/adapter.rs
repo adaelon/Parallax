@@ -3,8 +3,9 @@ use std::{collections::BTreeSet, fmt::Write, time::Duration};
 use eam_core::{
     ApplicableTime, ClaimOwner, ConversationEvidence, CounterpartRuntime, DecisionImpact,
     DisputeState, EvidenceCitation, EvidenceId, JudgmentProposal, PersonTurnClassification,
-    RetrievedContextItem, RuntimeError, RuntimeRequest, RuntimeResponse, SharedExperienceKind,
-    SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
+    RetrievedContextItem, RuntimeError, RuntimeRequest, RuntimeResponse, SharedAgreementAssent,
+    SharedAgreementCandidate, SharedExperienceKind, SharedExperienceProposal, SourceCurrentness,
+    Speaker, Uncertainty,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,8 +26,11 @@ const ORDINARY_RESPONSE_INSTRUCTIONS: &str = concat!(
     "and counterpart positions, a relationship change involving both participants, or an important ",
     "achievement completed together. Exclude ordinary questions, answers, and person-only external ",
     "experiences; if removing the digital counterpart leaves the event fully intact, do not propose ",
-    "a shared experience. Cite exact person evidence and an exact quote from this counterpart ",
-    "response. Return only the strict JSON schema."
+    "a shared experience. Agreement proposals must include explicit scope and effective_from; ",
+    "effective_until and end_condition may be null. If an immutable pending agreement candidate ",
+    "is listed, use assent_shared_agreement_candidate only when accepting that exact candidate ID ",
+    "and version. Cite exact person evidence and an exact quote from this counterpart response. ",
+    "Return only the strict JSON schema."
 );
 const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
     "Respond as the digital counterpart using only the supplied prompt and frozen working context. ",
@@ -38,8 +42,11 @@ const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
     "and counterpart positions, a relationship change involving both participants, or an important ",
     "achievement completed together. Exclude ordinary questions, answers, and person-only external ",
     "experiences; if removing the digital counterpart leaves the event fully intact, do not propose ",
-    "a shared experience. Cite exact person evidence and an exact quote from this counterpart ",
-    "response. Return only the strict JSON schema."
+    "a shared experience. Agreement proposals must include explicit scope and effective_from; ",
+    "effective_until and end_condition may be null. If an immutable pending agreement candidate ",
+    "is listed, use assent_shared_agreement_candidate only when accepting that exact candidate ID ",
+    "and version. Cite exact person evidence and an exact quote from this counterpart response. ",
+    "Return only the strict JSON schema."
 );
 
 pub struct OpenAiResponsesRuntime<T> {
@@ -192,6 +199,7 @@ where
                 evidence_ids.push(*id);
             }
         }
+        append_pending_agreement_evidence_ids(&request, &mut evidence_ids);
         let retrieved_sources = request
             .working_context()
             .retrieved()
@@ -201,6 +209,11 @@ where
         let input = serde_json::to_string(&TurnInput {
             kind: "response",
             prompt: EvidenceInput::from(request.prompt()),
+            pending_agreement_candidates: request
+                .pending_agreement_candidates()
+                .iter()
+                .map(PendingAgreementCandidateInput::from)
+                .collect(),
             working_context: WorkingContextInput {
                 frozen_at_millis: request.working_context().frozen_at().as_millis(),
                 decision_impact: decision_impact_name(impact),
@@ -259,6 +272,22 @@ struct OutboundSelection {
     retrieved_sources: Vec<OutboundContextSource>,
 }
 
+fn append_pending_agreement_evidence_ids(
+    request: &RuntimeRequest,
+    evidence_ids: &mut Vec<EvidenceId>,
+) {
+    for id in request
+        .pending_agreement_candidates()
+        .iter()
+        .flat_map(|candidate| candidate.support().iter())
+        .map(EvidenceCitation::evidence_id)
+    {
+        if !evidence_ids.contains(&id) {
+            evidence_ids.push(id);
+        }
+    }
+}
+
 fn map_transport_error(error: &TransportError) -> RuntimeError {
     match error.kind() {
         TransportErrorKind::Timeout => RuntimeError::timeout(error.to_string()),
@@ -278,7 +307,35 @@ struct ClassificationInput<'a> {
 struct TurnInput<'a> {
     kind: &'static str,
     prompt: EvidenceInput<'a>,
+    pending_agreement_candidates: Vec<PendingAgreementCandidateInput<'a>>,
     working_context: WorkingContextInput<'a>,
+}
+
+#[derive(Serialize)]
+struct PendingAgreementCandidateInput<'a> {
+    candidate_id: u64,
+    version: u64,
+    statement: &'a str,
+    scope: Option<&'a str>,
+    effective_from_millis: Option<i64>,
+    effective_until_millis: Option<i64>,
+    end_condition: Option<&'a str>,
+    person_support: Vec<CitationInput<'a>>,
+}
+
+impl<'a> From<&'a SharedAgreementCandidate> for PendingAgreementCandidateInput<'a> {
+    fn from(value: &'a SharedAgreementCandidate) -> Self {
+        Self {
+            candidate_id: value.id().get(),
+            version: value.version(),
+            statement: value.statement(),
+            scope: value.scope(),
+            effective_from_millis: value.effective_from().map(eam_core::Timestamp::as_millis),
+            effective_until_millis: value.effective_until().map(eam_core::Timestamp::as_millis),
+            end_condition: value.end_condition(),
+            person_support: value.support().iter().map(CitationInput::from).collect(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -665,6 +722,17 @@ struct SharedExperienceOperation {
     person_support: Vec<WireCitation>,
     counterpart_quote: String,
     occurred_at_millis: i64,
+    scope: Option<String>,
+    effective_from_millis: Option<i64>,
+    effective_until_millis: Option<i64>,
+    end_condition: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SharedAgreementAssentOperation {
+    candidate_id: u64,
+    candidate_version: u64,
+    counterpart_quote: String,
 }
 
 #[derive(Deserialize)]
@@ -772,8 +840,9 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
             "propose_shared_experience" => {
                 let proposal: SharedExperienceOperation = serde_json::from_value(operation)
                     .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
-                response = response.with_shared_experience(SharedExperienceProposal::new(
-                    proposal.experience_kind.into_domain(),
+                let kind = proposal.experience_kind.into_domain();
+                let mut domain = SharedExperienceProposal::new(
+                    kind,
                     proposal.statement,
                     proposal
                         .person_support
@@ -782,6 +851,30 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
                         .collect(),
                     proposal.counterpart_quote,
                     eam_core::Timestamp::from_millis(proposal.occurred_at_millis),
+                );
+                if let Some(scope) = proposal.scope {
+                    domain = if let Some(effective_from_millis) = proposal.effective_from_millis {
+                        domain.with_agreement_terms(
+                            scope,
+                            eam_core::Timestamp::from_millis(effective_from_millis),
+                            proposal
+                                .effective_until_millis
+                                .map(eam_core::Timestamp::from_millis),
+                            proposal.end_condition,
+                        )
+                    } else {
+                        domain.with_agreement_scope(scope)
+                    };
+                }
+                response = response.with_shared_experience(domain);
+            }
+            "assent_shared_agreement_candidate" => {
+                let assent: SharedAgreementAssentOperation = serde_json::from_value(operation)
+                    .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
+                response = response.with_shared_agreement_assent(SharedAgreementAssent::new(
+                    eam_core::SharedAgreementCandidateId::from_raw(assent.candidate_id),
+                    assent.candidate_version,
+                    assent.counterpart_quote,
                 ));
             }
             _ => response = response.with_unsupported_operation(operation_index, name),
@@ -815,6 +908,7 @@ fn response_schema() -> Value {
     let citation = citation_schema();
     let judgment_operation = judgment_operation_schema(&citation);
     let shared_experience_operation = shared_experience_operation_schema(&citation);
+    let shared_agreement_assent_operation = shared_agreement_assent_operation_schema();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -824,7 +918,11 @@ fn response_schema() -> Value {
             "operations": {
                 "type": "array",
                 "items": {
-                    "anyOf": [judgment_operation, shared_experience_operation]
+                    "anyOf": [
+                        judgment_operation,
+                        shared_experience_operation,
+                        shared_agreement_assent_operation
+                    ]
                 }
             }
         },
@@ -931,7 +1029,11 @@ fn shared_experience_operation_schema(citation: &Value) -> Value {
                 "items": citation
             },
             "counterpart_quote": { "type": "string" },
-            "occurred_at_millis": { "type": "integer" }
+            "occurred_at_millis": { "type": "integer" },
+            "scope": { "type": ["string", "null"] },
+            "effective_from_millis": { "type": ["integer", "null"] },
+            "effective_until_millis": { "type": ["integer", "null"] },
+            "end_condition": { "type": ["string", "null"] }
         },
         "required": [
             "type",
@@ -939,7 +1041,33 @@ fn shared_experience_operation_schema(citation: &Value) -> Value {
             "statement",
             "person_support",
             "counterpart_quote",
-            "occurred_at_millis"
+            "occurred_at_millis",
+            "scope",
+            "effective_from_millis",
+            "effective_until_millis",
+            "end_condition"
+        ]
+    })
+}
+
+fn shared_agreement_assent_operation_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["assent_shared_agreement_candidate"]
+            },
+            "candidate_id": { "type": "integer" },
+            "candidate_version": { "type": "integer" },
+            "counterpart_quote": { "type": "string" }
+        },
+        "required": [
+            "type",
+            "candidate_id",
+            "candidate_version",
+            "counterpart_quote"
         ]
     })
 }

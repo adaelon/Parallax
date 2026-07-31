@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceId, ForgetReceipt,
-    ForgetTarget, PersonTurnClassification, RuntimeRequest, RuntimeResponse,
+    Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceCitation, EvidenceId,
+    ForgetReceipt, ForgetTarget, PersonTurnClassification, RuntimeRequest, RuntimeResponse,
     SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
     SharedAgreementResolution, SharedExperience, Timestamp,
 };
@@ -183,6 +183,34 @@ pub trait SharedExperienceRepository: MemoryRepository {
         &mut self,
         candidate: SharedAgreementCandidate,
     ) -> Result<(), RepositoryError>;
+
+    /// Atomically records a person's structured revision evidence, retires the
+    /// previous signable version, and appends the new immutable candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without partially changing either version.
+    fn commit_shared_agreement_revision(
+        &mut self,
+        previous_id: SharedAgreementCandidateId,
+        person_evidence: ConversationEvidence,
+        revised: SharedAgreementCandidate,
+        revised_at: Timestamp,
+    ) -> Result<(), RepositoryError>;
+
+    /// Atomically attaches the counterpart's exact assent evidence to one
+    /// immutable version and makes that version eligible for person signing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without partially changing candidate state.
+    fn commit_counterpart_agreement_assent(
+        &mut self,
+        id: SharedAgreementCandidateId,
+        version: u64,
+        citation: EvidenceCitation,
+        assented_at: Timestamp,
+    ) -> Result<SharedAgreementCandidate, RepositoryError>;
 
     /// Resolves one candidate together with its immutable evidence.
     ///

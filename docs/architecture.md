@@ -361,7 +361,7 @@ SharedAgreementCandidate {
   evidence_refs[],
   state = AWAITING_PERSON | AWAITING_COUNTERPART |
           DEFERRED | CONFIRMED,
-  supersedes_candidate_id?,
+  predecessor_candidate_id?,
   supersedes_agreement_ids[],
   counterpart_assented_at?, person_confirmed_at?
 }
@@ -697,7 +697,9 @@ ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
                               as an ActiveRelationalConstraint; preserve its history
          person defers -> candidate N = DEFERRED; do not append Claim
          person revises -> create candidate N+1(state=AWAITING_COUNTERPART)
-         counterpart accepts candidate N+1 -> state=AWAITING_PERSON
+         next RuntimeRequest includes exact immutable candidate N+1 boundaries
+         counterpart accepts candidate id + version with an exact response quote
+           -> state=AWAITING_PERSON
          person finally confirms candidate N+1 -> append Claim(owner=shared, candidate_ref=N+1)
        substantive_disagreement:
          require incompatible positions from person and counterpart in ConversationEvidence
@@ -1656,3 +1658,40 @@ send_message() failure after an earlier atomic write
 ```
 
 S20 不实现 S21 的候选文本版本、修改后重新取得第二自我同意、范围/有效期和双签替代流程，也不投影 S22 的活动关系约束。
+
+### 9.21 S21 共同约定候选版本与双签当前实现边界
+
+```text
+crates/core/src/
+  domain.rs / ports.rs              # 候选版本链、签署边界、修订与精确同意契约
+  memory_loop.rs / in_memory.rs     # 缺边界拒绝、修改新版本和双签状态机
+crates/runtime-gateway/src/
+  adapter.rs                        # 候选边界提议与精确版本同意白名单
+crates/vault/src/
+  schema.rs / repository.rs         # schema v18、原子修订/同意/签署与遗忘闭包
+apps/desktop/src-tauri/src/
+  state.rs / lib.rs                 # 可信候选边界投影与结构化修订 command
+apps/desktop/src/
+  App.tsx / styles.css              # 版本、范围、有效期、持续条件及修改后重签仪式
+```
+
+```text
+propose_shared_experience(kind=AGREEMENT, statement, scope, effective_from,
+                          effective_until?, end_condition?, both_exact_evidence)
+  -> reject missing/empty scope or missing/invalid effective time
+  -> create immutable candidate v1(AWAITING_PERSON, counterpart already assented)
+  -> no termination item: ceremony explicitly shows active until withdrawal or replacement
+
+revise_shared_agreement(candidate vN, new exact boundaries)
+  -> atomically append person structured evidence
+  -> preserve vN content and retire it from signing
+  -> append vN+1(AWAITING_COUNTERPART, predecessor=vN)
+
+next conversation turn
+  -> RuntimeRequest includes every AWAITING_COUNTERPART candidate and source evidence
+  -> assent_shared_agreement_candidate(candidate_id, version, exact_counterpart_quote)
+  -> wrong id/version/quote rejected; exact match -> AWAITING_PERSON
+  -> person confirms exact vN+1 -> append shared Claim with candidate validity interval
+```
+
+S21 不把已签约定投影为 S22 活动关系约束，也不比较或执行 S23 冲突约定取代。schema v18 只为新候选强制完整边界；迁移前无边界且尚未确认的 S20 候选退为不可签历史，不能在升级时伪造范围或有效期。

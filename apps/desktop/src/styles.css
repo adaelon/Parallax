@@ -199,6 +199,7 @@ h1 {
 
 .composer,
 .error-banner,
+.revision-notice,
 .retention-note {
   width: min(100%, 56rem);
   margin-right: auto;
@@ -275,6 +276,17 @@ h1 {
   font-size: 0.8rem;
 }
 
+.revision-notice {
+  margin-top: 0;
+  margin-bottom: 0.55rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid rgb(143 177 132 / 28%);
+  border-radius: 0.7rem;
+  color: #b7c9b0;
+  background: rgb(76 97 68 / 22%);
+  font-size: 0.8rem;
+}
+
 .ceremony-layer {
   position: fixed;
   z-index: 10;
@@ -311,6 +323,43 @@ h1 {
   color: #eff1ea;
   font-size: 1.05rem;
   line-height: 1.7;
+}
+
+.ceremony-version {
+  display: inline-block;
+  margin: 0.7rem 0 0;
+  padding: 0.24rem 0.5rem;
+  border-radius: 999px;
+  color: #b8cab1;
+  background: rgb(143 177 132 / 12%);
+  font-size: 0.72rem;
+}
+
+.ceremony-boundaries {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0 0 1.2rem;
+}
+
+.ceremony-boundaries div {
+  display: grid;
+  grid-template-columns: 5rem 1fr;
+  gap: 0.7rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 0.7rem;
+  background: rgb(255 255 255 / 3%);
+}
+
+.ceremony-boundaries dt {
+  color: #879181;
+  font-size: 0.72rem;
+}
+
+.ceremony-boundaries dd {
+  margin: 0;
+  color: #d9ddd5;
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 
 .ceremony-evidence {
@@ -374,6 +423,43 @@ h1 {
 .ceremony-actions button:disabled {
   cursor: wait;
   opacity: 0.55;
+}
+
+.revision-form {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgb(255 255 255 / 8%);
+}
+
+.revision-form label {
+  margin-top: 0.35rem;
+  color: #929b8d;
+  font-size: 0.72rem;
+}
+
+.revision-form input,
+.revision-form textarea {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0.65rem 0.7rem;
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 0.65rem;
+  outline: none;
+  color: #eceee8;
+  background: #141713;
+  font: inherit;
+}
+
+.revision-form textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.revision-form input:focus,
+.revision-form textarea:focus {
+  border-color: rgb(143 177 132 / 50%);
 }
 
 .ceremony-queue {

@@ -542,6 +542,7 @@ impl SharedExperienceKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SharedAgreementCandidateStatus {
+    AwaitingCounterpart,
     AwaitingPerson,
     Deferred,
     Confirmed,
@@ -556,11 +557,18 @@ pub enum SharedAgreementDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedAgreementCandidate {
     id: SharedAgreementCandidateId,
+    version: u64,
+    predecessor_candidate_id: Option<SharedAgreementCandidateId>,
     statement: String,
+    scope: Option<String>,
+    effective_from: Option<Timestamp>,
+    effective_until: Option<Timestamp>,
+    end_condition: Option<String>,
     support: Vec<EvidenceCitation>,
     occurred_at: Timestamp,
     recorded_at: Timestamp,
     status: SharedAgreementCandidateStatus,
+    counterpart_assented_at: Option<Timestamp>,
     decided_at: Option<Timestamp>,
     claim_id: Option<ClaimId>,
 }
@@ -568,18 +576,53 @@ pub struct SharedAgreementCandidate {
 impl SharedAgreementCandidate {
     pub(crate) fn awaiting_person(
         id: SharedAgreementCandidateId,
-        statement: String,
+        agreement: SharedAgreementRevision,
         support: Vec<EvidenceCitation>,
         occurred_at: Timestamp,
         recorded_at: Timestamp,
     ) -> Self {
         Self {
             id,
-            statement,
+            version: 1,
+            predecessor_candidate_id: None,
+            statement: agreement.statement,
+            scope: Some(agreement.scope),
+            effective_from: Some(agreement.effective_from),
+            effective_until: agreement.effective_until,
+            end_condition: agreement.end_condition,
             support,
             occurred_at,
             recorded_at,
             status: SharedAgreementCandidateStatus::AwaitingPerson,
+            counterpart_assented_at: Some(recorded_at),
+            decided_at: None,
+            claim_id: None,
+        }
+    }
+
+    pub(crate) fn awaiting_counterpart(
+        id: SharedAgreementCandidateId,
+        version: u64,
+        predecessor_candidate_id: SharedAgreementCandidateId,
+        revision: SharedAgreementRevision,
+        support: Vec<EvidenceCitation>,
+        occurred_at: Timestamp,
+        recorded_at: Timestamp,
+    ) -> Self {
+        Self {
+            id,
+            version,
+            predecessor_candidate_id: Some(predecessor_candidate_id),
+            statement: revision.statement,
+            scope: Some(revision.scope),
+            effective_from: Some(revision.effective_from),
+            effective_until: revision.effective_until,
+            end_condition: revision.end_condition,
+            support,
+            occurred_at,
+            recorded_at,
+            status: SharedAgreementCandidateStatus::AwaitingCounterpart,
+            counterpart_assented_at: None,
             decided_at: None,
             claim_id: None,
         }
@@ -590,21 +633,35 @@ impl SharedAgreementCandidate {
     #[allow(clippy::too_many_arguments)]
     pub fn restore(
         id: SharedAgreementCandidateId,
+        version: u64,
+        predecessor_candidate_id: Option<SharedAgreementCandidateId>,
         statement: String,
+        scope: Option<String>,
+        effective_from: Option<Timestamp>,
+        effective_until: Option<Timestamp>,
+        end_condition: Option<String>,
         support: Vec<EvidenceCitation>,
         occurred_at: Timestamp,
         recorded_at: Timestamp,
         status: SharedAgreementCandidateStatus,
+        counterpart_assented_at: Option<Timestamp>,
         decided_at: Option<Timestamp>,
         claim_id: Option<ClaimId>,
     ) -> Self {
         Self {
             id,
+            version,
+            predecessor_candidate_id,
             statement,
+            scope,
+            effective_from,
+            effective_until,
+            end_condition,
             support,
             occurred_at,
             recorded_at,
             status,
+            counterpart_assented_at,
             decided_at,
             claim_id,
         }
@@ -616,8 +673,38 @@ impl SharedAgreementCandidate {
     }
 
     #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn predecessor_candidate_id(&self) -> Option<SharedAgreementCandidateId> {
+        self.predecessor_candidate_id
+    }
+
+    #[must_use]
     pub fn statement(&self) -> &str {
         &self.statement
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+
+    #[must_use]
+    pub const fn effective_from(&self) -> Option<Timestamp> {
+        self.effective_from
+    }
+
+    #[must_use]
+    pub const fn effective_until(&self) -> Option<Timestamp> {
+        self.effective_until
+    }
+
+    #[must_use]
+    pub fn end_condition(&self) -> Option<&str> {
+        self.end_condition.as_deref()
     }
 
     #[must_use]
@@ -641,6 +728,11 @@ impl SharedAgreementCandidate {
     }
 
     #[must_use]
+    pub const fn counterpart_assented_at(&self) -> Option<Timestamp> {
+        self.counterpart_assented_at
+    }
+
+    #[must_use]
     pub const fn decided_at(&self) -> Option<Timestamp> {
         self.decided_at
     }
@@ -659,6 +751,95 @@ impl SharedAgreementCandidate {
         self.status = status;
         self.decided_at = Some(decided_at);
         self.claim_id = claim_id;
+    }
+
+    pub(crate) fn accept_counterpart_assent(
+        &mut self,
+        citation: EvidenceCitation,
+        assented_at: Timestamp,
+    ) {
+        self.support.push(citation);
+        self.status = SharedAgreementCandidateStatus::AwaitingPerson;
+        self.counterpart_assented_at = Some(assented_at);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgreementRevision {
+    statement: String,
+    scope: String,
+    effective_from: Timestamp,
+    effective_until: Option<Timestamp>,
+    end_condition: Option<String>,
+}
+
+impl SharedAgreementRevision {
+    #[must_use]
+    pub fn new(
+        statement: impl Into<String>,
+        scope: impl Into<String>,
+        effective_from: Timestamp,
+        effective_until: Option<Timestamp>,
+        end_condition: Option<String>,
+    ) -> Self {
+        Self {
+            statement: statement.into(),
+            scope: scope.into(),
+            effective_from,
+            effective_until,
+            end_condition,
+        }
+    }
+
+    #[must_use]
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn effective_from(&self) -> Timestamp {
+        self.effective_from
+    }
+
+    #[must_use]
+    pub const fn effective_until(&self) -> Option<Timestamp> {
+        self.effective_until
+    }
+
+    #[must_use]
+    pub fn end_condition(&self) -> Option<&str> {
+        self.end_condition.as_deref()
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.statement.trim().is_empty()
+            && !self.scope.trim().is_empty()
+            && self
+                .effective_until
+                .is_none_or(|until| until.as_millis() >= self.effective_from.as_millis())
+            && self
+                .end_condition
+                .as_deref()
+                .is_none_or(|condition| !condition.trim().is_empty())
+    }
+
+    #[must_use]
+    pub fn canonical_text(&self) -> String {
+        format!(
+            "约定：{}\n范围：{}\n生效时间：{}\n终止时间：{}\n终止条件：{}",
+            self.statement,
+            self.scope,
+            self.effective_from.as_millis(),
+            self.effective_until
+                .map_or_else(|| "无".to_owned(), |value| value.as_millis().to_string()),
+            self.end_condition.as_deref().unwrap_or("无")
+        )
     }
 }
 
@@ -1288,6 +1469,10 @@ pub struct SharedExperienceProposal {
     person_support: Vec<EvidenceCitation>,
     counterpart_quote: String,
     occurred_at: Timestamp,
+    agreement_scope: Option<String>,
+    agreement_effective_from: Option<Timestamp>,
+    agreement_effective_until: Option<Timestamp>,
+    agreement_end_condition: Option<String>,
 }
 
 impl SharedExperienceProposal {
@@ -1305,7 +1490,32 @@ impl SharedExperienceProposal {
             person_support,
             counterpart_quote: counterpart_quote.into(),
             occurred_at,
+            agreement_scope: None,
+            agreement_effective_from: None,
+            agreement_effective_until: None,
+            agreement_end_condition: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_agreement_terms(
+        mut self,
+        scope: impl Into<String>,
+        effective_from: Timestamp,
+        effective_until: Option<Timestamp>,
+        end_condition: Option<String>,
+    ) -> Self {
+        self.agreement_scope = Some(scope.into());
+        self.agreement_effective_from = Some(effective_from);
+        self.agreement_effective_until = effective_until;
+        self.agreement_end_condition = end_condition;
+        self
+    }
+
+    #[must_use]
+    pub fn with_agreement_scope(mut self, scope: impl Into<String>) -> Self {
+        self.agreement_scope = Some(scope.into());
+        self
     }
 
     #[must_use]
@@ -1331,6 +1541,63 @@ impl SharedExperienceProposal {
     #[must_use]
     pub const fn occurred_at(&self) -> Timestamp {
         self.occurred_at
+    }
+
+    #[must_use]
+    pub fn agreement_scope(&self) -> Option<&str> {
+        self.agreement_scope.as_deref()
+    }
+
+    #[must_use]
+    pub const fn agreement_effective_from(&self) -> Option<Timestamp> {
+        self.agreement_effective_from
+    }
+
+    #[must_use]
+    pub const fn agreement_effective_until(&self) -> Option<Timestamp> {
+        self.agreement_effective_until
+    }
+
+    #[must_use]
+    pub fn agreement_end_condition(&self) -> Option<&str> {
+        self.agreement_end_condition.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgreementAssent {
+    candidate_id: SharedAgreementCandidateId,
+    version: u64,
+    counterpart_quote: String,
+}
+
+impl SharedAgreementAssent {
+    #[must_use]
+    pub fn new(
+        candidate_id: SharedAgreementCandidateId,
+        version: u64,
+        counterpart_quote: impl Into<String>,
+    ) -> Self {
+        Self {
+            candidate_id,
+            version,
+            counterpart_quote: counterpart_quote.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn candidate_id(&self) -> SharedAgreementCandidateId {
+        self.candidate_id
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[must_use]
+    pub fn counterpart_quote(&self) -> &str {
+        &self.counterpart_quote
     }
 }
 
@@ -1377,6 +1644,7 @@ pub struct RuntimeResponse {
     citations: Vec<EvidenceCitation>,
     judgment_proposals: Vec<JudgmentProposal>,
     shared_experience_proposals: Vec<SharedExperienceProposal>,
+    shared_agreement_assents: Vec<SharedAgreementAssent>,
     unsupported_operations: Vec<UnsupportedStructuredOperation>,
 }
 
@@ -1388,6 +1656,7 @@ impl RuntimeResponse {
             citations: Vec::new(),
             judgment_proposals: Vec::new(),
             shared_experience_proposals: Vec::new(),
+            shared_agreement_assents: Vec::new(),
             unsupported_operations: Vec::new(),
         }
     }
@@ -1407,6 +1676,12 @@ impl RuntimeResponse {
     #[must_use]
     pub fn with_shared_experience(mut self, proposal: SharedExperienceProposal) -> Self {
         self.shared_experience_proposals.push(proposal);
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_agreement_assent(mut self, assent: SharedAgreementAssent) -> Self {
+        self.shared_agreement_assents.push(assent);
         self
     }
 
@@ -1439,6 +1714,11 @@ impl RuntimeResponse {
     #[must_use]
     pub fn shared_experience_proposals(&self) -> &[SharedExperienceProposal] {
         &self.shared_experience_proposals
+    }
+
+    #[must_use]
+    pub fn shared_agreement_assents(&self) -> &[SharedAgreementAssent] {
+        &self.shared_agreement_assents
     }
 
     #[must_use]
@@ -1477,13 +1757,19 @@ impl UnsupportedStructuredOperation {
 pub struct RuntimeRequest {
     prompt: ConversationEvidence,
     working_context: WorkingContext,
+    pending_agreement_candidates: Vec<SharedAgreementCandidate>,
 }
 
 impl RuntimeRequest {
-    pub(crate) fn new(prompt: ConversationEvidence, working_context: WorkingContext) -> Self {
+    pub(crate) fn new(
+        prompt: ConversationEvidence,
+        working_context: WorkingContext,
+        pending_agreement_candidates: Vec<SharedAgreementCandidate>,
+    ) -> Self {
         Self {
             prompt,
             working_context,
+            pending_agreement_candidates,
         }
     }
 
@@ -1495,6 +1781,11 @@ impl RuntimeRequest {
     #[must_use]
     pub fn working_context(&self) -> &WorkingContext {
         &self.working_context
+    }
+
+    #[must_use]
+    pub fn pending_agreement_candidates(&self) -> &[SharedAgreementCandidate] {
+        &self.pending_agreement_candidates
     }
 }
 
@@ -1524,6 +1815,51 @@ pub enum SharedExperienceRejectionReason {
     PersonQuoteMismatch(EvidenceId),
     EmptyCounterpartQuote,
     CounterpartQuoteMismatch,
+    MissingAgreementScope,
+    MissingAgreementEffectiveFrom,
+    InvalidAgreementValidity,
+    UnexpectedAgreementTerms,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedAgreementAssentRejectionReason {
+    CandidateNotFound(SharedAgreementCandidateId),
+    CandidateNotAwaitingCounterpart(SharedAgreementCandidateId),
+    VersionMismatch {
+        candidate_id: SharedAgreementCandidateId,
+        expected: u64,
+        actual: u64,
+    },
+    EmptyCounterpartQuote,
+    CounterpartQuoteMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgreementAssentRejection {
+    proposal_index: usize,
+    reason: SharedAgreementAssentRejectionReason,
+}
+
+impl SharedAgreementAssentRejection {
+    pub(crate) const fn new(
+        proposal_index: usize,
+        reason: SharedAgreementAssentRejectionReason,
+    ) -> Self {
+        Self {
+            proposal_index,
+            reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn proposal_index(&self) -> usize {
+        self.proposal_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &SharedAgreementAssentRejectionReason {
+        &self.reason
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1616,6 +1952,8 @@ pub struct TurnOutcome {
     pending_agreement_candidate_ids: Vec<SharedAgreementCandidateId>,
     admitted_shared_experience_ids: Vec<ClaimId>,
     rejected_shared_experiences: Vec<SharedExperienceRejection>,
+    assented_agreement_candidate_ids: Vec<SharedAgreementCandidateId>,
+    rejected_agreement_assents: Vec<SharedAgreementAssentRejection>,
     rejected_operations: Vec<StructuredOperationRejection>,
     validated_citations: Vec<EvidenceCitation>,
 }
@@ -1636,6 +1974,8 @@ impl TurnOutcome {
             pending_agreement_candidate_ids: Vec::new(),
             admitted_shared_experience_ids: Vec::new(),
             rejected_shared_experiences: Vec::new(),
+            assented_agreement_candidate_ids: Vec::new(),
+            rejected_agreement_assents: Vec::new(),
             rejected_operations: Vec::new(),
             validated_citations,
         }
@@ -1660,6 +2000,16 @@ impl TurnOutcome {
         self.pending_agreement_candidate_ids = pending_agreements;
         self.admitted_shared_experience_ids = admitted;
         self.rejected_shared_experiences = rejected;
+        self
+    }
+
+    pub(crate) fn with_agreement_assents(
+        mut self,
+        assented: Vec<SharedAgreementCandidateId>,
+        rejected: Vec<SharedAgreementAssentRejection>,
+    ) -> Self {
+        self.assented_agreement_candidate_ids = assented;
+        self.rejected_agreement_assents = rejected;
         self
     }
 
@@ -1709,6 +2059,16 @@ impl TurnOutcome {
     #[must_use]
     pub fn rejected_shared_experiences(&self) -> &[SharedExperienceRejection] {
         &self.rejected_shared_experiences
+    }
+
+    #[must_use]
+    pub fn assented_agreement_candidate_ids(&self) -> &[SharedAgreementCandidateId] {
+        &self.assented_agreement_candidate_ids
+    }
+
+    #[must_use]
+    pub fn rejected_agreement_assents(&self) -> &[SharedAgreementAssentRejection] {
+        &self.rejected_agreement_assents
     }
 
     #[must_use]

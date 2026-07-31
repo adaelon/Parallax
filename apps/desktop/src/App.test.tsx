@@ -122,6 +122,11 @@ describe("S20 typed shared-experience ceremony", () => {
     await vi.waitFor(() => {
       expect(document.body.textContent).toContain("共同约定待确认");
       expect(document.body.textContent).toContain("发现关键逃避时直接指出");
+      expect(document.body.textContent).toContain("候选 v1");
+      expect(document.body.textContent).toContain("双方的重要议题讨论");
+      expect(document.body.textContent).toContain(
+        "持续有效，直到任何一方退出或双方签署替代约定",
+      );
       expect(document.body.textContent).toContain("我也同意");
     });
 
@@ -136,6 +141,43 @@ describe("S20 typed shared-experience ceremony", () => {
     });
   });
 
+  it("creates a new immutable candidate version instead of editing the signable one", async () => {
+    const ceremony = agreementCeremony();
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "list_conversation") {
+        return [] as T;
+      }
+      if (command === "list_shared_experience_ceremonies") {
+        return [ceremony] as T;
+      }
+      if (command === "revise_shared_agreement") {
+        return { candidateId: 8, version: 2, status: "awaitingCounterpart" } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("共同约定待确认"));
+    await clickButton("提出修改");
+    await setControlValue("#agreement-statement", "只在正式复盘时直接指出关键逃避");
+    await clickButton("提交新版本");
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).not.toContain("共同约定待确认");
+      expect(document.body.textContent).toContain(
+        "候选 v2 已生成，等待第二自我明确同意该精确版本",
+      );
+    });
+    expect(invokeMock).toHaveBeenCalledWith("revise_shared_agreement", {
+      candidateId: 7,
+      statement: "只在正式复盘时直接指出关键逃避",
+      scope: "双方的重要议题讨论",
+      effectiveFromMillis: 1_785_000_000_000,
+      effectiveUntilMillis: null,
+      endCondition: null,
+    });
+  });
+
   it("closes a non-veto disagreement notice without offering denial", async () => {
     const ceremony: SharedExperienceCeremony = {
       targetId: 13,
@@ -143,6 +185,11 @@ describe("S20 typed shared-experience ceremony", () => {
       experienceKind: "substantiveDisagreement",
       admission: "nonVetoNotice",
       statement: "双方对这件事的重要性持不相容立场",
+      candidateVersion: null,
+      scope: null,
+      effectiveFromMillis: null,
+      effectiveUntilMillis: null,
+      endCondition: null,
       evidence: [
         { evidenceId: 1, speaker: "person", quote: "这件事无关紧要" },
         { evidenceId: 2, speaker: "counterpart", quote: "我不同意" },
@@ -200,6 +247,19 @@ async function clickButton(label: string) {
   await act(async () => button!.click());
 }
 
+async function setControlValue(selector: string, value: string) {
+  const control = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)!;
+  const prototype =
+    control instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")!.set!;
+  await act(async () => {
+    setter.call(control, value);
+    control.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 function agreementCeremony(): SharedExperienceCeremony {
   return {
     targetId: 7,
@@ -207,6 +267,11 @@ function agreementCeremony(): SharedExperienceCeremony {
     experienceKind: "agreement",
     admission: "confirmationRequired",
     statement: "发现关键逃避时直接指出",
+    candidateVersion: 1,
+    scope: "双方的重要议题讨论",
+    effectiveFromMillis: 1_785_000_000_000,
+    effectiveUntilMillis: null,
+    endCondition: null,
     evidence: [
       { evidenceId: 1, speaker: "person", quote: "我同意" },
       { evidenceId: 2, speaker: "counterpart", quote: "我也同意" },

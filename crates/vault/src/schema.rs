@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 17;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 18;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1093,6 +1093,37 @@ CREATE TABLE shared_experiences (
 ) STRICT;
 ";
 
+const MIGRATION_18: &str = r"
+ALTER TABLE shared_agreement_candidates
+    ADD COLUMN version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0);
+ALTER TABLE shared_agreement_candidates
+    ADD COLUMN predecessor_candidate_id INTEGER
+        REFERENCES shared_agreement_candidates(id) ON DELETE RESTRICT;
+ALTER TABLE shared_agreement_candidates
+    ADD COLUMN scope TEXT CHECK (scope IS NULL OR length(trim(scope)) > 0);
+ALTER TABLE shared_agreement_candidates ADD COLUMN effective_from INTEGER;
+ALTER TABLE shared_agreement_candidates ADD COLUMN effective_until INTEGER;
+ALTER TABLE shared_agreement_candidates
+    ADD COLUMN end_condition TEXT
+        CHECK (end_condition IS NULL OR length(trim(end_condition)) > 0);
+ALTER TABLE shared_agreement_candidates
+    ADD COLUMN awaiting_counterpart INTEGER NOT NULL DEFAULT 0
+        CHECK (awaiting_counterpart IN (0, 1));
+ALTER TABLE shared_agreement_candidates ADD COLUMN counterpart_assented_at INTEGER;
+ALTER TABLE shared_agreement_candidates ADD COLUMN person_confirmed_at INTEGER;
+
+CREATE UNIQUE INDEX shared_agreement_candidate_successor
+    ON shared_agreement_candidates(predecessor_candidate_id)
+    WHERE predecessor_candidate_id IS NOT NULL;
+
+UPDATE shared_agreement_candidates
+SET status = 1, decided_at = recorded_at
+WHERE version = 0 AND status = 0;
+UPDATE shared_agreement_candidates
+SET person_confirmed_at = decided_at
+WHERE version = 0 AND status = 2;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1127,6 +1158,7 @@ where
             15 => transaction.execute_batch(MIGRATION_15)?,
             16 => transaction.execute_batch(MIGRATION_16)?,
             17 => transaction.execute_batch(MIGRATION_17)?,
+            18 => transaction.execute_batch(MIGRATION_18)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -2049,6 +2081,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn interrupted_agreement_version_migration_keeps_shared_experience_schema_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+            MIGRATION_12,
+            MIGRATION_13,
+            MIGRATION_14,
+            MIGRATION_15,
+            MIGRATION_16,
+            MIGRATION_17,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 17).unwrap();
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 18 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(18))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            17
+        );
+        let column_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('shared_agreement_candidates')
+                 WHERE name IN ('version', 'scope', 'awaiting_counterpart')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 0);
 
         migrate(&mut connection).unwrap();
         assert_eq!(

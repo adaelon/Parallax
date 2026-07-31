@@ -10,8 +10,9 @@ use eam_core::{
     ApplicableTime, Claim, ClaimId, ClaimOwner, CoreError, DecisionImpact, DisputeState,
     EvidenceCitation, EvidenceId, FrozenEvidenceBlock, FrozenMemoryDispute, FrozenRetrievalWindow,
     InMemoryRepository, IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification,
-    RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SessionId, SourceCurrentness,
-    StructuredOperationRejectionReason, Timestamp, Uncertainty,
+    RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SessionId,
+    SharedAgreementCandidateStatus, SharedAgreementRevision, SharedExperienceRepository,
+    SourceCurrentness, StructuredOperationRejectionReason, Timestamp, Uncertainty,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL,
@@ -27,6 +28,9 @@ const TURN_RESPONSE: &str = include_str!("fixtures/turn-response.json");
 const UNSUPPORTED_OPERATION_RESPONSE: &str =
     include_str!("fixtures/unsupported-operation-response.json");
 const SHARED_EXPERIENCE_RESPONSE: &str = include_str!("fixtures/shared-experience-response.json");
+const SHARED_AGREEMENT_RESPONSE: &str = include_str!("fixtures/shared-agreement-response.json");
+const SHARED_AGREEMENT_ASSENT_RESPONSE: &str =
+    include_str!("fixtures/shared-agreement-assent-response.json");
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -518,6 +522,92 @@ fn shared_experience_operation_is_whitelisted_and_keeps_typed_evidence() {
     assert!(instructions.contains("substantive disagreement with incompatible"));
     assert!(
         instructions.contains("if removing the digital counterpart leaves the event fully intact")
+    );
+}
+
+#[test]
+fn agreement_boundaries_and_pending_exact_version_are_in_the_runtime_contract() {
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(SHARED_AGREEMENT_RESPONSE),
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(SHARED_AGREEMENT_ASSENT_RESPONSE),
+    ]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(1_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let first = core
+        .run_counterpart_turn(
+            SessionId::new("chat"),
+            "我同意复盘时直接指出关键逃避。",
+            context,
+        )
+        .unwrap();
+    let first_id = first.pending_agreement_candidate_ids()[0];
+    let first_candidate = core
+        .repository()
+        .shared_agreement_candidate(first_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_candidate.scope(), Some("双方共同项目复盘"));
+    assert_eq!(
+        first_candidate.effective_from(),
+        Some(Timestamp::from_millis(2_000))
+    );
+
+    let second_id = core
+        .revise_shared_agreement(
+            first_id,
+            SessionId::new("chat"),
+            SharedAgreementRevision::new(
+                "只在正式复盘中直接指出关键逃避",
+                "双方共同项目的正式复盘",
+                Timestamp::from_millis(3_000),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+    let context = core.freeze_working_context(&[]).unwrap();
+    let second = core
+        .run_counterpart_turn(SessionId::new("chat"), "请核对第二版。", context)
+        .unwrap();
+    assert_eq!(second.assented_agreement_candidate_ids(), &[second_id]);
+    assert_eq!(
+        core.repository()
+            .shared_agreement_candidate(second_id)
+            .unwrap()
+            .unwrap()
+            .status(),
+        SharedAgreementCandidateStatus::AwaitingPerson
+    );
+
+    let response_disclosures = core
+        .runtime()
+        .disclosures()
+        .iter()
+        .filter(|record| record.invocation() == InvocationKind::Response)
+        .collect::<Vec<_>>();
+    let assent_request: Value =
+        serde_json::from_str(response_disclosures[1].request_json()).unwrap();
+    let input: Value = serde_json::from_str(assent_request["input"].as_str().unwrap()).unwrap();
+    let pending = &input["pending_agreement_candidates"][0];
+    assert_eq!(pending["candidate_id"], second_id.get());
+    assert_eq!(pending["version"], 2);
+    assert_eq!(pending["scope"], "双方共同项目的正式复盘");
+    assert_eq!(pending["effective_from_millis"], 3_000);
+    assert!(
+        assent_request["text"]["format"]["schema"]
+            .to_string()
+            .contains("assent_shared_agreement_candidate")
+    );
+    assert!(
+        response_disclosures[1]
+            .evidence_ids()
+            .contains(&EvidenceId::from_raw(3))
     );
 }
 

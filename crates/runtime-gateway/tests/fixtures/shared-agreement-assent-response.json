@@ -1,0 +1,14 @@
+{
+  "id": "resp_shared_agreement_assent_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"text\":\"我明确接受候选第二版的全部边界。\",\"citations\":[],\"operations\":[{\"type\":\"assent_shared_agreement_candidate\",\"candidate_id\":2,\"candidate_version\":2,\"counterpart_quote\":\"我明确接受候选第二版的全部边界\"}]}"
+        }
+      ]
+    }
+  ]
+}

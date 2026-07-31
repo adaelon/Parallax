@@ -6,7 +6,7 @@
       "content": [
         {
           "type": "output_text",
-          "text": "{\"text\":\"我不同意把它视为无关紧要。\",\"citations\":[],\"operations\":[{\"type\":\"propose_shared_experience\",\"experience_kind\":\"substantive_disagreement\",\"statement\":\"双方对这件事的重要性持不相容立场\",\"person_support\":[{\"evidence_id\":1,\"quote\":\"这件事无关紧要\"}],\"counterpart_quote\":\"我不同意把它视为无关紧要\",\"occurred_at_millis\":1000}]}"
+          "text": "{\"text\":\"我不同意把它视为无关紧要。\",\"citations\":[],\"operations\":[{\"type\":\"propose_shared_experience\",\"experience_kind\":\"substantive_disagreement\",\"statement\":\"双方对这件事的重要性持不相容立场\",\"person_support\":[{\"evidence_id\":1,\"quote\":\"这件事无关紧要\"}],\"counterpart_quote\":\"我不同意把它视为无关紧要\",\"occurred_at_millis\":1000,\"scope\":null,\"effective_from_millis\":null,\"effective_until_millis\":null,\"end_condition\":null}]}"
         }
       ]
     }

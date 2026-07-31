@@ -5,9 +5,10 @@ use crate::{
     ClaimStatus, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
     ForgetReceipt, ForgetRepository, ForgetRequest, JudgmentProposal, JudgmentRejection,
     JudgmentRejectionReason, MemoryRepository, PersonTurnClassification, RepositoryError,
-    RuntimeError, RuntimeRequest, SessionId, SharedAgreementCandidate, SharedAgreementCandidateId,
+    RuntimeError, RuntimeRequest, SessionId, SharedAgreementAssentRejection,
+    SharedAgreementAssentRejectionReason, SharedAgreementCandidate, SharedAgreementCandidateId,
     SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
-    SharedExperience, SharedExperienceProposal, SharedExperienceRejection,
+    SharedAgreementRevision, SharedExperience, SharedExperienceProposal, SharedExperienceRejection,
     SharedExperienceRejectionReason, SharedExperienceRepository, Speaker,
     StructuredOperationRejection, StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
 };
@@ -25,6 +26,8 @@ pub enum CoreError {
     ForgetTargetNotFound,
     SharedAgreementCandidateNotFound(SharedAgreementCandidateId),
     SharedAgreementCandidateNotAwaitingPerson(SharedAgreementCandidateId),
+    InvalidSharedAgreementRevision,
+    UnchangedSharedAgreementRevision,
     MissingEvidence(EvidenceId),
     InvalidResponseCitation(JudgmentRejectionReason),
     Repository(RepositoryError),
@@ -40,6 +43,11 @@ struct SharedExperienceWriteOutcome {
     pending_agreements: Vec<SharedAgreementCandidateId>,
     admitted: Vec<ClaimId>,
     rejected: Vec<SharedExperienceRejection>,
+}
+
+struct SharedAgreementAssentWriteOutcome {
+    assented: Vec<SharedAgreementCandidateId>,
+    rejected: Vec<SharedAgreementAssentRejection>,
 }
 
 impl fmt::Display for CoreError {
@@ -72,6 +80,12 @@ impl fmt::Display for CoreError {
                 "shared agreement candidate {} is not awaiting person confirmation",
                 id.get()
             ),
+            Self::InvalidSharedAgreementRevision => {
+                formatter.write_str("shared agreement revision has invalid boundaries")
+            }
+            Self::UnchangedSharedAgreementRevision => {
+                formatter.write_str("shared agreement revision must change the candidate")
+            }
             Self::MissingEvidence(id) => write!(formatter, "evidence {} does not exist", id.get()),
             Self::InvalidResponseCitation(reason) => {
                 write!(
@@ -362,7 +376,19 @@ where
             .evidence(person_evidence_id)?
             .ok_or(CoreError::MissingEvidence(person_evidence_id))?;
 
-        let request = RuntimeRequest::new(prompt.clone(), working_context);
+        let pending_agreement_candidates = self
+            .repository
+            .all_shared_agreement_candidates()?
+            .into_iter()
+            .filter(|candidate| {
+                candidate.status() == SharedAgreementCandidateStatus::AwaitingCounterpart
+            })
+            .collect();
+        let request = RuntimeRequest::new(
+            prompt.clone(),
+            working_context,
+            pending_agreement_candidates,
+        );
         let validation_context = request.working_context().clone();
         let response = self.runtime.respond(request)?;
 
@@ -383,6 +409,8 @@ where
             &prompt,
             &counterpart_evidence,
         )?;
+        let agreement_assents =
+            self.persist_shared_agreement_assents(&response, &counterpart_evidence)?;
         let shared = self.persist_shared_experience_proposals(
             &response,
             &validation_context,
@@ -406,8 +434,66 @@ where
             response.citations().to_vec(),
         )
         .with_judgments(judgments.accepted, judgments.rejected)
+        .with_agreement_assents(agreement_assents.assented, agreement_assents.rejected)
         .with_shared_experiences(shared.pending_agreements, shared.admitted, shared.rejected)
         .with_rejected_operations(rejected_operations))
+    }
+
+    fn persist_shared_agreement_assents(
+        &mut self,
+        response: &crate::RuntimeResponse,
+        counterpart_evidence: &ConversationEvidence,
+    ) -> Result<SharedAgreementAssentWriteOutcome, CoreError> {
+        let mut outcome = SharedAgreementAssentWriteOutcome {
+            assented: Vec::new(),
+            rejected: Vec::new(),
+        };
+        for (proposal_index, assent) in response.shared_agreement_assents().iter().enumerate() {
+            let Some(candidate) = self
+                .repository
+                .shared_agreement_candidate(assent.candidate_id())?
+            else {
+                outcome.rejected.push(SharedAgreementAssentRejection::new(
+                    proposal_index,
+                    SharedAgreementAssentRejectionReason::CandidateNotFound(assent.candidate_id()),
+                ));
+                continue;
+            };
+            let rejection =
+                if candidate.status() != SharedAgreementCandidateStatus::AwaitingCounterpart {
+                    Some(
+                        SharedAgreementAssentRejectionReason::CandidateNotAwaitingCounterpart(
+                            assent.candidate_id(),
+                        ),
+                    )
+                } else if candidate.version() != assent.version() {
+                    Some(SharedAgreementAssentRejectionReason::VersionMismatch {
+                        candidate_id: assent.candidate_id(),
+                        expected: candidate.version(),
+                        actual: assent.version(),
+                    })
+                } else if assent.counterpart_quote().is_empty() {
+                    Some(SharedAgreementAssentRejectionReason::EmptyCounterpartQuote)
+                } else if !response.text().contains(assent.counterpart_quote()) {
+                    Some(SharedAgreementAssentRejectionReason::CounterpartQuoteMismatch)
+                } else {
+                    None
+                };
+            if let Some(reason) = rejection {
+                outcome
+                    .rejected
+                    .push(SharedAgreementAssentRejection::new(proposal_index, reason));
+                continue;
+            }
+            self.repository.commit_counterpart_agreement_assent(
+                assent.candidate_id(),
+                assent.version(),
+                EvidenceCitation::new(counterpart_evidence.id(), assent.counterpart_quote()),
+                counterpart_evidence.recorded_at(),
+            )?;
+            outcome.assented.push(assent.candidate_id());
+        }
+        Ok(outcome)
     }
 
     fn persist_judgment_proposals(
@@ -483,7 +569,17 @@ where
             if proposal.kind().requires_person_confirmation() {
                 let candidate = SharedAgreementCandidate::awaiting_person(
                     self.repository.next_shared_agreement_candidate_id(),
-                    proposal.statement().to_owned(),
+                    SharedAgreementRevision::new(
+                        proposal.statement(),
+                        proposal
+                            .agreement_scope()
+                            .expect("validated agreement scope"),
+                        proposal
+                            .agreement_effective_from()
+                            .expect("validated agreement effective time"),
+                        proposal.agreement_effective_until(),
+                        proposal.agreement_end_condition().map(str::to_owned),
+                    ),
                     support,
                     proposal.occurred_at(),
                     counterpart_evidence.recorded_at(),
@@ -511,6 +607,72 @@ where
         Ok(outcome)
     }
 
+    /// Creates a new immutable candidate version from a person's structured
+    /// ceremony revision. The previous version becomes non-signable, while the
+    /// new version waits for explicit counterpart assent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown or non-signable candidates, unchanged/invalid terms,
+    /// and adapter failures without partially recording the revision.
+    pub fn revise_shared_agreement(
+        &mut self,
+        candidate_id: SharedAgreementCandidateId,
+        session_id: SessionId,
+        revision: SharedAgreementRevision,
+    ) -> Result<SharedAgreementCandidateId, CoreError> {
+        let previous = self
+            .repository
+            .shared_agreement_candidate(candidate_id)?
+            .ok_or(CoreError::SharedAgreementCandidateNotFound(candidate_id))?;
+        if previous.status() != SharedAgreementCandidateStatus::AwaitingPerson {
+            return Err(CoreError::SharedAgreementCandidateNotAwaitingPerson(
+                candidate_id,
+            ));
+        }
+        if !revision.is_valid() {
+            return Err(CoreError::InvalidSharedAgreementRevision);
+        }
+        if previous.statement() == revision.statement()
+            && previous.scope() == Some(revision.scope())
+            && previous.effective_from() == Some(revision.effective_from())
+            && previous.effective_until() == revision.effective_until()
+            && previous.end_condition() == revision.end_condition()
+        {
+            return Err(CoreError::UnchangedSharedAgreementRevision);
+        }
+
+        let revised_at = self.clock.now();
+        let canonical = revision.canonical_text();
+        let person_evidence = ConversationEvidence::new(
+            self.repository.next_evidence_id(),
+            session_id,
+            Speaker::Person,
+            canonical.clone(),
+            revised_at,
+        );
+        let revised = SharedAgreementCandidate::awaiting_counterpart(
+            self.repository.next_shared_agreement_candidate_id(),
+            previous
+                .version()
+                .checked_add(1)
+                .ok_or(CoreError::InvalidSharedAgreementRevision)?,
+            candidate_id,
+            revision,
+            vec![EvidenceCitation::new(person_evidence.id(), canonical)],
+            revised_at,
+            revised_at,
+        );
+        let revised_id = revised.id();
+        self.repository.commit_shared_agreement_revision(
+            candidate_id,
+            person_evidence,
+            revised,
+            revised_at,
+        )?;
+        Ok(revised_id)
+    }
+
     /// Resolves the person-facing admission ceremony for one immutable shared
     /// agreement candidate.
     ///
@@ -532,18 +694,34 @@ where
             ));
         }
         let decided_at = self.clock.now();
-        let confirmed = (decision == SharedAgreementDecision::Confirm).then(|| {
-            let claim = Claim::new(
-                self.repository.next_claim_id(),
-                ClaimOwner::Shared,
-                candidate.statement().to_owned(),
-                candidate.support().to_vec(),
-                None,
-                ApplicableTime::At(candidate.occurred_at()),
-                decided_at,
-            );
-            SharedExperience::admitted(crate::SharedExperienceKind::Agreement, claim)
-        });
+        let confirmed =
+            if decision == SharedAgreementDecision::Confirm {
+                let effective_from = candidate
+                    .effective_from()
+                    .ok_or(CoreError::InvalidSharedAgreementRevision)?;
+                let applicable_time = candidate.effective_until().map_or(
+                    ApplicableTime::Since(effective_from),
+                    |end| ApplicableTime::Between {
+                        start: effective_from,
+                        end,
+                    },
+                );
+                let claim = Claim::new(
+                    self.repository.next_claim_id(),
+                    ClaimOwner::Shared,
+                    candidate.statement().to_owned(),
+                    candidate.support().to_vec(),
+                    None,
+                    applicable_time,
+                    decided_at,
+                );
+                Some(SharedExperience::admitted(
+                    crate::SharedExperienceKind::Agreement,
+                    claim,
+                ))
+            } else {
+                None
+            };
         self.repository
             .commit_shared_agreement_decision(candidate_id, decision, confirmed, decided_at)
             .map_err(CoreError::from)
@@ -592,6 +770,32 @@ fn validate_shared_experience_proposal(
 ) -> Result<(), SharedExperienceRejectionReason> {
     if proposal.statement().trim().is_empty() {
         return Err(SharedExperienceRejectionReason::EmptyStatement);
+    }
+    if proposal.kind() == crate::SharedExperienceKind::Agreement {
+        let Some(scope) = proposal.agreement_scope() else {
+            return Err(SharedExperienceRejectionReason::MissingAgreementScope);
+        };
+        if scope.trim().is_empty() {
+            return Err(SharedExperienceRejectionReason::MissingAgreementScope);
+        }
+        let Some(effective_from) = proposal.agreement_effective_from() else {
+            return Err(SharedExperienceRejectionReason::MissingAgreementEffectiveFrom);
+        };
+        if proposal
+            .agreement_effective_until()
+            .is_some_and(|until| until.as_millis() < effective_from.as_millis())
+            || proposal
+                .agreement_end_condition()
+                .is_some_and(|condition| condition.trim().is_empty())
+        {
+            return Err(SharedExperienceRejectionReason::InvalidAgreementValidity);
+        }
+    } else if proposal.agreement_scope().is_some()
+        || proposal.agreement_effective_from().is_some()
+        || proposal.agreement_effective_until().is_some()
+        || proposal.agreement_end_condition().is_some()
+    {
+        return Err(SharedExperienceRejectionReason::UnexpectedAgreementTerms);
     }
     if proposal.person_support().is_empty() {
         return Err(SharedExperienceRejectionReason::MissingPersonSupport);

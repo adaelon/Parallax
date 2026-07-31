@@ -1,5 +1,49 @@
 # 代码链路
 
+## 2026-07-31 S21-4 全仓门禁与实现级 diff 审计
+
+**触达**:
+- `crates/core/src/domain.rs`、`crates/core/src/memory_loop.rs` — 收紧候选构造与最终签署错误路径，保持无 panic 的显式拒绝。
+- `docs/architecture.md:§4.2/§5.4/§9.21` — 对齐真实候选版本链、RuntimeRequest 精确同意和 S21 已完成边界。
+- `docs/code-trail.md:S21-1～S21-4` — 记录 Core、Vault、运行时/桌面和全仓验证四个可接手切片。
+
+**入口**：S21 完整纵向路径从真实运行时约定提议或本人仪式修改进入，经 Core/Vault 双签状态机回到桌面最终签署。
+**测试**：Rust 全仓 198/198、Clippy `-D warnings`、fmt、桌面 target、React 5/5、TypeScript 与生产构建通过；`git diff --check` 和 101 个本地 Markdown 链接审计通过。
+
+## 2026-07-31 S21-3 真实运行时与桌面版本双签仪式
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:TurnInput/parse_turn_response/response_schema` — 向真实运行时提供待同意候选精确版本，要求约定边界，并白名单解析第二自我精确版本同意操作。
+- `apps/desktop/src-tauri/src/state.rs:list_shared_experience_ceremonies_from_core/revise_shared_agreement_from_core` — 从可信 Core 投影候选版本、范围、有效期和终止项，以白名单路径提交本人结构化修订。
+- `apps/desktop/src-tauri/src/lib.rs:revise_shared_agreement` — 暴露最小候选修订 command，不向 WebView 提供仓储或任意写能力。
+- `apps/desktop/src/App.tsx:App/terminationText`、`apps/desktop/src/styles.css` — 展示全部签署边界，无终止项明确持续条件，并把本人修改提交为等待第二自我同意的新版本。
+- `crates/runtime-gateway/tests/runtime_contract.rs`、`apps/desktop/src-tauri/src/state.rs`、`apps/desktop/src/App.test.tsx` — 固定真实 contract、可信投影、修改后重签和持续条件文案。
+
+**入口**：初次运行时约定提议直接形成 v1 最终签署仪式；本人从仪式修改后生成待第二自我同意的 vN+1，后续对话精确同意该版本才恢复最终签署按钮。
+**测试**：runtime contract 13/13、桌面 Rust host 15/15、React 5/5 与 TypeScript 类型检查通过。
+
+## 2026-07-31 S21-2 schema v18 与版本双签持久化
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_18` — 增加候选版本链、范围、有效期、终止项、待第二自我同意及双方签署时间，并使旧 S20 无边界候选不可继续签署。
+- `crates/vault/src/repository.rs:SharedExperienceRepository` — 原子提交本人修订与旧版退役、绑定第二自我精确同意、按候选有效期签署 Claim，并在遗忘时递归清除版本后继及确认 Claim。
+- `crates/vault/tests/shared_experience_persistence.rs` — 覆盖候选边界重启恢复、修订版本链、精确双签和前代证据遗忘闭包。
+- `crates/vault/src/schema.rs:schema::tests` — 固定 v18 中断迁移回滚后可重新打开并完成升级。
+
+**入口**：Core 通过扩展后的 `SharedExperienceRepository` 提交候选、修订、精确同意和最终签署；Vault 在同一 SQLCipher 事务内维护候选状态与签署证据。
+**测试**：Vault 共同约定持久化 4/4、schema 迁移 20/20 通过。
+
+## 2026-07-31 S21-1 Core 候选版本与精确双签状态机
+
+**触达**:
+- `crates/core/src/domain.rs:SharedAgreementCandidate/SharedAgreementRevision/SharedAgreementAssent` — 为候选增加不可变版本链、范围、有效期、终止项及第二自我精确版本同意契约。
+- `crates/core/src/memory_loop.rs:MemoryCore::revise_shared_agreement/persist_shared_agreement_assents/resolve_shared_agreement` — 拒绝缺边界候选，本人修改生成待第二自我同意的新版本，精确同意后才允许最终签署。
+- `crates/core/src/in_memory.rs:SharedExperienceRepository` — 原子模拟旧版退役、新版暂存、同意证据追加与候选内容/签署状态校验。
+- `crates/core/tests/shared_experiences.rs` — 覆盖缺范围/生效时间拒绝、开放终止项、旧版不可改写、错误版本同意拒绝和精确版本双签。
+
+**入口**：运行时初次提出带完整边界的约定，或本人从仪式提交结构化修改；待第二自我候选会随下一轮 `RuntimeRequest` 进入精确同意路径。
+**测试**：`cargo test -p core --test shared_experiences --no-fail-fast`，9/9 通过。
+
 ## 2026-07-31 S20-4 全仓门禁与实现级 diff 审计
 
 **触达**:

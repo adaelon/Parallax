@@ -16,12 +16,14 @@ pub use domain::{
     ForgetReceipt, ForgetRequest, ForgetTarget, FrozenEvidenceBlock, FrozenLedgerClaim,
     FrozenMemoryDispute, FrozenRetrievalWindow, JudgmentProposal, JudgmentRejection,
     JudgmentRejectionReason, PersonTurnClassification, RetrievalSnapshot, RetrievedContextItem,
-    RuntimeRequest, RuntimeResponse, SessionId, SharedAgreementCandidate,
+    RuntimeRequest, RuntimeResponse, SessionId, SharedAgreementAssent,
+    SharedAgreementAssentRejection, SharedAgreementAssentRejectionReason, SharedAgreementCandidate,
     SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedAgreementDecision,
-    SharedAgreementResolution, SharedExperience, SharedExperienceKind, SharedExperienceProposal,
-    SharedExperienceRejection, SharedExperienceRejectionReason, SourceCurrentness, Speaker,
-    StructuredOperationRejection, StructuredOperationRejectionReason, Timestamp, TurnOutcome,
-    Uncertainty, UnsupportedStructuredOperation, WorkingContext, WorkingContextError,
+    SharedAgreementResolution, SharedAgreementRevision, SharedExperience, SharedExperienceKind,
+    SharedExperienceProposal, SharedExperienceRejection, SharedExperienceRejectionReason,
+    SourceCurrentness, Speaker, StructuredOperationRejection, StructuredOperationRejectionReason,
+    Timestamp, TurnOutcome, Uncertainty, UnsupportedStructuredOperation, WorkingContext,
+    WorkingContextError,
 };
 pub use in_memory::InMemoryRepository;
 pub use memory_loop::{CoreError, MemoryCore};

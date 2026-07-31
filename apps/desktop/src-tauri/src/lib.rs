@@ -15,7 +15,8 @@ use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
 use state::{
     ConversationTurnResult, ConversationTurnView, HostStatusView, ImportContextFileView,
-    ManagedHost, SharedAgreementResolutionView, SharedExperienceCeremonyView,
+    ManagedHost, SharedAgreementResolutionView, SharedAgreementRevisionView,
+    SharedExperienceCeremonyView,
 };
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
@@ -82,6 +83,31 @@ async fn resolve_shared_agreement(
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<ManagedHost>()
             .resolve_shared_agreement(candidate_id, confirm)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn revise_shared_agreement(
+    app: AppHandle,
+    candidate_id: u64,
+    statement: String,
+    scope: String,
+    effective_from_millis: i64,
+    effective_until_millis: Option<i64>,
+    end_condition: Option<String>,
+) -> Result<SharedAgreementRevisionView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>().revise_shared_agreement(
+            candidate_id,
+            statement,
+            scope,
+            effective_from_millis,
+            effective_until_millis,
+            end_condition,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -278,6 +304,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             list_shared_experience_ceremonies,
             send_message,
             resolve_shared_agreement,
+            revise_shared_agreement,
             dismiss_shared_experience_ceremony,
             import_context_file,
             get_autostart,

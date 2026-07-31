@@ -28,11 +28,24 @@ export interface SharedExperienceCeremony {
   experienceKind: SharedExperienceKind;
   admission: "confirmationRequired" | "nonVetoNotice";
   statement: string;
+  candidateVersion: number | null;
+  scope: string | null;
+  effectiveFromMillis: number | null;
+  effectiveUntilMillis: number | null;
+  endCondition: string | null;
   evidence: Array<{
     evidenceId: number;
     speaker: Speaker;
     quote: string;
   }>;
+}
+
+interface AgreementRevisionDraft {
+  statement: string;
+  scope: string;
+  effectiveFrom: string;
+  effectiveUntil: string;
+  endCondition: string;
 }
 
 const timeFormatter = new Intl.DateTimeFormat("zh-CN", {
@@ -47,6 +60,8 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [ceremonyAction, setCeremonyAction] = useState<string | null>(null);
+  const [revisionDraft, setRevisionDraft] = useState<AgreementRevisionDraft | null>(null);
+  const [revisionNotice, setRevisionNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const conversationEnd = useRef<HTMLDivElement>(null);
 
@@ -146,6 +161,67 @@ export function App() {
     }
   }
 
+  function beginRevision(ceremony: SharedExperienceCeremony) {
+    setRevisionDraft({
+      statement: ceremony.statement,
+      scope: ceremony.scope ?? "",
+      effectiveFrom: toDateTimeInput(ceremony.effectiveFromMillis),
+      effectiveUntil: toDateTimeInput(ceremony.effectiveUntilMillis),
+      endCondition: ceremony.endCondition ?? "",
+    });
+  }
+
+  async function submitRevision(
+    event: FormEvent<HTMLFormElement>,
+    ceremony: SharedExperienceCeremony,
+  ) {
+    event.preventDefault();
+    if (revisionDraft === null || ceremonyAction !== null) {
+      return;
+    }
+    const effectiveFromMillis = Date.parse(revisionDraft.effectiveFrom);
+    const effectiveUntilMillis = revisionDraft.effectiveUntil
+      ? Date.parse(revisionDraft.effectiveUntil)
+      : null;
+    if (
+      revisionDraft.statement.trim().length === 0 ||
+      revisionDraft.scope.trim().length === 0 ||
+      !Number.isFinite(effectiveFromMillis) ||
+      (effectiveUntilMillis !== null && !Number.isFinite(effectiveUntilMillis))
+    ) {
+      setError("候选表述、适用范围和生效时间不能为空。");
+      return;
+    }
+
+    const key = ceremonyKey(ceremony);
+    setCeremonyAction(key);
+    setError(null);
+    try {
+      const revised = await invoke<{ candidateId: number; version: number; status: string }>(
+        "revise_shared_agreement",
+        {
+          candidateId: ceremony.targetId,
+          statement: revisionDraft.statement,
+          scope: revisionDraft.scope,
+          effectiveFromMillis,
+          effectiveUntilMillis,
+          endCondition: revisionDraft.endCondition.trim() || null,
+        },
+      );
+      setCeremonies((current) =>
+        current.filter((item) => ceremonyKey(item) !== key),
+      );
+      setRevisionDraft(null);
+      setRevisionNotice(
+        `候选 v${revised.version} 已生成，等待第二自我明确同意该精确版本后再由你最终签署。`,
+      );
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setCeremonyAction(null);
+    }
+  }
+
   const activeCeremony = ceremonies[0];
 
   return (
@@ -207,7 +283,26 @@ export function App() {
           >
             <p className="eyebrow">共同历史仪式</p>
             <h2 id="ceremony-title">{ceremonyTitle(activeCeremony.experienceKind)}</h2>
+            {activeCeremony.candidateVersion !== null ? (
+              <p className="ceremony-version">候选 v{activeCeremony.candidateVersion}</p>
+            ) : null}
             <p className="ceremony-statement">{activeCeremony.statement}</p>
+            {activeCeremony.admission === "confirmationRequired" ? (
+              <dl className="ceremony-boundaries">
+                <div>
+                  <dt>适用范围</dt>
+                  <dd>{activeCeremony.scope}</dd>
+                </div>
+                <div>
+                  <dt>生效时间</dt>
+                  <dd>{formatBoundaryTime(activeCeremony.effectiveFromMillis)}</dd>
+                </div>
+                <div>
+                  <dt>终止项</dt>
+                  <dd>{terminationText(activeCeremony)}</dd>
+                </div>
+              </dl>
+            ) : null}
             <div className="ceremony-evidence" aria-label="支持它的双方原话">
               {activeCeremony.evidence.map((item) => (
                 <blockquote key={`${item.evidenceId}-${item.speaker}`}>
@@ -222,7 +317,7 @@ export function App() {
                 : "这段共同历史已依据双方证据入账；关闭通知不会撤销记录。"}
             </p>
             <div className="ceremony-actions">
-              {activeCeremony.admission === "confirmationRequired" ? (
+              {activeCeremony.admission === "confirmationRequired" && revisionDraft === null ? (
                 <>
                   <button
                     className="secondary-action"
@@ -233,6 +328,14 @@ export function App() {
                     暂不记录
                   </button>
                   <button
+                    className="secondary-action"
+                    disabled={ceremonyAction !== null}
+                    onClick={() => beginRevision(activeCeremony)}
+                    type="button"
+                  >
+                    提出修改
+                  </button>
+                  <button
                     disabled={ceremonyAction !== null}
                     onClick={() => void resolveCeremony(activeCeremony, true)}
                     type="button"
@@ -240,7 +343,7 @@ export function App() {
                     确认入账
                   </button>
                 </>
-              ) : (
+              ) : activeCeremony.admission === "nonVetoNotice" ? (
                 <button
                   disabled={ceremonyAction !== null}
                   onClick={() => void resolveCeremony(activeCeremony)}
@@ -248,8 +351,70 @@ export function App() {
                 >
                   已知悉并关闭
                 </button>
-              )}
+              ) : null}
             </div>
+            {activeCeremony.admission === "confirmationRequired" && revisionDraft !== null ? (
+              <form
+                className="revision-form"
+                onSubmit={(event) => void submitRevision(event, activeCeremony)}
+              >
+                <label htmlFor="agreement-statement">候选表述</label>
+                <textarea
+                  id="agreement-statement"
+                  onChange={(event) =>
+                    setRevisionDraft({ ...revisionDraft, statement: event.target.value })
+                  }
+                  value={revisionDraft.statement}
+                />
+                <label htmlFor="agreement-scope">适用范围</label>
+                <input
+                  id="agreement-scope"
+                  onChange={(event) =>
+                    setRevisionDraft({ ...revisionDraft, scope: event.target.value })
+                  }
+                  value={revisionDraft.scope}
+                />
+                <label htmlFor="agreement-effective-from">生效时间</label>
+                <input
+                  id="agreement-effective-from"
+                  onChange={(event) =>
+                    setRevisionDraft({ ...revisionDraft, effectiveFrom: event.target.value })
+                  }
+                  type="datetime-local"
+                  value={revisionDraft.effectiveFrom}
+                />
+                <label htmlFor="agreement-effective-until">终止时间（可选）</label>
+                <input
+                  id="agreement-effective-until"
+                  onChange={(event) =>
+                    setRevisionDraft({ ...revisionDraft, effectiveUntil: event.target.value })
+                  }
+                  type="datetime-local"
+                  value={revisionDraft.effectiveUntil}
+                />
+                <label htmlFor="agreement-end-condition">终止条件（可选）</label>
+                <input
+                  id="agreement-end-condition"
+                  onChange={(event) =>
+                    setRevisionDraft({ ...revisionDraft, endCondition: event.target.value })
+                  }
+                  value={revisionDraft.endCondition}
+                />
+                <div className="ceremony-actions">
+                  <button
+                    className="secondary-action"
+                    disabled={ceremonyAction !== null}
+                    onClick={() => setRevisionDraft(null)}
+                    type="button"
+                  >
+                    取消修改
+                  </button>
+                  <button disabled={ceremonyAction !== null} type="submit">
+                    提交新版本
+                  </button>
+                </div>
+              </form>
+            ) : null}
             {ceremonies.length > 1 ? (
               <p className="ceremony-queue">还有 {ceremonies.length - 1} 项仪式等待处理</p>
             ) : null}
@@ -263,6 +428,7 @@ export function App() {
             {error}
           </p>
         ) : null}
+        {revisionNotice ? <p className="revision-notice">{revisionNotice}</p> : null}
         <form className="composer" onSubmit={submitMessage}>
           <label className="sr-only" htmlFor="message">
             写下此刻想说的话
@@ -296,6 +462,32 @@ function ceremonyTitle(kind: SharedExperienceKind): string {
     case "sharedAchievement":
       return "共同完成的重要事情已记录";
   }
+}
+
+function terminationText(ceremony: SharedExperienceCeremony): string {
+  const parts: string[] = [];
+  if (ceremony.effectiveUntilMillis !== null) {
+    parts.push(`至 ${formatBoundaryTime(ceremony.effectiveUntilMillis)}`);
+  }
+  if (ceremony.endCondition !== null) {
+    parts.push(ceremony.endCondition);
+  }
+  return parts.length > 0
+    ? parts.join("；")
+    : "持续有效，直到任何一方退出或双方签署替代约定";
+}
+
+function formatBoundaryTime(value: number | null): string {
+  return value === null ? "未设置" : new Date(value).toLocaleString("zh-CN");
+}
+
+function toDateTimeInput(value: number | null): string {
+  if (value === null) {
+    return "";
+  }
+  const date = new Date(value);
+  const local = new Date(value - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
 }
 
 function ceremonyKey(ceremony: SharedExperienceCeremony): string {

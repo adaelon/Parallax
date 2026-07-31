@@ -60,6 +60,7 @@ impl SharedExperienceRepository for InMemoryRepository {
     ) -> Result<(), RepositoryError> {
         validate_candidate_storage(&self.evidence, &candidate)?;
         if candidate.status() != SharedAgreementCandidateStatus::AwaitingPerson
+            || candidate.counterpart_assented_at().is_none()
             || candidate.decided_at().is_some()
             || candidate.claim_id().is_some()
         {
@@ -77,6 +78,82 @@ impl SharedExperienceRepository for InMemoryRepository {
             ));
         }
         Ok(())
+    }
+
+    fn commit_shared_agreement_revision(
+        &mut self,
+        previous_id: SharedAgreementCandidateId,
+        person_evidence: ConversationEvidence,
+        revised: SharedAgreementCandidate,
+        revised_at: Timestamp,
+    ) -> Result<(), RepositoryError> {
+        let previous = self
+            .shared_agreement_candidates
+            .get(&previous_id)
+            .ok_or_else(|| RepositoryError::new("shared agreement candidate does not exist"))?;
+        if previous.status() != SharedAgreementCandidateStatus::AwaitingPerson {
+            return Err(RepositoryError::new(
+                "shared agreement candidate is not awaiting person confirmation",
+            ));
+        }
+        if revised.status() != SharedAgreementCandidateStatus::AwaitingCounterpart
+            || revised.predecessor_candidate_id() != Some(previous_id)
+            || revised.version() != previous.version().saturating_add(1)
+            || revised.counterpart_assented_at().is_some()
+            || revised.decided_at().is_some()
+            || revised.claim_id().is_some()
+            || person_evidence.speaker() != Speaker::Person
+            || self.evidence.contains_key(&person_evidence.id())
+            || self.shared_agreement_candidates.contains_key(&revised.id())
+        {
+            return Err(RepositoryError::new("invalid shared agreement revision"));
+        }
+        let mut evidence = self.evidence.clone();
+        evidence.insert(person_evidence.id(), person_evidence.clone());
+        validate_candidate_storage(&evidence, &revised)?;
+
+        self.evidence.insert(person_evidence.id(), person_evidence);
+        self.shared_agreement_candidates
+            .get_mut(&previous_id)
+            .expect("validated candidate remains present")
+            .resolve(SharedAgreementCandidateStatus::Deferred, revised_at, None);
+        self.shared_agreement_candidates
+            .insert(revised.id(), revised);
+        Ok(())
+    }
+
+    fn commit_counterpart_agreement_assent(
+        &mut self,
+        id: SharedAgreementCandidateId,
+        version: u64,
+        citation: crate::EvidenceCitation,
+        assented_at: Timestamp,
+    ) -> Result<SharedAgreementCandidate, RepositoryError> {
+        let source = self
+            .evidence
+            .get(&citation.evidence_id())
+            .ok_or_else(|| RepositoryError::new("counterpart assent evidence does not exist"))?;
+        if source.speaker() != Speaker::Counterpart
+            || citation.quote().is_empty()
+            || !source.verbatim().contains(citation.quote())
+        {
+            return Err(RepositoryError::new(
+                "counterpart assent is not an exact counterpart quote",
+            ));
+        }
+        let candidate = self
+            .shared_agreement_candidates
+            .get_mut(&id)
+            .ok_or_else(|| RepositoryError::new("shared agreement candidate does not exist"))?;
+        if candidate.status() != SharedAgreementCandidateStatus::AwaitingCounterpart
+            || candidate.version() != version
+        {
+            return Err(RepositoryError::new(
+                "shared agreement candidate is not awaiting this counterpart assent",
+            ));
+        }
+        candidate.accept_counterpart_assent(citation, assented_at);
+        Ok(candidate.clone())
     }
 
     fn shared_agreement_candidate(
@@ -112,6 +189,8 @@ impl SharedExperienceRepository for InMemoryRepository {
                 if experience.kind() != SharedExperienceKind::Agreement
                     || experience.claim().statement() != candidate.statement()
                     || experience.claim().support() != candidate.support()
+                    || candidate.effective_from().is_none()
+                    || experience.claim().applicable_time() != agreement_applicable_time(&candidate)
                 {
                     return Err(RepositoryError::new(
                         "confirmed agreement does not match its immutable candidate",
@@ -190,10 +269,61 @@ fn validate_candidate_storage(
     evidence: &BTreeMap<EvidenceId, ConversationEvidence>,
     candidate: &SharedAgreementCandidate,
 ) -> Result<(), RepositoryError> {
-    if candidate.statement().trim().is_empty() || candidate.support().len() < 2 {
+    if candidate.version() == 0
+        || candidate.statement().trim().is_empty()
+        || candidate
+            .scope()
+            .is_none_or(|scope| scope.trim().is_empty())
+        || candidate.effective_from().is_none()
+        || candidate.effective_until().is_some_and(|until| {
+            until.as_millis()
+                < candidate
+                    .effective_from()
+                    .expect("checked above")
+                    .as_millis()
+        })
+        || candidate
+            .end_condition()
+            .is_some_and(|condition| condition.trim().is_empty())
+    {
         return Err(RepositoryError::new("invalid shared agreement candidate"));
     }
-    validate_shared_support(evidence, candidate.support())
+    match candidate.status() {
+        SharedAgreementCandidateStatus::AwaitingCounterpart => {
+            validate_candidate_support(evidence, candidate.support(), true, false)
+        }
+        SharedAgreementCandidateStatus::AwaitingPerson
+        | SharedAgreementCandidateStatus::Deferred
+        | SharedAgreementCandidateStatus::Confirmed => {
+            validate_candidate_support(evidence, candidate.support(), true, true)
+        }
+    }
+}
+
+fn agreement_applicable_time(candidate: &SharedAgreementCandidate) -> crate::ApplicableTime {
+    let start = candidate
+        .effective_from()
+        .expect("signable candidates have an effective time");
+    candidate
+        .effective_until()
+        .map_or(crate::ApplicableTime::Since(start), |end| {
+            crate::ApplicableTime::Between { start, end }
+        })
+}
+
+fn validate_candidate_support(
+    evidence: &BTreeMap<EvidenceId, ConversationEvidence>,
+    support: &[crate::EvidenceCitation],
+    require_person: bool,
+    require_counterpart: bool,
+) -> Result<(), RepositoryError> {
+    let (has_person, has_counterpart) = validate_exact_support(evidence, support)?;
+    if (require_person && !has_person) || (require_counterpart && !has_counterpart) {
+        return Err(RepositoryError::new(
+            "candidate signature evidence does not match its signing state",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_shared_experience_storage(
@@ -215,6 +345,19 @@ fn validate_shared_support(
     evidence: &BTreeMap<EvidenceId, ConversationEvidence>,
     support: &[crate::EvidenceCitation],
 ) -> Result<(), RepositoryError> {
+    let (has_person, has_counterpart) = validate_exact_support(evidence, support)?;
+    if !has_person || !has_counterpart {
+        return Err(RepositoryError::new(
+            "shared history requires evidence from both participants",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_support(
+    evidence: &BTreeMap<EvidenceId, ConversationEvidence>,
+    support: &[crate::EvidenceCitation],
+) -> Result<(bool, bool), RepositoryError> {
     let mut has_person = false;
     let mut has_counterpart = false;
     for citation in support {
@@ -231,12 +374,7 @@ fn validate_shared_support(
             Speaker::Counterpart => has_counterpart = true,
         }
     }
-    if !has_person || !has_counterpart {
-        return Err(RepositoryError::new(
-            "shared history requires evidence from both participants",
-        ));
-    }
-    Ok(())
+    Ok((has_person, has_counterpart))
 }
 
 impl ForgetRepository for InMemoryRepository {
@@ -266,6 +404,41 @@ impl ForgetRepository for InMemoryRepository {
             })
             .map(Claim::id)
             .collect::<Vec<_>>();
+        let mut affected_candidates = self
+            .shared_agreement_candidates
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .support()
+                    .iter()
+                    .any(|citation| citation.evidence_id() == evidence_id)
+                    || candidate
+                        .claim_id()
+                        .is_some_and(|claim_id| affected_claims.contains(&claim_id))
+            })
+            .map(SharedAgreementCandidate::id)
+            .collect::<Vec<_>>();
+        loop {
+            let previous_len = affected_candidates.len();
+            for candidate in self.shared_agreement_candidates.values() {
+                if candidate
+                    .predecessor_candidate_id()
+                    .is_some_and(|id| affected_candidates.contains(&id))
+                    && !affected_candidates.contains(&candidate.id())
+                {
+                    affected_candidates.push(candidate.id());
+                }
+            }
+            if affected_candidates.len() == previous_len {
+                break;
+            }
+        }
+        affected_claims.extend(
+            self.shared_agreement_candidates
+                .values()
+                .filter(|candidate| affected_candidates.contains(&candidate.id()))
+                .filter_map(SharedAgreementCandidate::claim_id),
+        );
         loop {
             let previous_len = affected_claims.len();
             for claim in self.claims.values() {
@@ -286,20 +459,6 @@ impl ForgetRepository for InMemoryRepository {
         for claim_id in &affected_claims {
             self.claims.remove(claim_id);
         }
-        let affected_candidates = self
-            .shared_agreement_candidates
-            .values()
-            .filter(|candidate| {
-                candidate
-                    .support()
-                    .iter()
-                    .any(|citation| citation.evidence_id() == evidence_id)
-                    || candidate
-                        .claim_id()
-                        .is_some_and(|claim_id| affected_claims.contains(&claim_id))
-            })
-            .map(SharedAgreementCandidate::id)
-            .collect::<Vec<_>>();
         for candidate_id in &affected_candidates {
             self.shared_agreement_candidates.remove(candidate_id);
         }
