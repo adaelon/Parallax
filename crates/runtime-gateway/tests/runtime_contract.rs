@@ -30,6 +30,8 @@ const UNSUPPORTED_OPERATION_RESPONSE: &str =
     include_str!("fixtures/unsupported-operation-response.json");
 const SHARED_EXPERIENCE_RESPONSE: &str = include_str!("fixtures/shared-experience-response.json");
 const SHARED_AGREEMENT_RESPONSE: &str = include_str!("fixtures/shared-agreement-response.json");
+const SHARED_AGREEMENT_SUPERSESSION_RESPONSE: &str =
+    include_str!("fixtures/shared-agreement-supersession-response.json");
 const SHARED_AGREEMENT_ASSENT_RESPONSE: &str =
     include_str!("fixtures/shared-agreement-assent-response.json");
 const RELATIONAL_CONSTRAINT_DEPARTURE_RESPONSE: &str =
@@ -602,6 +604,7 @@ fn agreement_boundaries_and_pending_exact_version_are_in_the_runtime_contract() 
     assert_eq!(pending["version"], 2);
     assert_eq!(pending["scope"], "双方共同项目的正式复盘");
     assert_eq!(pending["effective_from_millis"], 3_000);
+    assert_eq!(pending["supersedes_agreement_ids"], serde_json::json!([]));
     assert!(
         assent_request["text"]["format"]["schema"]
             .to_string()
@@ -611,6 +614,87 @@ fn agreement_boundaries_and_pending_exact_version_are_in_the_runtime_contract() 
         response_disclosures[1]
             .evidence_ids()
             .contains(&EvidenceId::from_raw(3))
+    );
+}
+
+#[test]
+fn explicit_whole_supersession_is_in_the_strict_runtime_contract() {
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(SHARED_AGREEMENT_RESPONSE),
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(SHARED_AGREEMENT_SUPERSESSION_RESPONSE),
+    ]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(1_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let first = core
+        .run_counterpart_turn(
+            SessionId::new("chat"),
+            "我同意复盘时直接指出关键逃避。",
+            context,
+        )
+        .unwrap();
+    let original_claim_id = core
+        .resolve_shared_agreement(
+            first.pending_agreement_candidate_ids()[0],
+            SharedAgreementDecision::Confirm,
+        )
+        .unwrap()
+        .claim_id()
+        .unwrap();
+    let context = WorkingContext::from_selected_evidence(Vec::new(), Timestamp::from_millis(3_000))
+        .with_active_relational_constraints(vec![
+            ActiveRelationalConstraint::new(
+                original_claim_id,
+                "复盘中直接指出关键逃避",
+                "双方共同项目复盘",
+                Timestamp::from_millis(2_000),
+                None,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    let second = core
+        .run_counterpart_turn(
+            SessionId::new("chat"),
+            "我同意新约定整份取代旧约定。",
+            context,
+        )
+        .unwrap();
+
+    assert!(second.rejected_shared_experiences().is_empty());
+    let replacement = core
+        .repository()
+        .shared_agreement_candidate(second.pending_agreement_candidate_ids()[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement.supersedes_agreement_ids(), &[original_claim_id]);
+    let disclosure = core
+        .runtime()
+        .disclosures()
+        .iter()
+        .filter(|record| record.invocation() == InvocationKind::Response)
+        .nth(1)
+        .unwrap();
+    let request: Value = serde_json::from_str(disclosure.request_json()).unwrap();
+    let schema = request["text"]["format"]["schema"].to_string();
+    assert!(schema.contains("supersedes_agreement_ids"));
+    assert!(
+        request["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("every entire displaced agreement Claim ID")
+    );
+    assert!(
+        disclosure
+            .retrieved_sources()
+            .contains(&OutboundContextSource::LedgerClaim {
+                claim_id: original_claim_id,
+            })
     );
 }
 

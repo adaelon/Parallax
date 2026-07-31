@@ -175,6 +175,40 @@ describe("S20 typed shared-experience ceremony", () => {
       effectiveFromMillis: 1_785_000_000_000,
       effectiveUntilMillis: null,
       endCondition: null,
+      supersedesAgreementIds: [],
+    });
+  });
+
+  it("shows the complete whole-agreement supersession list before signing", async () => {
+    const ceremony: SharedExperienceCeremony = {
+      ...agreementCeremony(),
+      statement: "复盘时不要直接指出关键逃避",
+      supersededAgreements: [
+        {
+          claimId: 4,
+          statement: "复盘时直接指出关键逃避",
+          scope: "双方共同项目复盘",
+          effectiveFromMillis: 1_785_000_000_000,
+          effectiveUntilMillis: null,
+        },
+      ],
+    };
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "list_conversation") {
+        return [] as T;
+      }
+      if (command === "list_shared_experience_ceremonies") {
+        return [ceremony] as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("本约定将整份取代以下共同约定");
+      expect(document.body.textContent).toContain("Claim #4：复盘时直接指出关键逃避");
+      expect(document.body.textContent).toContain("双方共同项目复盘");
+      expect(document.body.textContent).toContain("不会推导任何残余义务");
     });
   });
 
@@ -192,6 +226,7 @@ describe("S20 typed shared-experience ceremony", () => {
       endCondition: null,
       agreementClaimId: null,
       departureReason: null,
+      supersededAgreements: [],
       evidence: [
         { evidenceId: 1, speaker: "person", quote: "这件事无关紧要" },
         { evidenceId: 2, speaker: "counterpart", quote: "我不同意" },
@@ -243,6 +278,7 @@ describe("S20 typed shared-experience ceremony", () => {
       endCondition: null,
       agreementClaimId: 7,
       departureReason: "因为安全边界禁止现实行动授权",
+      supersededAgreements: [],
       evidence: [
         { evidenceId: 1, speaker: "person", quote: "我同意" },
         { evidenceId: 2, speaker: "counterpart", quote: "我也同意" },
@@ -329,6 +365,7 @@ function agreementCeremony(): SharedExperienceCeremony {
     endCondition: null,
     agreementClaimId: null,
     departureReason: null,
+    supersededAgreements: [],
     evidence: [
       { evidenceId: 1, speaker: "person", quote: "我同意" },
       { evidenceId: 2, speaker: "counterpart", quote: "我也同意" },

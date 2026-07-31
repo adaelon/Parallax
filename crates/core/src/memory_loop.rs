@@ -698,19 +698,31 @@ where
                 )))
                 .collect::<Vec<_>>();
             if proposal.kind().requires_person_confirmation() {
+                let revision = SharedAgreementRevision::new(
+                    proposal.statement(),
+                    proposal
+                        .agreement_scope()
+                        .expect("validated agreement scope"),
+                    proposal
+                        .agreement_effective_from()
+                        .expect("validated agreement effective time"),
+                    proposal.agreement_effective_until(),
+                    proposal.agreement_end_condition().map(str::to_owned),
+                )
+                .with_superseded_agreements(proposal.supersedes_agreement_ids().to_vec());
+                if let Err(reason) = validate_agreement_supersession(
+                    &revision,
+                    &self.repository.all_shared_agreement_candidates()?,
+                    &self.repository.all_shared_experiences()?,
+                ) {
+                    outcome
+                        .rejected
+                        .push(SharedExperienceRejection::new(proposal_index, reason));
+                    continue;
+                }
                 let candidate = SharedAgreementCandidate::awaiting_person(
                     self.repository.next_shared_agreement_candidate_id(),
-                    SharedAgreementRevision::new(
-                        proposal.statement(),
-                        proposal
-                            .agreement_scope()
-                            .expect("validated agreement scope"),
-                        proposal
-                            .agreement_effective_from()
-                            .expect("validated agreement effective time"),
-                        proposal.agreement_effective_until(),
-                        proposal.agreement_end_condition().map(str::to_owned),
-                    ),
+                    revision,
                     support,
                     proposal.occurred_at(),
                     counterpart_evidence.recorded_at(),
@@ -764,11 +776,21 @@ where
         if !revision.is_valid() {
             return Err(CoreError::InvalidSharedAgreementRevision);
         }
+        if validate_agreement_supersession(
+            &revision,
+            &self.repository.all_shared_agreement_candidates()?,
+            &self.repository.all_shared_experiences()?,
+        )
+        .is_err()
+        {
+            return Err(CoreError::InvalidSharedAgreementRevision);
+        }
         if previous.statement() == revision.statement()
             && previous.scope() == Some(revision.scope())
             && previous.effective_from() == Some(revision.effective_from())
             && previous.effective_until() == revision.effective_until()
             && previous.end_condition() == revision.end_condition()
+            && previous.supersedes_agreement_ids() == revision.supersedes_agreement_ids()
         {
             return Err(CoreError::UnchangedSharedAgreementRevision);
         }
@@ -827,6 +849,27 @@ where
         let decided_at = self.clock.now();
         let confirmed =
             if decision == SharedAgreementDecision::Confirm {
+                let revision = SharedAgreementRevision::new(
+                    candidate.statement(),
+                    candidate
+                        .scope()
+                        .ok_or(CoreError::InvalidSharedAgreementRevision)?,
+                    candidate
+                        .effective_from()
+                        .ok_or(CoreError::InvalidSharedAgreementRevision)?,
+                    candidate.effective_until(),
+                    candidate.end_condition().map(str::to_owned),
+                )
+                .with_superseded_agreements(candidate.supersedes_agreement_ids().to_vec());
+                if validate_agreement_supersession(
+                    &revision,
+                    &self.repository.all_shared_agreement_candidates()?,
+                    &self.repository.all_shared_experiences()?,
+                )
+                .is_err()
+                {
+                    return Err(CoreError::InvalidSharedAgreementRevision);
+                }
                 let effective_from = candidate
                     .effective_from()
                     .ok_or(CoreError::InvalidSharedAgreementRevision)?;
@@ -924,10 +967,21 @@ fn validate_shared_experience_proposal(
         {
             return Err(SharedExperienceRejectionReason::InvalidAgreementValidity);
         }
+        if proposal
+            .supersedes_agreement_ids()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != proposal.supersedes_agreement_ids().len()
+        {
+            return Err(SharedExperienceRejectionReason::InvalidAgreementValidity);
+        }
     } else if proposal.agreement_scope().is_some()
         || proposal.agreement_effective_from().is_some()
         || proposal.agreement_effective_until().is_some()
         || proposal.agreement_end_condition().is_some()
+        || !proposal.supersedes_agreement_ids().is_empty()
     {
         return Err(SharedExperienceRejectionReason::UnexpectedAgreementTerms);
     }
@@ -971,6 +1025,70 @@ fn validate_shared_experience_proposal(
         return Err(SharedExperienceRejectionReason::CounterpartQuoteMismatch);
     }
     Ok(())
+}
+
+fn validate_agreement_supersession(
+    proposed: &SharedAgreementRevision,
+    candidates: &[SharedAgreementCandidate],
+    experiences: &[SharedExperience],
+) -> Result<(), SharedExperienceRejectionReason> {
+    let effective_from = proposed.effective_from();
+    let agreement_exists = |claim_id: ClaimId| {
+        experiences.iter().any(|experience| {
+            experience.kind() == crate::SharedExperienceKind::Agreement
+                && experience.claim().id() == claim_id
+                && experience.claim().status() == ClaimStatus::Current
+        })
+    };
+    let is_superseded_at = |claim_id: ClaimId| {
+        candidates.iter().any(|candidate| {
+            candidate.status() == SharedAgreementCandidateStatus::Confirmed
+                && candidate.claim_id().is_some_and(&agreement_exists)
+                && candidate
+                    .effective_from()
+                    .is_some_and(|from| from.as_millis() <= effective_from.as_millis())
+                && candidate.supersedes_agreement_ids().contains(&claim_id)
+        })
+    };
+    let is_active_at_start = |candidate: &SharedAgreementCandidate| {
+        candidate.status() == SharedAgreementCandidateStatus::Confirmed
+            && candidate.claim_id().is_some_and(&agreement_exists)
+            && candidate
+                .effective_from()
+                .is_some_and(|from| from.as_millis() <= effective_from.as_millis())
+            && candidate
+                .effective_until()
+                .is_none_or(|until| until.as_millis() >= effective_from.as_millis())
+            && candidate.claim_id().is_some_and(|id| !is_superseded_at(id))
+    };
+
+    for target in proposed.supersedes_agreement_ids() {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.claim_id() == Some(*target) && is_active_at_start(candidate))
+        {
+            return Err(SharedExperienceRejectionReason::SupersededAgreementNotActive(*target));
+        }
+    }
+
+    let mut undeclared = candidates
+        .iter()
+        .filter(|candidate| is_active_at_start(candidate))
+        .filter(|candidate| crate::domain::shared_agreements_conflict(proposed, candidate))
+        .filter_map(SharedAgreementCandidate::claim_id)
+        .filter(|claim_id| !proposed.supersedes_agreement_ids().contains(claim_id))
+        .collect::<Vec<_>>();
+    undeclared.sort_unstable();
+    undeclared.dedup();
+    if undeclared.is_empty() {
+        Ok(())
+    } else {
+        Err(
+            SharedExperienceRejectionReason::ConflictingAgreementsRequireExplicitSupersession(
+                undeclared,
+            ),
+        )
+    }
 }
 
 fn validate_citation(

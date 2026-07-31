@@ -98,6 +98,7 @@ async fn revise_shared_agreement(
     effective_from_millis: i64,
     effective_until_millis: Option<i64>,
     end_condition: Option<String>,
+    supersedes_agreement_ids: Vec<u64>,
 ) -> Result<SharedAgreementRevisionView, String> {
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<ManagedHost>().revise_shared_agreement(
@@ -107,6 +108,7 @@ async fn revise_shared_agreement(
             effective_from_millis,
             effective_until_millis,
             end_condition,
+            supersedes_agreement_ids,
         )
     })
     .await

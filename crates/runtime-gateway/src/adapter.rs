@@ -28,8 +28,12 @@ const ORDINARY_RESPONSE_INSTRUCTIONS: &str = concat!(
     "achievement completed together. Exclude ordinary questions, answers, and person-only external ",
     "experiences; if removing the digital counterpart leaves the event fully intact, do not propose ",
     "a shared experience. Agreement proposals must include explicit scope and effective_from; ",
-    "effective_until and end_condition may be null. If an immutable pending agreement candidate ",
-    "is listed, use assent_shared_agreement_candidate only when accepting that exact candidate ID ",
+    "effective_until and end_condition may be null. If an agreement proposal conflicts with an ",
+    "active agreement, supersedes_agreement_ids must list every entire displaced ",
+    "agreement Claim ID and the new statement must restate every obligation intended to survive; ",
+    "never infer a residual duty from an old agreement. ",
+    "If an immutable pending agreement candidate is listed, use assent_shared_agreement_candidate ",
+    "only when accepting that exact candidate ID ",
     "and version. Cite exact person evidence and an exact quote from this counterpart response. ",
     "Follow every listed active relational constraint when it is relevant. These constraints are ",
     "always below the constitution, safety boundaries, and action authorization; they cannot ",
@@ -49,8 +53,12 @@ const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
     "achievement completed together. Exclude ordinary questions, answers, and person-only external ",
     "experiences; if removing the digital counterpart leaves the event fully intact, do not propose ",
     "a shared experience. Agreement proposals must include explicit scope and effective_from; ",
-    "effective_until and end_condition may be null. If an immutable pending agreement candidate ",
-    "is listed, use assent_shared_agreement_candidate only when accepting that exact candidate ID ",
+    "effective_until and end_condition may be null. If an agreement proposal conflicts with an ",
+    "active agreement, supersedes_agreement_ids must list every entire displaced ",
+    "agreement Claim ID and the new statement must restate every obligation intended to survive; ",
+    "never infer a residual duty from an old agreement. ",
+    "If an immutable pending agreement candidate is listed, use assent_shared_agreement_candidate ",
+    "only when accepting that exact candidate ID ",
     "and version. Cite exact person evidence and an exact quote from this counterpart response. ",
     "Follow every listed active relational constraint when it is relevant. These constraints are ",
     "always below the constitution, safety boundaries, and action authorization; they cannot ",
@@ -299,6 +307,16 @@ fn response_outbound_selection(
             retrieved_sources.push(source);
         }
     }
+    for claim_id in request
+        .pending_agreement_candidates()
+        .iter()
+        .flat_map(|candidate| candidate.supersedes_agreement_ids().iter().copied())
+    {
+        let source = OutboundContextSource::LedgerClaim { claim_id };
+        if !retrieved_sources.contains(&source) {
+            retrieved_sources.push(source);
+        }
+    }
     OutboundSelection {
         evidence_ids,
         retrieved_sources,
@@ -353,6 +371,7 @@ struct PendingAgreementCandidateInput<'a> {
     effective_from_millis: Option<i64>,
     effective_until_millis: Option<i64>,
     end_condition: Option<&'a str>,
+    supersedes_agreement_ids: Vec<u64>,
     person_support: Vec<CitationInput<'a>>,
 }
 
@@ -366,6 +385,11 @@ impl<'a> From<&'a SharedAgreementCandidate> for PendingAgreementCandidateInput<'
             effective_from_millis: value.effective_from().map(eam_core::Timestamp::as_millis),
             effective_until_millis: value.effective_until().map(eam_core::Timestamp::as_millis),
             end_condition: value.end_condition(),
+            supersedes_agreement_ids: value
+                .supersedes_agreement_ids()
+                .iter()
+                .map(|id| id.get())
+                .collect(),
             person_support: value.support().iter().map(CitationInput::from).collect(),
         }
     }
@@ -793,6 +817,7 @@ struct SharedExperienceOperation {
     effective_from_millis: Option<i64>,
     effective_until_millis: Option<i64>,
     end_condition: Option<String>,
+    supersedes_agreement_ids: Vec<u64>,
 }
 
 #[derive(Deserialize)]
@@ -939,6 +964,13 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
                         domain.with_agreement_scope(scope)
                     };
                 }
+                domain = domain.with_superseded_agreements(
+                    proposal
+                        .supersedes_agreement_ids
+                        .into_iter()
+                        .map(eam_core::ClaimId::from_raw)
+                        .collect(),
+                );
                 response = response.with_shared_experience(domain);
             }
             "assent_shared_agreement_candidate" => {
@@ -1120,7 +1152,11 @@ fn shared_experience_operation_schema(citation: &Value) -> Value {
             "scope": { "type": ["string", "null"] },
             "effective_from_millis": { "type": ["integer", "null"] },
             "effective_until_millis": { "type": ["integer", "null"] },
-            "end_condition": { "type": ["string", "null"] }
+            "end_condition": { "type": ["string", "null"] },
+            "supersedes_agreement_ids": {
+                "type": "array",
+                "items": { "type": "integer" }
+            }
         },
         "required": [
             "type",
@@ -1132,7 +1168,8 @@ fn shared_experience_operation_schema(citation: &Value) -> Value {
             "scope",
             "effective_from_millis",
             "effective_until_millis",
-            "end_condition"
+            "end_condition",
+            "supersedes_agreement_ids"
         ]
     })
 }

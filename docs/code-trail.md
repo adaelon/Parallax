@@ -1,5 +1,50 @@
 # 代码链路
 
+## 2026-07-31 S23-4 全仓门禁、实现级 diff 审计与文档对齐
+
+**触达**:
+- `crates/core/src/domain.rs:agreement_terms/conflict_detection_ignores_generic_relational_scope_words` — 固定冲突检测不会因“双方/共同”等通用关系词误判无关范围。
+- `crates/core/src/in_memory.rs:collect_shared_agreement_forget_closure` — 提取候选、确认 Claim 与取代边的遗忘闭包收集，保持原行为并满足 Clippy 函数长度门禁。
+- `crates/retrieval/tests/relational_constraints.rs:whole_supersession_changes_only_future_projection_and_keeps_compatible_agreements` — 固定替代约定终止后旧约定也不会复活，兼容约定继续并行。
+- `docs/architecture.md:§4.1/§5.5/§9.23` — 对齐 schema v20 有序取代边、三阶段活动目标复核、未来投影与桌面可信展示的真实数据流。
+
+**入口**：S23-1～S23-3 的完整实现 diff，经格式化、全仓测试、静态检查、桌面/前端构建、链接与 JSON 夹具审计后进入提交。
+**测试**：Rust 全仓 216/216、fmt、Clippy `-D warnings`、桌面 all-targets、React 7/7、TypeScript 与生产构建通过；`git diff --check`、3 个变更 Markdown 的 101 个本地链接和 3 个 JSON 夹具通过。
+
+## 2026-07-31 S23-3 运行时取代契约与桌面完整仪式
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:TurnInput/parse_turn_response/response_schema` — 在严格 JSON 中收发 `supersedes_agreement_ids[]`，要求冲突候选重述保留义务并禁止残余推导，同时审计被取代 Claim。
+- `apps/desktop/src-tauri/src/state.rs:list_shared_experience_ceremonies_from_core/revise_shared_agreement_from_core` — 从可信候选和共同账本解析旧约定 Claim、表述、范围及结构化起止时间，并把取代清单保留到本人修订的新版本。
+- `apps/desktop/src-tauri/src/lib.rs:revise_shared_agreement` — 以白名单 command 传递结构化 Claim ID 清单，不向 WebView 暴露仓储。
+- `apps/desktop/src/App.tsx:App` — 签署前展示全部取代目标的 Claim、表述、范围及结构化起止时间，明确生效后无残余义务且历史保留。
+- `crates/runtime-gateway/tests/runtime_contract.rs`、`apps/desktop/src-tauri/src/state.rs`、`apps/desktop/src/App.test.tsx` — 固定真实 contract、可信投影、修订保留和界面清单。
+
+**入口**：相关对话把当前活动约定送入运行时；冲突候选携带旧 Agreement Claim ID，经 Core/Vault 校验后成为本人可检查的最终签署仪式。
+**测试**：Runtime contract 15/15、桌面 Rust 17/17、React 7/7 与 TypeScript 类型检查通过。
+
+## 2026-07-31 S23-2 schema v20、重启历史与遗忘闭包
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_20` — 以有序候选→旧共同约定 Claim 外键表持久化整份取代关系，并保持迁移单事务回滚。
+- `crates/vault/src/repository.rs:SharedExperienceRepository/load_shared_agreement_candidate` — 原子写入、恢复并在最终签署时复核取代目标仍有效。
+- `crates/vault/src/repository.rs:plan_conversation_forget/delete_conversation_claim_closure` — 遗忘旧约定支持时沿取代边递归删除依赖候选、确认 Claim 与派生历史，避免悬空或复活。
+- `crates/vault/tests/shared_experience_persistence.rs`、`crates/vault/src/schema.rs` — 覆盖重启、取代前后查询、旧违约保留、遗忘闭包与 v20 中断迁移。
+
+**入口**：Core 暂存或修订共同约定候选时把完整取代 Claim ID 清单交给 Vault；最终确认和重启恢复均只信任 schema v20 关系。
+**测试**：Vault 共同经历 6/6、schema 迁移 22/22 通过。
+
+## 2026-07-31 S23-1 冲突检测与显式整份取代契约
+
+**触达**:
+- `crates/core/src/domain.rs:SharedAgreementRevision/SharedAgreementCandidate/shared_agreements_conflict` — 把被取代约定 Claim ID 固定进不可变候选，并以范围、有效期、义务词项和显式否定极性保守识别直接冲突。
+- `crates/core/src/memory_loop.rs:validate_agreement_supersession` — 拒绝未完整声明的冲突及非活动取代目标，禁止从旧约定推导残余义务。
+- `crates/retrieval/src/lib.rs:project_active_relational_constraints` — 仅从新约定生效时起整份停止旧约定未来投影，兼容约定继续并行。
+- `crates/core/tests/shared_experiences.rs`、`crates/retrieval/tests/relational_constraints.rs` — 固定未声明拒绝、兼容并行、取代前后投影和历史不删除。
+
+**入口**：运行时提出带完整边界的共同约定候选；Core 在暂存前对有效约定执行保守冲突门禁，检索在冻结任务关系约束时应用已签署取代关系。
+**测试**：Core 共同经历 11/11、Retrieval 关系约束 3/3 通过。
+
 ## 2026-07-31 S22-4 相关性误召回修正与收尾审计
 
 **触达**:

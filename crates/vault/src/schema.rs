@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 19;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 20;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1163,6 +1163,21 @@ CREATE INDEX shared_experience_departed_agreement
     WHERE departed_agreement_claim_id IS NOT NULL;
 ";
 
+const MIGRATION_20: &str = r"
+CREATE TABLE shared_agreement_candidate_supersessions (
+    candidate_id INTEGER NOT NULL
+        REFERENCES shared_agreement_candidates(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    superseded_agreement_claim_id INTEGER NOT NULL
+        REFERENCES claims(id) ON DELETE RESTRICT,
+    PRIMARY KEY (candidate_id, ordinal),
+    UNIQUE (candidate_id, superseded_agreement_claim_id)
+) STRICT;
+
+CREATE INDEX shared_agreement_superseded_claim
+    ON shared_agreement_candidate_supersessions(superseded_agreement_claim_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1199,6 +1214,7 @@ where
             17 => transaction.execute_batch(MIGRATION_17)?,
             18 => transaction.execute_batch(MIGRATION_18)?,
             19 => transaction.execute_batch(MIGRATION_19)?,
+            20 => transaction.execute_batch(MIGRATION_20)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -2237,5 +2253,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(departure_columns, 2);
+    }
+
+    #[test]
+    fn interrupted_agreement_supersession_migration_keeps_v19_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 20 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(20))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            19
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'shared_agreement_candidate_supersessions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'shared_agreement_candidate_supersessions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_exists);
     }
 }

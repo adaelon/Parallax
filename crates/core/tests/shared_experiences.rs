@@ -546,3 +546,183 @@ fn forgetting_support_removes_pending_and_admitted_shared_derivatives() {
             .is_empty()
     );
 }
+
+#[test]
+fn conflicting_agreement_requires_explicit_whole_supersession_before_staging() {
+    let original = RuntimeResponse::new("我同意在复盘时直接指出关键逃避。").with_shared_experience(
+        SharedExperienceProposal::new(
+            SharedExperienceKind::Agreement,
+            "复盘时直接指出关键逃避",
+            vec![EvidenceCitation::new(
+                EvidenceId::from_raw(1),
+                "我同意在复盘时直接指出关键逃避",
+            )],
+            "我同意在复盘时直接指出关键逃避",
+            Timestamp::from_millis(1_000),
+        )
+        .with_agreement_terms(
+            "双方共同项目复盘",
+            Timestamp::from_millis(2_000),
+            None,
+            None,
+        ),
+    );
+    let undeclared = RuntimeResponse::new("我同意复盘时不要直接指出关键逃避。")
+        .with_shared_experience(
+            SharedExperienceProposal::new(
+                SharedExperienceKind::Agreement,
+                "复盘时不要直接指出关键逃避",
+                vec![EvidenceCitation::new(
+                    EvidenceId::from_raw(3),
+                    "我同意复盘时不要直接指出关键逃避",
+                )],
+                "我同意复盘时不要直接指出关键逃避",
+                Timestamp::from_millis(3_000),
+            )
+            .with_agreement_terms(
+                "双方共同项目复盘",
+                Timestamp::from_millis(4_000),
+                None,
+                None,
+            ),
+        );
+    let declared = RuntimeResponse::new("我确认这份新约定将整份取代旧约定。")
+        .with_shared_experience(
+            SharedExperienceProposal::new(
+                SharedExperienceKind::Agreement,
+                "复盘时不要直接指出关键逃避",
+                vec![EvidenceCitation::new(
+                    EvidenceId::from_raw(5),
+                    "我确认这份新约定将整份取代旧约定",
+                )],
+                "我确认这份新约定将整份取代旧约定",
+                Timestamp::from_millis(5_000),
+            )
+            .with_agreement_terms(
+                "双方共同项目复盘",
+                Timestamp::from_millis(6_000),
+                None,
+                None,
+            )
+            .with_superseded_agreements(vec![ClaimId::from_raw(1)]),
+        );
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new(
+            [
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+            ],
+            [original, undeclared, declared],
+        ),
+        IncrementingClock::new(1_000),
+    );
+
+    let context = core.freeze_working_context(&[]).unwrap();
+    let first = core
+        .run_counterpart_turn(session(), "我同意在复盘时直接指出关键逃避。", context)
+        .unwrap();
+    let original_resolution = core
+        .resolve_shared_agreement(
+            first.pending_agreement_candidate_ids()[0],
+            SharedAgreementDecision::Confirm,
+        )
+        .unwrap();
+    let original_claim_id = original_resolution.claim_id().unwrap();
+
+    let context = core.freeze_working_context(&[]).unwrap();
+    let blocked = core
+        .run_counterpart_turn(session(), "我同意复盘时不要直接指出关键逃避。", context)
+        .unwrap();
+    assert_eq!(
+        blocked.rejected_shared_experiences()[0].reason(),
+        &SharedExperienceRejectionReason::ConflictingAgreementsRequireExplicitSupersession(vec![
+            original_claim_id,
+        ])
+    );
+
+    let context = core.freeze_working_context(&[]).unwrap();
+    let staged = core
+        .run_counterpart_turn(session(), "我确认这份新约定将整份取代旧约定。", context)
+        .unwrap();
+    let replacement = core
+        .repository()
+        .shared_agreement_candidate(staged.pending_agreement_candidate_ids()[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement.supersedes_agreement_ids(), &[original_claim_id]);
+}
+
+#[test]
+fn compatible_agreement_with_overlapping_scope_can_remain_parallel() {
+    let first = RuntimeResponse::new("我同意复盘前提供议程。").with_shared_experience(
+        SharedExperienceProposal::new(
+            SharedExperienceKind::Agreement,
+            "复盘前提供议程",
+            vec![EvidenceCitation::new(
+                EvidenceId::from_raw(1),
+                "我同意复盘前提供议程",
+            )],
+            "我同意复盘前提供议程",
+            Timestamp::from_millis(1_000),
+        )
+        .with_agreement_terms(
+            "双方共同项目复盘",
+            Timestamp::from_millis(2_000),
+            None,
+            None,
+        ),
+    );
+    let second = RuntimeResponse::new("我同意复盘后记录结论。").with_shared_experience(
+        SharedExperienceProposal::new(
+            SharedExperienceKind::Agreement,
+            "复盘后记录结论",
+            vec![EvidenceCitation::new(
+                EvidenceId::from_raw(3),
+                "我同意复盘后记录结论",
+            )],
+            "我同意复盘后记录结论",
+            Timestamp::from_millis(3_000),
+        )
+        .with_agreement_terms(
+            "双方共同项目复盘",
+            Timestamp::from_millis(4_000),
+            None,
+            None,
+        ),
+    );
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new(
+            [
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+            ],
+            [first, second],
+        ),
+        IncrementingClock::new(1_000),
+    );
+
+    let context = core.freeze_working_context(&[]).unwrap();
+    let first = core
+        .run_counterpart_turn(session(), "我同意复盘前提供议程。", context)
+        .unwrap();
+    core.resolve_shared_agreement(
+        first.pending_agreement_candidate_ids()[0],
+        SharedAgreementDecision::Confirm,
+    )
+    .unwrap();
+    let context = core.freeze_working_context(&[]).unwrap();
+    let second = core
+        .run_counterpart_turn(session(), "我同意复盘后记录结论。", context)
+        .unwrap();
+
+    assert!(second.rejected_shared_experiences().is_empty());
+    let candidate = core
+        .repository()
+        .shared_agreement_candidate(second.pending_agreement_candidate_ids()[0])
+        .unwrap()
+        .unwrap();
+    assert!(candidate.supersedes_agreement_ids().is_empty());
+}

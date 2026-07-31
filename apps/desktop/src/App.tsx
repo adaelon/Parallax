@@ -36,6 +36,13 @@ export interface SharedExperienceCeremony {
   endCondition: string | null;
   agreementClaimId: number | null;
   departureReason: string | null;
+  supersededAgreements: Array<{
+    claimId: number;
+    statement: string;
+    scope: string;
+    effectiveFromMillis: number;
+    effectiveUntilMillis: number | null;
+  }>;
   evidence: Array<{
     evidenceId: number;
     speaker: Speaker;
@@ -209,6 +216,9 @@ export function App() {
           effectiveFromMillis,
           effectiveUntilMillis,
           endCondition: revisionDraft.endCondition.trim() || null,
+          supersedesAgreementIds: ceremony.supersededAgreements.map(
+            (agreement) => agreement.claimId,
+          ),
         },
       );
       setCeremonies((current) =>
@@ -317,6 +327,37 @@ export function App() {
                   <dd>{activeCeremony.departureReason}</dd>
                 </div>
               </dl>
+            ) : null}
+            {activeCeremony.supersededAgreements.length > 0 ? (
+              <section className="ceremony-evidence" aria-label="将被整份取代的共同约定">
+                <h3>本约定将整份取代以下共同约定</h3>
+                {activeCeremony.supersededAgreements.map((agreement) => (
+                  <dl className="ceremony-boundaries" key={agreement.claimId}>
+                    <div>
+                      <dt>原约定</dt>
+                      <dd>
+                        Claim #{agreement.claimId}：{agreement.statement}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>原适用范围</dt>
+                      <dd>{agreement.scope}</dd>
+                    </div>
+                    <div>
+                      <dt>原有效期</dt>
+                      <dd>
+                        {formatBoundaryTime(agreement.effectiveFromMillis)} 至{" "}
+                        {agreement.effectiveUntilMillis === null
+                          ? "持续有效"
+                          : formatBoundaryTime(agreement.effectiveUntilMillis)}
+                      </dd>
+                    </div>
+                  </dl>
+                ))}
+                <p className="ceremony-note">
+                  新约定生效后，以上旧约定整份停止未来约束；系统不会推导任何残余义务，历史仍保留。
+                </p>
+              </section>
             ) : null}
             <div className="ceremony-evidence" aria-label="支持它的双方原话">
               {activeCeremony.evidence.map((item) => (

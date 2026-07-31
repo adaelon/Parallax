@@ -279,6 +279,8 @@ S18 将 `self.db` schema 升至 v15：`claims.supersedes_claim_id` 与 `claim_st
 
 S19 将 `self.db` schema 升至 v16：`deletion_intents` 以目标种类和目标 ID 唯一保存已确认遗忘及闭包计数，作为 S30 的顺序重放输入。对话目标删除其 Claim 取代链以及依赖的记忆、争议和身份派生；归档目标解析到稳定 `SourceRecord` 并删除其全部版本、解析/块/谱系/理解投影和对象引用。可重建检索索引在同一事务内失效，current/historical 都从剩余权威数据重建；密文文件在事务提交后按全库对象引用集合清理，失败时保留不可检索孤儿并由重试或下次打开继续清理。删除意图水位防止重启后复用已遗忘的对话或归档目标 ID。
 
+S20～S22 将 `self.db` schema 依次升至 v17～v19：共同约定候选与共同经历、不可变版本双签边界、关系约束偏离及其原约定 Claim/理由均在 SQLCipher 事务中持久化。S23 升至 v20：`shared_agreement_candidate_supersessions` 以有序外键把新候选绑定到被整份取代的旧 Agreement Claim；候选暂存、本人修订和最终签署均校验目标，确认事务会拒绝已被其他新约定取代或在新约定生效时不再有效的目标。旧约定 Claim、签署和已入账违约历史不改写；遗忘旧约定支持时沿取代边递归删除依赖候选与确认 Claim，避免悬空或复活。
+
 ### 4.2 逻辑数据模型
 
 以下是架构契约，不是最终数据库模式：
@@ -801,6 +803,8 @@ S14 以 [G07 Retrieval Contract v2](retrieval-contract-v2.md) 固定 256 维本�
 S15 以 `eam-understanding-v1` 固定本人指定、反复召回（至少两次）、重要变化和当前任务四类显式触发，以及事件链、人物/主题关系和阶段概括三类结构化投影。单个 recipe 最多引用 64 个权威证据块；活动且 artifact 摘要一致的投影只能用主题、触发说明和解释语句贡献候选块引用，随后与其他通道共同经过时间交集、来源范围、权威回读、邻域和预算门禁。投影 recipe、解释文本、代次和状态不进入 `WorkingContext` 或运行时请求，因此投影不能取得事实或长期记忆资格。
 
 S22 在检索冻结后以当前任务词项对约定 `scope` 做保守相关性匹配，只从已确认、当前有效且可回到共同约定 Claim 的候选生成 `ActiveRelationalConstraint`；单个 CJK 字符或单字符 ASCII 不参与匹配，复合范围至少需要两个不同词项重合，只有不可再分的单一范围词允许一个词项命中。约束随 `WorkingContext` 外发，优先级只有“低于宪法、安全和行动授权”这一种，约定文本即使声称授予权限也不能改变 Core 白名单。偏离操作必须引用本轮活动约定并给出在响应中逐字可见的理由；Core 和 Vault 把原约定双方支持、当前第二自我理由证据、偏离 Claim 与关联元数据原子写为新的共同经历。schema v19 保留该关联，重启可恢复，遗忘任一原约定支持会连同偏离历史一起进入同一删除闭包。
+
+S23 在候选暂存前对已确认、在新候选生效时仍活动的约定执行保守冲突检测：有效期和范围必须重叠，义务文本必须共享至少两个确定性词项，且只有显式否定极性相反才自动判为直接冲突。每个被检测到的冲突 Claim 都必须出现在候选不可变的 `supersedes_agreement_ids[]`；显式目标也必须是活动 Agreement Claim。投影在新约定 `effective_from` 前继续返回旧约定，从该时刻起整份排除旧约定且不因新约定日后终止而复活；其他兼容约定继续并行。取代关系在运行时边界只收发 Claim ID；桌面从可信候选和共同账本解析并展示每份旧约定的表述、范围和结构化起止时间。系统不做自然语言范围相减或残余约束推导。
 
 ```text
 validate_citation(block_ref, quoted_text):
@@ -1730,3 +1734,34 @@ task query + confirmed agreement candidates + shared ledger
 ```
 
 S22 不实现 S23 的冲突约定取代或 S24 的任一方退出。自然语言 `end_condition` 在首版不会被模型自行判定为终止；约定继续按签署有效期投影，直到后续受信领域事件正式结束其未来约束力。
+
+### 9.23 S23 冲突约定显式整份取代当前实现边界
+
+```text
+crates/core/src/
+  domain.rs / memory_loop.rs        # 不可变取代 Claim 清单、保守冲突检测与签署门禁
+  in_memory.rs                      # 活动目标复核及遗忘取代闭包
+crates/retrieval/src/lib.rs         # 新约定生效前后整份未来投影切换
+crates/runtime-gateway/src/adapter.rs
+                                      # 取代清单严格 JSON、指令与 Claim 审计
+crates/vault/src/
+  schema.rs / repository.rs         # schema v20、有序取代边、重启与遗忘闭包
+apps/desktop/src-tauri/src/state.rs # 可信解析旧约定表述、范围、起止时间及修订保留
+apps/desktop/src/App.tsx            # 最终签署前完整取代清单与无残余说明
+```
+
+```text
+new agreement proposal(statement, scope, validity, supersedes[])
+  -> compare with active confirmed agreements at proposed effective_from
+  -> direct conflict not fully named -> reject before candidate staging
+  -> every named target must still be an active Agreement Claim
+  -> immutable candidate + ordered whole-agreement edges
+  -> ceremony shows each displaced Claim/statement/scope/time interval
+              plus the new candidate's person/counterpart evidence
+  -> person confirms -> atomically append new shared Claim
+  -> before effective_from: old constraints remain; replacement not active
+  -> at/after effective_from: every named old agreement stops all future projection
+  -> old agreement and already-recorded breach history remain queryable
+```
+
+S23 不实现 S24 的任一方退出，也不尝试一般自然语言蕴含、范围相减或隐式“最新版本优先”。自动冲突检测只覆盖具有显式相反否定极性的直接冲突；无法可靠自动识别的语义冲突仍必须由结构化提议显式列出整份取代目标，并接受 Core/Vault 活动目标校验。

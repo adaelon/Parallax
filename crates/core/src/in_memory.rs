@@ -42,6 +42,57 @@ impl InMemoryRepository {
             next_deletion_intent_id: 1,
         }
     }
+
+    fn collect_shared_agreement_forget_closure(
+        &self,
+        evidence_id: EvidenceId,
+        affected_claims: &mut Vec<ClaimId>,
+    ) -> Vec<SharedAgreementCandidateId> {
+        let mut affected_candidates = self
+            .shared_agreement_candidates
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .support()
+                    .iter()
+                    .any(|citation| citation.evidence_id() == evidence_id)
+                    || candidate
+                        .claim_id()
+                        .is_some_and(|claim_id| affected_claims.contains(&claim_id))
+            })
+            .map(SharedAgreementCandidate::id)
+            .collect::<Vec<_>>();
+        loop {
+            let previous_candidate_len = affected_candidates.len();
+            let previous_claim_len = affected_claims.len();
+            for candidate in self.shared_agreement_candidates.values() {
+                let depends_on_affected = candidate
+                    .predecessor_candidate_id()
+                    .is_some_and(|id| affected_candidates.contains(&id))
+                    || candidate
+                        .supersedes_agreement_ids()
+                        .iter()
+                        .any(|id| affected_claims.contains(id));
+                if depends_on_affected && !affected_candidates.contains(&candidate.id()) {
+                    affected_candidates.push(candidate.id());
+                }
+            }
+            let newly_affected_claims = self
+                .shared_agreement_candidates
+                .values()
+                .filter(|candidate| affected_candidates.contains(&candidate.id()))
+                .filter_map(SharedAgreementCandidate::claim_id)
+                .filter(|claim_id| !affected_claims.contains(claim_id))
+                .collect::<Vec<_>>();
+            affected_claims.extend(newly_affected_claims);
+            if affected_candidates.len() == previous_candidate_len
+                && affected_claims.len() == previous_claim_len
+            {
+                break;
+            }
+        }
+        affected_candidates
+    }
 }
 
 impl SharedExperienceRepository for InMemoryRepository {
@@ -59,6 +110,11 @@ impl SharedExperienceRepository for InMemoryRepository {
         candidate: SharedAgreementCandidate,
     ) -> Result<(), RepositoryError> {
         validate_candidate_storage(&self.evidence, &candidate)?;
+        validate_candidate_supersession_targets(
+            &candidate,
+            &self.shared_agreement_candidates,
+            &self.shared_experiences,
+        )?;
         if candidate.status() != SharedAgreementCandidateStatus::AwaitingPerson
             || candidate.counterpart_assented_at().is_none()
             || candidate.decided_at().is_some()
@@ -111,6 +167,11 @@ impl SharedExperienceRepository for InMemoryRepository {
         let mut evidence = self.evidence.clone();
         evidence.insert(person_evidence.id(), person_evidence.clone());
         validate_candidate_storage(&evidence, &revised)?;
+        validate_candidate_supersession_targets(
+            &revised,
+            &self.shared_agreement_candidates,
+            &self.shared_experiences,
+        )?;
 
         self.evidence.insert(person_evidence.id(), person_evidence);
         self.shared_agreement_candidates
@@ -196,6 +257,11 @@ impl SharedExperienceRepository for InMemoryRepository {
                         "confirmed agreement does not match its immutable candidate",
                     ));
                 }
+                validate_candidate_supersession_targets(
+                    &candidate,
+                    &self.shared_agreement_candidates,
+                    &self.shared_experiences,
+                )?;
                 validate_shared_experience_storage(&self.evidence, &experience)?;
                 let claim_id = experience.claim().id();
                 if self.claims.contains_key(&claim_id)
@@ -335,6 +401,13 @@ fn validate_candidate_storage(
         || candidate
             .end_condition()
             .is_some_and(|condition| condition.trim().is_empty())
+        || candidate
+            .supersedes_agreement_ids()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != candidate.supersedes_agreement_ids().len()
     {
         return Err(RepositoryError::new("invalid shared agreement candidate"));
     }
@@ -348,6 +421,48 @@ fn validate_candidate_storage(
             validate_candidate_support(evidence, candidate.support(), true, true)
         }
     }
+}
+
+fn validate_candidate_supersession_targets(
+    candidate: &SharedAgreementCandidate,
+    candidates: &BTreeMap<SharedAgreementCandidateId, SharedAgreementCandidate>,
+    experiences: &BTreeMap<ClaimId, SharedExperience>,
+) -> Result<(), RepositoryError> {
+    let effective_from = candidate
+        .effective_from()
+        .ok_or_else(|| RepositoryError::new("agreement effective time is missing"))?;
+    for target in candidate.supersedes_agreement_ids() {
+        let is_superseded = candidates.values().any(|replacement| {
+            replacement.status() == SharedAgreementCandidateStatus::Confirmed
+                && replacement
+                    .claim_id()
+                    .is_some_and(|claim_id| experiences.contains_key(&claim_id))
+                && replacement
+                    .effective_from()
+                    .is_some_and(|from| from.as_millis() <= effective_from.as_millis())
+                && replacement.supersedes_agreement_ids().contains(target)
+        });
+        let is_active = candidates.values().any(|original| {
+            original.status() == SharedAgreementCandidateStatus::Confirmed
+                && original.claim_id() == Some(*target)
+                && experiences
+                    .get(target)
+                    .is_some_and(|experience| experience.kind() == SharedExperienceKind::Agreement)
+                && original
+                    .effective_from()
+                    .is_some_and(|from| from.as_millis() <= effective_from.as_millis())
+                && original
+                    .effective_until()
+                    .is_none_or(|until| until.as_millis() >= effective_from.as_millis())
+                && !is_superseded
+        });
+        if !is_active {
+            return Err(RepositoryError::new(
+                "superseded shared agreement is no longer active",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn agreement_applicable_time(candidate: &SharedAgreementCandidate) -> crate::ApplicableTime {
@@ -454,41 +569,8 @@ impl ForgetRepository for InMemoryRepository {
             })
             .map(Claim::id)
             .collect::<Vec<_>>();
-        let mut affected_candidates = self
-            .shared_agreement_candidates
-            .values()
-            .filter(|candidate| {
-                candidate
-                    .support()
-                    .iter()
-                    .any(|citation| citation.evidence_id() == evidence_id)
-                    || candidate
-                        .claim_id()
-                        .is_some_and(|claim_id| affected_claims.contains(&claim_id))
-            })
-            .map(SharedAgreementCandidate::id)
-            .collect::<Vec<_>>();
-        loop {
-            let previous_len = affected_candidates.len();
-            for candidate in self.shared_agreement_candidates.values() {
-                if candidate
-                    .predecessor_candidate_id()
-                    .is_some_and(|id| affected_candidates.contains(&id))
-                    && !affected_candidates.contains(&candidate.id())
-                {
-                    affected_candidates.push(candidate.id());
-                }
-            }
-            if affected_candidates.len() == previous_len {
-                break;
-            }
-        }
-        affected_claims.extend(
-            self.shared_agreement_candidates
-                .values()
-                .filter(|candidate| affected_candidates.contains(&candidate.id()))
-                .filter_map(SharedAgreementCandidate::claim_id),
-        );
+        let affected_candidates =
+            self.collect_shared_agreement_forget_closure(evidence_id, &mut affected_claims);
         loop {
             let previous_len = affected_claims.len();
             for claim in self.claims.values() {

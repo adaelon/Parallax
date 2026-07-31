@@ -6,7 +6,7 @@
       "content": [
         {
           "type": "output_text",
-          "text": "{\"text\":\"我同意在复盘中直接指出关键逃避。\",\"citations\":[],\"operations\":[{\"type\":\"propose_shared_experience\",\"experience_kind\":\"agreement\",\"statement\":\"复盘中直接指出关键逃避\",\"person_support\":[{\"evidence_id\":1,\"quote\":\"我同意复盘时直接指出关键逃避\"}],\"counterpart_quote\":\"我同意在复盘中直接指出关键逃避\",\"occurred_at_millis\":1000,\"scope\":\"双方共同项目复盘\",\"effective_from_millis\":2000,\"effective_until_millis\":null,\"end_condition\":null}]}"
+          "text": "{\"text\":\"我同意在复盘中直接指出关键逃避。\",\"citations\":[],\"operations\":[{\"type\":\"propose_shared_experience\",\"experience_kind\":\"agreement\",\"statement\":\"复盘中直接指出关键逃避\",\"person_support\":[{\"evidence_id\":1,\"quote\":\"我同意复盘时直接指出关键逃避\"}],\"counterpart_quote\":\"我同意在复盘中直接指出关键逃避\",\"occurred_at_millis\":1000,\"scope\":\"双方共同项目复盘\",\"effective_from_millis\":2000,\"effective_until_millis\":null,\"end_condition\":null,\"supersedes_agreement_ids\":[]}]}"
         }
       ]
     }

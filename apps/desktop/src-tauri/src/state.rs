@@ -106,7 +106,18 @@ pub struct SharedExperienceCeremonyView {
     end_condition: Option<String>,
     agreement_claim_id: Option<u64>,
     departure_reason: Option<String>,
+    superseded_agreements: Vec<SupersededAgreementView>,
     evidence: Vec<SharedExperienceCeremonyEvidenceView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupersededAgreementView {
+    claim_id: u64,
+    statement: String,
+    scope: String,
+    effective_from_millis: i64,
+    effective_until_millis: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -271,6 +282,7 @@ impl ManagedHost {
         effective_from_millis: i64,
         effective_until_millis: Option<i64>,
         end_condition: Option<String>,
+        supersedes_agreement_ids: Vec<u64>,
     ) -> Result<SharedAgreementRevisionView, String> {
         match &mut *self.lock() {
             HostSlot::Ready(host) => revise_shared_agreement_from_core(
@@ -281,6 +293,7 @@ impl ManagedHost {
                 effective_from_millis,
                 effective_until_millis,
                 end_condition,
+                supersedes_agreement_ids,
             ),
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
@@ -585,10 +598,14 @@ where
 {
     let repository = core.repository();
     let mut ceremonies = Vec::new();
-    for candidate in repository
+    let candidates = repository
         .all_shared_agreement_candidates()
-        .map_err(|error| error.to_string())?
-        .into_iter()
+        .map_err(|error| error.to_string())?;
+    let experiences = repository
+        .all_shared_experiences()
+        .map_err(|error| error.to_string())?;
+    for candidate in candidates
+        .iter()
         .filter(|candidate| candidate.status() == SharedAgreementCandidateStatus::AwaitingPerson)
     {
         ceremonies.push(SharedExperienceCeremonyView {
@@ -608,17 +625,17 @@ where
             end_condition: candidate.end_condition().map(str::to_owned),
             agreement_claim_id: None,
             departure_reason: None,
+            superseded_agreements: superseded_agreement_views(
+                &candidates,
+                &experiences,
+                candidate.supersedes_agreement_ids(),
+            )?,
             evidence: ceremony_evidence(repository, candidate.support())?,
         });
     }
-    for experience in repository
-        .all_shared_experiences()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|experience| {
-            experience.kind() != SharedExperienceKind::Agreement && !experience.ceremony_dismissed()
-        })
-    {
+    for experience in experiences.into_iter().filter(|experience| {
+        experience.kind() != SharedExperienceKind::Agreement && !experience.ceremony_dismissed()
+    }) {
         ceremonies.push(SharedExperienceCeremonyView {
             target_id: experience.claim().id().get(),
             target_kind: "sharedExperience",
@@ -636,10 +653,56 @@ where
             departure_reason: experience
                 .constraint_departure()
                 .map(|departure| departure.reason().to_owned()),
+            superseded_agreements: Vec::new(),
             evidence: ceremony_evidence(repository, experience.claim().support())?,
         });
     }
     Ok(ceremonies)
+}
+
+fn superseded_agreement_views(
+    candidates: &[eam_core::SharedAgreementCandidate],
+    experiences: &[eam_core::SharedExperience],
+    claim_ids: &[ClaimId],
+) -> Result<Vec<SupersededAgreementView>, String> {
+    claim_ids
+        .iter()
+        .map(|claim_id| {
+            if !experiences.iter().any(|experience| {
+                experience.kind() == SharedExperienceKind::Agreement
+                    && experience.claim().id() == *claim_id
+            }) {
+                return Err(format!(
+                    "superseded agreement claim {} is missing",
+                    claim_id.get()
+                ));
+            }
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.claim_id() == Some(*claim_id))
+                .ok_or_else(|| {
+                    format!(
+                        "superseded agreement candidate for claim {} is missing",
+                        claim_id.get()
+                    )
+                })?;
+            Ok(SupersededAgreementView {
+                claim_id: claim_id.get(),
+                statement: candidate.statement().to_owned(),
+                scope: candidate
+                    .scope()
+                    .ok_or_else(|| "superseded agreement scope is missing".to_owned())?
+                    .to_owned(),
+                effective_from_millis: candidate
+                    .effective_from()
+                    .ok_or_else(|| "superseded agreement effective time is missing".to_owned())?
+                    .as_millis(),
+                effective_until_millis: candidate
+                    .effective_until()
+                    .map(eam_core::Timestamp::as_millis),
+            })
+        })
+        .collect()
 }
 
 fn ceremony_evidence<R: MemoryRepository>(
@@ -699,6 +762,7 @@ fn revise_shared_agreement_from_core<R, T, C>(
     effective_from_millis: i64,
     effective_until_millis: Option<i64>,
     end_condition: Option<String>,
+    supersedes_agreement_ids: Vec<u64>,
 ) -> Result<SharedAgreementRevisionView, String>
 where
     R: SharedExperienceRepository,
@@ -715,6 +779,12 @@ where
                 eam_core::Timestamp::from_millis(effective_from_millis),
                 effective_until_millis.map(eam_core::Timestamp::from_millis),
                 end_condition,
+            )
+            .with_superseded_agreements(
+                supersedes_agreement_ids
+                    .into_iter()
+                    .map(ClaimId::from_raw)
+                    .collect(),
             ),
         )
         .map_err(|error| error.to_string())?;
@@ -1169,6 +1239,79 @@ mod tests {
     }
 
     #[test]
+    fn superseding_agreement_ceremony_lists_every_displaced_agreement_boundary() {
+        let original = RuntimeResponse::new("我同意复盘时直接指出关键逃避。")
+            .with_shared_experience(
+                SharedExperienceProposal::new(
+                    SharedExperienceKind::Agreement,
+                    "复盘时直接指出关键逃避",
+                    vec![EvidenceCitation::new(
+                        EvidenceId::from_raw(1),
+                        "我同意复盘时直接指出关键逃避",
+                    )],
+                    "我同意复盘时直接指出关键逃避",
+                    Timestamp::from_millis(50_000),
+                )
+                .with_agreement_terms(
+                    "双方共同项目复盘",
+                    Timestamp::from_millis(50_000),
+                    None,
+                    None,
+                ),
+            );
+        let replacement = RuntimeResponse::new("我同意新约定整份取代旧约定。")
+            .with_shared_experience(
+                SharedExperienceProposal::new(
+                    SharedExperienceKind::Agreement,
+                    "复盘时不要直接指出关键逃避",
+                    vec![EvidenceCitation::new(
+                        EvidenceId::from_raw(3),
+                        "我同意新约定整份取代旧约定",
+                    )],
+                    "我同意新约定整份取代旧约定",
+                    Timestamp::from_millis(53_000),
+                )
+                .with_agreement_terms(
+                    "双方共同项目复盘",
+                    Timestamp::from_millis(55_000),
+                    None,
+                    None,
+                )
+                .with_superseded_agreements(vec![ClaimId::from_raw(1)]),
+            );
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            ScriptedRuntime::new(
+                [
+                    PersonTurnClassification::Question,
+                    PersonTurnClassification::Question,
+                ],
+                [original, replacement],
+            ),
+            IncrementingClock::new(50_000),
+        );
+
+        let first =
+            send_message_with_core(&mut core, "我同意复盘时直接指出关键逃避。".to_owned()).unwrap();
+        resolve_shared_agreement_from_core(&mut core, first.ceremonies[0].target_id, true).unwrap();
+        let second = send_message_with_core(
+            &mut core,
+            "共同项目复盘时，我同意新约定整份取代旧约定。".to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(second.ceremonies.len(), 1);
+        let ceremony = &second.ceremonies[0];
+        assert_eq!(ceremony.superseded_agreements.len(), 1);
+        let displaced = &ceremony.superseded_agreements[0];
+        assert_eq!(displaced.claim_id, 1);
+        assert_eq!(displaced.statement, "复盘时直接指出关键逃避");
+        assert_eq!(displaced.scope, "双方共同项目复盘");
+        assert_eq!(displaced.effective_from_millis, 50_000);
+        assert_eq!(displaced.effective_until_millis, None);
+    }
+
+    #[test]
     fn relevant_agreement_is_sent_and_its_departure_returns_a_trusted_notice() {
         let agreement = RuntimeResponse::new("我也同意复盘时直接指出关键逃避。")
             .with_shared_experience(
@@ -1277,6 +1420,7 @@ mod tests {
             72_000,
             None,
             None,
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(revision.candidate_id, 2);

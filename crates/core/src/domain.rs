@@ -565,6 +565,7 @@ pub struct SharedAgreementCandidate {
     effective_from: Option<Timestamp>,
     effective_until: Option<Timestamp>,
     end_condition: Option<String>,
+    supersedes_agreement_ids: Vec<ClaimId>,
     support: Vec<EvidenceCitation>,
     occurred_at: Timestamp,
     recorded_at: Timestamp,
@@ -591,6 +592,7 @@ impl SharedAgreementCandidate {
             effective_from: Some(agreement.effective_from),
             effective_until: agreement.effective_until,
             end_condition: agreement.end_condition,
+            supersedes_agreement_ids: agreement.supersedes_agreement_ids,
             support,
             occurred_at,
             recorded_at,
@@ -619,6 +621,7 @@ impl SharedAgreementCandidate {
             effective_from: Some(revision.effective_from),
             effective_until: revision.effective_until,
             end_condition: revision.end_condition,
+            supersedes_agreement_ids: revision.supersedes_agreement_ids,
             support,
             occurred_at,
             recorded_at,
@@ -641,6 +644,7 @@ impl SharedAgreementCandidate {
         effective_from: Option<Timestamp>,
         effective_until: Option<Timestamp>,
         end_condition: Option<String>,
+        supersedes_agreement_ids: Vec<ClaimId>,
         support: Vec<EvidenceCitation>,
         occurred_at: Timestamp,
         recorded_at: Timestamp,
@@ -658,6 +662,7 @@ impl SharedAgreementCandidate {
             effective_from,
             effective_until,
             end_condition,
+            supersedes_agreement_ids,
             support,
             occurred_at,
             recorded_at,
@@ -706,6 +711,11 @@ impl SharedAgreementCandidate {
     #[must_use]
     pub fn end_condition(&self) -> Option<&str> {
         self.end_condition.as_deref()
+    }
+
+    #[must_use]
+    pub fn supersedes_agreement_ids(&self) -> &[ClaimId] {
+        &self.supersedes_agreement_ids
     }
 
     #[must_use]
@@ -772,6 +782,7 @@ pub struct SharedAgreementRevision {
     effective_from: Timestamp,
     effective_until: Option<Timestamp>,
     end_condition: Option<String>,
+    supersedes_agreement_ids: Vec<ClaimId>,
 }
 
 impl SharedAgreementRevision {
@@ -789,7 +800,14 @@ impl SharedAgreementRevision {
             effective_from,
             effective_until,
             end_condition,
+            supersedes_agreement_ids: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_superseded_agreements(mut self, agreement_claim_ids: Vec<ClaimId>) -> Self {
+        self.supersedes_agreement_ids = agreement_claim_ids;
+        self
     }
 
     #[must_use]
@@ -818,6 +836,11 @@ impl SharedAgreementRevision {
     }
 
     #[must_use]
+    pub fn supersedes_agreement_ids(&self) -> &[ClaimId] {
+        &self.supersedes_agreement_ids
+    }
+
+    #[must_use]
     pub fn is_valid(&self) -> bool {
         !self.statement.trim().is_empty()
             && !self.scope.trim().is_empty()
@@ -828,20 +851,147 @@ impl SharedAgreementRevision {
                 .end_condition
                 .as_deref()
                 .is_none_or(|condition| !condition.trim().is_empty())
+            && self
+                .supersedes_agreement_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == self.supersedes_agreement_ids.len()
     }
 
     #[must_use]
     pub fn canonical_text(&self) -> String {
         format!(
-            "约定：{}\n范围：{}\n生效时间：{}\n终止时间：{}\n终止条件：{}",
+            "约定：{}\n范围：{}\n生效时间：{}\n终止时间：{}\n终止条件：{}\n整份取代约定 Claim：{}",
             self.statement,
             self.scope,
             self.effective_from.as_millis(),
             self.effective_until
                 .map_or_else(|| "无".to_owned(), |value| value.as_millis().to_string()),
-            self.end_condition.as_deref().unwrap_or("无")
+            self.end_condition.as_deref().unwrap_or("无"),
+            if self.supersedes_agreement_ids.is_empty() {
+                "无".to_owned()
+            } else {
+                self.supersedes_agreement_ids
+                    .iter()
+                    .map(|id| id.get().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
         )
     }
+}
+
+/// Conservatively detects a direct contradiction between one proposed
+/// agreement revision and one already-signed agreement.
+///
+/// This detector deliberately requires overlapping validity, overlapping
+/// scope, shared obligation terms, and opposite explicit negation polarity.
+/// It does not subtract natural-language ranges or infer residual duties.
+#[must_use]
+pub fn shared_agreements_conflict(
+    proposed: &SharedAgreementRevision,
+    existing: &SharedAgreementCandidate,
+) -> bool {
+    let Some(existing_scope) = existing.scope() else {
+        return false;
+    };
+    let Some(existing_from) = existing.effective_from() else {
+        return false;
+    };
+    if !validity_intervals_overlap(
+        proposed.effective_from(),
+        proposed.effective_until(),
+        existing_from,
+        existing.effective_until(),
+    ) || !agreement_scopes_overlap(proposed.scope(), existing_scope)
+    {
+        return false;
+    }
+
+    contains_explicit_negation(proposed.statement())
+        != contains_explicit_negation(existing.statement())
+        && agreement_texts_overlap(proposed.statement(), existing.statement())
+}
+
+fn agreement_scopes_overlap(left: &str, right: &str) -> bool {
+    agreement_texts_overlap(
+        &left.replace("双方", " ").replace("共同", " "),
+        &right.replace("双方", " ").replace("共同", " "),
+    )
+}
+
+fn validity_intervals_overlap(
+    left_from: Timestamp,
+    left_until: Option<Timestamp>,
+    right_from: Timestamp,
+    right_until: Option<Timestamp>,
+) -> bool {
+    left_until.is_none_or(|until| until.as_millis() >= right_from.as_millis())
+        && right_until.is_none_or(|until| until.as_millis() >= left_from.as_millis())
+}
+
+fn agreement_texts_overlap(left: &str, right: &str) -> bool {
+    let left = agreement_terms(left);
+    let right = agreement_terms(right);
+    left.iter()
+        .filter(|term| right.contains(*term))
+        .take(2)
+        .count()
+        == 2
+}
+
+fn agreement_terms(value: &str) -> std::collections::BTreeSet<String> {
+    let mut terms = std::collections::BTreeSet::new();
+    let mut run = String::new();
+    let flush = |run: &mut String, terms: &mut std::collections::BTreeSet<String>| {
+        if run.is_empty() {
+            return;
+        }
+        if run.is_ascii() {
+            if run.chars().count() >= 2 && !is_negation_term(run) {
+                terms.insert(run.clone());
+            }
+        } else {
+            let characters = run.chars().collect::<Vec<_>>();
+            terms.extend(
+                characters
+                    .windows(2)
+                    .map(|pair| pair.iter().collect::<String>())
+                    .filter(|term| !is_negation_term(term)),
+            );
+        }
+        run.clear();
+    };
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            run.push(character);
+        } else {
+            flush(&mut run, &mut terms);
+        }
+    }
+    flush(&mut run, &mut terms);
+    terms
+}
+
+fn contains_explicit_negation(value: &str) -> bool {
+    let lowercase = value.to_lowercase();
+    ["不要", "不得", "不能", "不再", "禁止", "避免", "停止"]
+        .iter()
+        .any(|marker| lowercase.contains(marker))
+        || lowercase.contains("do not")
+        || lowercase.contains("must not")
+        || lowercase
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|term| matches!(term, "not" | "never"))
+}
+
+fn is_negation_term(value: &str) -> bool {
+    matches!(
+        value,
+        "不要" | "不得" | "不能" | "不再" | "禁止" | "避免" | "停止" | "not" | "never"
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1669,6 +1819,7 @@ pub struct SharedExperienceProposal {
     agreement_effective_from: Option<Timestamp>,
     agreement_effective_until: Option<Timestamp>,
     agreement_end_condition: Option<String>,
+    supersedes_agreement_ids: Vec<ClaimId>,
 }
 
 impl SharedExperienceProposal {
@@ -1690,6 +1841,7 @@ impl SharedExperienceProposal {
             agreement_effective_from: None,
             agreement_effective_until: None,
             agreement_end_condition: None,
+            supersedes_agreement_ids: Vec::new(),
         }
     }
 
@@ -1711,6 +1863,12 @@ impl SharedExperienceProposal {
     #[must_use]
     pub fn with_agreement_scope(mut self, scope: impl Into<String>) -> Self {
         self.agreement_scope = Some(scope.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_superseded_agreements(mut self, agreement_claim_ids: Vec<ClaimId>) -> Self {
+        self.supersedes_agreement_ids = agreement_claim_ids;
         self
     }
 
@@ -1757,6 +1915,11 @@ impl SharedExperienceProposal {
     #[must_use]
     pub fn agreement_end_condition(&self) -> Option<&str> {
         self.agreement_end_condition.as_deref()
+    }
+
+    #[must_use]
+    pub fn supersedes_agreement_ids(&self) -> &[ClaimId] {
+        &self.supersedes_agreement_ids
     }
 }
 
@@ -2031,6 +2194,8 @@ pub enum SharedExperienceRejectionReason {
     MissingAgreementScope,
     MissingAgreementEffectiveFrom,
     InvalidAgreementValidity,
+    ConflictingAgreementsRequireExplicitSupersession(Vec<ClaimId>),
+    SupersededAgreementNotActive(ClaimId),
     UnexpectedAgreementTerms,
 }
 
@@ -2353,5 +2518,53 @@ impl TurnOutcome {
     #[must_use]
     pub fn validated_citations(&self) -> &[EvidenceCitation] {
         &self.validated_citations
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn confirmed_agreement(scope: &str) -> SharedAgreementCandidate {
+        SharedAgreementCandidate::restore(
+            SharedAgreementCandidateId::from_raw(1),
+            1,
+            None,
+            "项目复盘时直接提醒休息".to_owned(),
+            Some(scope.to_owned()),
+            Some(Timestamp::from_millis(1_000)),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Timestamp::from_millis(1_000),
+            Timestamp::from_millis(1_000),
+            SharedAgreementCandidateStatus::Confirmed,
+            Some(Timestamp::from_millis(1_000)),
+            Some(Timestamp::from_millis(1_000)),
+            Some(ClaimId::from_raw(1)),
+        )
+    }
+
+    #[test]
+    fn conflict_detection_ignores_generic_relational_scope_words() {
+        let existing = confirmed_agreement("双方共同项目复盘");
+        let unrelated = SharedAgreementRevision::new(
+            "健康管理时不要直接提醒休息",
+            "双方共同健康管理",
+            Timestamp::from_millis(2_000),
+            None,
+            None,
+        );
+        let same_scope = SharedAgreementRevision::new(
+            "项目复盘时不要直接提醒休息",
+            "双方共同项目复盘",
+            Timestamp::from_millis(2_000),
+            None,
+            None,
+        );
+
+        assert!(!shared_agreements_conflict(&unrelated, &existing));
+        assert!(shared_agreements_conflict(&same_scope, &existing));
     }
 }

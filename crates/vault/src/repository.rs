@@ -2982,6 +2982,7 @@ impl SharedExperienceRepository for VaultRepository {
             .transaction()
             .map_err(repository_error)?;
         validate_candidate_support(&transaction, candidate.support(), true, true)?;
+        validate_candidate_supersession_targets(&transaction, &candidate)?;
         transaction
             .execute(
                 "INSERT INTO shared_agreement_candidates
@@ -3008,6 +3009,7 @@ impl SharedExperienceRepository for VaultRepository {
                 ],
             )
             .map_err(repository_error)?;
+        insert_shared_candidate_supersessions(&transaction, &candidate)?;
         insert_shared_candidate_support(&transaction, &candidate)?;
         transaction.commit().map_err(repository_error)?;
         Ok(())
@@ -3042,6 +3044,7 @@ impl SharedExperienceRepository for VaultRepository {
         }
         insert_conversation_evidence(&transaction, &person_evidence)?;
         validate_candidate_support(&transaction, revised.support(), true, false)?;
+        validate_candidate_supersession_targets(&transaction, &revised)?;
         let retired = transaction
             .execute(
                 "UPDATE shared_agreement_candidates
@@ -3079,6 +3082,7 @@ impl SharedExperienceRepository for VaultRepository {
                 ],
             )
             .map_err(repository_error)?;
+        insert_shared_candidate_supersessions(&transaction, &revised)?;
         insert_shared_candidate_support(&transaction, &revised)?;
         transaction.commit().map_err(repository_error)?;
         Ok(())
@@ -3187,6 +3191,7 @@ impl SharedExperienceRepository for VaultRepository {
                         "confirmed agreement does not match its immutable candidate",
                     ));
                 }
+                validate_candidate_supersession_targets(&transaction, &candidate)?;
                 insert_shared_claim(&transaction, experience.claim())?;
                 transaction
                     .execute(
@@ -3481,6 +3486,7 @@ fn load_shared_agreement_candidate(
         return Ok(None);
     };
     let support = load_shared_candidate_support(connection, id)?;
+    let supersedes_agreement_ids = load_shared_candidate_supersessions(connection, id)?;
     let claim_id = claim_id
         .map(|value| {
             u64::try_from(value)
@@ -3503,6 +3509,7 @@ fn load_shared_agreement_candidate(
         effective_from.map(Timestamp::from_millis),
         effective_until.map(Timestamp::from_millis),
         end_condition,
+        supersedes_agreement_ids,
         support,
         Timestamp::from_millis(occurred_at),
         Timestamp::from_millis(recorded_at),
@@ -3578,6 +3585,110 @@ fn insert_shared_candidate_support(
                 ],
             )
             .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
+fn load_shared_candidate_supersessions(
+    connection: &Connection,
+    id: SharedAgreementCandidateId,
+) -> Result<Vec<ClaimId>, RepositoryError> {
+    connection
+        .prepare(
+            "SELECT superseded_agreement_claim_id
+             FROM shared_agreement_candidate_supersessions
+             WHERE candidate_id = ?1 ORDER BY ordinal",
+        )
+        .map_err(repository_error)?
+        .query_map([to_sql_id(id.get())?], |row| row.get::<_, i64>(0))
+        .map_err(repository_error)?
+        .map(|stored| {
+            let claim_id =
+                u64::try_from(stored.map_err(repository_error)?).map_err(repository_error)?;
+            Ok(ClaimId::from_raw(claim_id))
+        })
+        .collect()
+}
+
+fn insert_shared_candidate_supersessions(
+    transaction: &rusqlite::Transaction<'_>,
+    candidate: &SharedAgreementCandidate,
+) -> Result<(), RepositoryError> {
+    for (ordinal, claim_id) in candidate.supersedes_agreement_ids().iter().enumerate() {
+        let is_agreement = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM shared_experiences
+                    WHERE claim_id = ?1 AND kind = 0
+                 )",
+                [to_sql_id(claim_id.get())?],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(repository_error)?;
+        if !is_agreement {
+            return Err(RepositoryError::new(
+                "supersession target is not a shared agreement",
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO shared_agreement_candidate_supersessions
+                 (candidate_id, ordinal, superseded_agreement_claim_id)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    to_sql_id(candidate.id().get())?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(claim_id.get())?,
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
+fn validate_candidate_supersession_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    candidate: &SharedAgreementCandidate,
+) -> Result<(), RepositoryError> {
+    let effective_from = candidate
+        .effective_from()
+        .ok_or_else(|| RepositoryError::new("agreement effective time is missing"))?;
+    for claim_id in candidate.supersedes_agreement_ids() {
+        let is_active = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM shared_agreement_candidates original
+                    JOIN shared_experiences original_experience
+                      ON original_experience.candidate_id = original.id
+                     AND original_experience.kind = 0
+                    WHERE original.confirmed_claim_id = ?1
+                      AND original.status = 2
+                      AND original.effective_from <= ?2
+                      AND (original.effective_until IS NULL
+                           OR original.effective_until >= ?2)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM shared_agreement_candidate_supersessions edge
+                          JOIN shared_agreement_candidates replacement
+                            ON replacement.id = edge.candidate_id
+                          JOIN shared_experiences replacement_experience
+                            ON replacement_experience.candidate_id = replacement.id
+                           AND replacement_experience.kind = 0
+                          WHERE edge.superseded_agreement_claim_id = ?1
+                            AND replacement.status = 2
+                            AND replacement.effective_from <= ?2
+                      )
+                 )",
+                params![to_sql_id(claim_id.get())?, effective_from.as_millis()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(repository_error)?;
+        if !is_active {
+            return Err(RepositoryError::new(
+                "superseded shared agreement is no longer active",
+            ));
+        }
     }
     Ok(())
 }
@@ -8372,11 +8483,20 @@ fn plan_conversation_forget(
                WHERE evidence_id = ?1
                UNION SELECT id FROM shared_agreement_candidates
                WHERE {}
+               UNION SELECT candidate_id
+               FROM shared_agreement_candidate_supersessions
+               WHERE {}
                UNION SELECT successor.id FROM shared_agreement_candidates successor
                JOIN affected predecessor
                  ON successor.predecessor_candidate_id = predecessor.candidate_id
+               UNION SELECT edge.candidate_id
+               FROM shared_agreement_candidate_supersessions edge
+               JOIN shared_agreement_candidates original
+                 ON original.confirmed_claim_id = edge.superseded_agreement_claim_id
+               JOIN affected predecessor ON predecessor.candidate_id = original.id
              ) SELECT candidate_id FROM affected ORDER BY candidate_id",
-            id_predicate("confirmed_claim_id", &claim_ids)
+            id_predicate("confirmed_claim_id", &claim_ids),
+            id_predicate("superseded_agreement_claim_id", &claim_ids)
         ),
         evidence_id_sql,
     )?;
@@ -8584,6 +8704,14 @@ fn delete_conversation_claim_closure(
     }
     let claim_predicate = id_predicate("claim_id", &plan.claim_ids);
     let candidate_predicate = id_predicate("candidate_id", &plan.shared_agreement_candidate_ids);
+    counts.derived += transaction.execute(
+        &format!(
+            "DELETE FROM shared_agreement_candidate_supersessions
+             WHERE {candidate_predicate} OR {}",
+            id_predicate("superseded_agreement_claim_id", &plan.claim_ids)
+        ),
+        [],
+    )?;
     counts.derived += transaction.execute(
         &format!(
             "DELETE FROM shared_experiences
