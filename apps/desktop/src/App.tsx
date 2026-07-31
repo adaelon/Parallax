@@ -20,7 +20,8 @@ type SharedExperienceKind =
   | "agreement"
   | "substantiveDisagreement"
   | "relationshipChange"
-  | "sharedAchievement";
+  | "sharedAchievement"
+  | "agreementBreach";
 
 export interface SharedExperienceCeremony {
   targetId: number;
@@ -33,6 +34,8 @@ export interface SharedExperienceCeremony {
   effectiveFromMillis: number | null;
   effectiveUntilMillis: number | null;
   endCondition: string | null;
+  agreementClaimId: number | null;
+  departureReason: string | null;
   evidence: Array<{
     evidenceId: number;
     speaker: Speaker;
@@ -303,6 +306,18 @@ export function App() {
                 </div>
               </dl>
             ) : null}
+            {activeCeremony.experienceKind === "agreementBreach" ? (
+              <dl className="ceremony-boundaries">
+                <div>
+                  <dt>偏离的共同约定</dt>
+                  <dd>Claim #{activeCeremony.agreementClaimId}</dd>
+                </div>
+                <div>
+                  <dt>第二自我说明的理由</dt>
+                  <dd>{activeCeremony.departureReason}</dd>
+                </div>
+              </dl>
+            ) : null}
             <div className="ceremony-evidence" aria-label="支持它的双方原话">
               {activeCeremony.evidence.map((item) => (
                 <blockquote key={`${item.evidenceId}-${item.speaker}`}>
@@ -461,6 +476,8 @@ function ceremonyTitle(kind: SharedExperienceKind): string {
       return "关系变化已记录";
     case "sharedAchievement":
       return "共同完成的重要事情已记录";
+    case "agreementBreach":
+      return "共同约定偏离已记录";
   }
 }
 

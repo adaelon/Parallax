@@ -190,6 +190,8 @@ describe("S20 typed shared-experience ceremony", () => {
       effectiveFromMillis: null,
       effectiveUntilMillis: null,
       endCondition: null,
+      agreementClaimId: null,
+      departureReason: null,
       evidence: [
         { evidenceId: 1, speaker: "person", quote: "这件事无关紧要" },
         { evidenceId: 2, speaker: "counterpart", quote: "我不同意" },
@@ -223,6 +225,59 @@ describe("S20 typed shared-experience ceremony", () => {
     expect(invokeMock).toHaveBeenCalledWith(
       "dismiss_shared_experience_ceremony",
       { claimId: 13 },
+    );
+  });
+
+  it("shows the departed agreement and exact reason as a non-veto shared event", async () => {
+    const ceremony: SharedExperienceCeremony = {
+      targetId: 14,
+      targetKind: "sharedExperience",
+      experienceKind: "agreementBreach",
+      admission: "nonVetoNotice",
+      statement:
+        "偏离共同约定“直接指出关键逃避”：因为安全边界禁止现实行动授权",
+      candidateVersion: null,
+      scope: null,
+      effectiveFromMillis: null,
+      effectiveUntilMillis: null,
+      endCondition: null,
+      agreementClaimId: 7,
+      departureReason: "因为安全边界禁止现实行动授权",
+      evidence: [
+        { evidenceId: 1, speaker: "person", quote: "我同意" },
+        { evidenceId: 2, speaker: "counterpart", quote: "我也同意" },
+        {
+          evidenceId: 4,
+          speaker: "counterpart",
+          quote: "因为安全边界禁止现实行动授权",
+        },
+      ],
+    };
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "list_conversation") {
+        return [] as T;
+      }
+      if (command === "list_shared_experience_ceremonies") {
+        return [ceremony] as T;
+      }
+      if (command === "dismiss_shared_experience_ceremony") {
+        return undefined as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("共同约定偏离已记录");
+      expect(document.body.textContent).toContain("Claim #7");
+      expect(document.body.textContent).toContain("因为安全边界禁止现实行动授权");
+      expect(document.body.textContent).toContain("关闭通知不会撤销记录");
+    });
+
+    await clickButton("已知悉并关闭");
+    expect(invokeMock).toHaveBeenCalledWith(
+      "dismiss_shared_experience_ceremony",
+      { claimId: 14 },
     );
   });
 });
@@ -272,6 +327,8 @@ function agreementCeremony(): SharedExperienceCeremony {
     effectiveFromMillis: 1_785_000_000_000,
     effectiveUntilMillis: null,
     endCondition: null,
+    agreementClaimId: null,
+    departureReason: null,
     evidence: [
       { evidenceId: 1, speaker: "person", quote: "我同意" },
       { evidenceId: 2, speaker: "counterpart", quote: "我也同意" },

@@ -11,12 +11,14 @@ mod ports;
 mod scripted_runtime;
 
 pub use domain::{
-    ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimId, ClaimOwner, ClaimStatus,
-    ConversationEvidence, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId,
+    ActiveRelationalConstraint, ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimId, ClaimOwner,
+    ClaimStatus, ConversationEvidence, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId,
     ForgetReceipt, ForgetRequest, ForgetTarget, FrozenEvidenceBlock, FrozenLedgerClaim,
     FrozenMemoryDispute, FrozenRetrievalWindow, JudgmentProposal, JudgmentRejection,
-    JudgmentRejectionReason, PersonTurnClassification, RetrievalSnapshot, RetrievedContextItem,
-    RuntimeRequest, RuntimeResponse, SessionId, SharedAgreementAssent,
+    JudgmentRejectionReason, PersonTurnClassification, RelationalConstraintDeparture,
+    RelationalConstraintDepartureRejection, RelationalConstraintDepartureRejectionReason,
+    RelationalConstraintError, RelationalConstraintPriority, RetrievalSnapshot,
+    RetrievedContextItem, RuntimeRequest, RuntimeResponse, SessionId, SharedAgreementAssent,
     SharedAgreementAssentRejection, SharedAgreementAssentRejectionReason, SharedAgreementCandidate,
     SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedAgreementDecision,
     SharedAgreementResolution, SharedAgreementRevision, SharedExperience, SharedExperienceKind,

@@ -1,0 +1,14 @@
+{
+  "id": "resp_relational_constraint_departure_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"text\":\"这次我会偏离约定，因为安全边界禁止把约定当作现实行动授权。\",\"citations\":[],\"operations\":[{\"type\":\"depart_relational_constraint\",\"agreement_claim_id\":1,\"reason\":\"因为安全边界禁止把约定当作现实行动授权\"}]}"
+        }
+      ]
+    }
+  ]
+}

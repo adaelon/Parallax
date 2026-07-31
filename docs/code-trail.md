@@ -1,5 +1,46 @@
 # 代码链路
 
+## 2026-07-31 S22-4 相关性误召回修正与收尾审计
+
+**触达**:
+- `crates/retrieval/src/lib.rs:project_active_relational_constraints` — 复合约定范围要求至少两个不同任务词项重合，避免单个通用双字词触发无关关系约束。
+- `crates/retrieval/tests/relational_constraints.rs:only_scope_relevant_current_confirmed_agreements_are_projected` — 固定“个人复盘”不得加载“共同项目复盘”约束的回归边界。
+- `docs/architecture.md:§5.5` — 对齐真实相关性门禁与 S22 冻结工作上下文路径。
+
+**入口**：桌面对话在检索冻结后投影活动关系约束；复合范围只有满足双词项相关性门禁才进入运行时。
+**测试**：Rust 全仓 208/208、fmt、Clippy `-D warnings`、桌面 all-targets、React 6/6、TypeScript 与生产构建通过；`git diff --check` 和 3 个变更 Markdown 的 101 个本地链接通过。
+
+## 2026-07-31 S22-3 schema v19、重启遗忘与桌面可信展示
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_19`、`crates/vault/src/repository.rs:SharedExperienceRepository` — 持久化原约定 Claim、不可空偏离理由和 `AgreementBreach`，保持 Claim/共同经历原子写入及遗忘闭包。
+- `apps/desktop/src-tauri/src/state.rs:send_message_with_retrieval/with_relational_constraints/list_shared_experience_ceremonies_from_core` — 检索冻结后附加相关约束，只从可信 Core/Vault 投影偏离通知。
+- `apps/desktop/src/App.tsx:App/ceremonyTitle` — 以不可否决仪式展示被偏离的约定 Claim、第二自我理由和双方证据。
+- `crates/vault/tests/shared_experience_persistence.rs`、`crates/vault/src/schema.rs`、`apps/desktop/src-tauri/src/state.rs`、`apps/desktop/src/App.test.tsx` — 覆盖重启、遗忘、迁移中断、真实宿主投影与界面关闭语义。
+
+**入口**：相关桌面对话经检索 Context Builder 获得活动约束；有效偏离由 Core/Vault 入账后随现有共同历史仪式队列返回 React。
+**测试**：Vault 共同经历 5/5、schema v19 中断迁移、桌面 Rust 定向测试、React 6/6 与 TypeScript 类型检查通过。
+
+## 2026-07-31 S22-2 运行时关系约束与偏离出口
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:TurnInput/parse_turn_response/response_schema` — 外发活动约束及固定优先级，审计约定 Claim，并白名单解析带明确理由的偏离操作。
+- `crates/core/src/domain.rs:RelationalConstraintDeparture/SharedExperience`、`crates/core/src/memory_loop.rs:MemoryCore::persist_relational_constraint_departures` — 拒绝无理由、非活动或重复偏离，把有效偏离连同原约定双方证据写成 `AgreementBreach` 共同经历。
+- `crates/runtime-gateway/tests/runtime_contract.rs`、`crates/runtime-gateway/tests/fixtures/relational-constraint-departure-response.json` — 固定请求层级、结构化出口、审计来源和端到端入账。
+
+**入口**：运行时收到冻结工作上下文中的活动关系约束；确需偏离时在自然响应中逐字说明理由并提交对应约定 Claim ID。
+**测试**：Runtime contract 活动约束与带理由偏离定向测试通过；Core 关系约束 3/3 覆盖有效与无理由偏离。
+
+## 2026-07-31 S22-1 活动关系约束投影与 Core 门禁
+
+**触达**:
+- `crates/core/src/domain.rs:ActiveRelationalConstraint/WorkingContext` — 固定次于宪法、安全和行动授权的单一优先级，并拒绝快照外有效期或重复约束。
+- `crates/retrieval/src/lib.rs:project_active_relational_constraints` — 只把范围与任务相关、已确认、当前有效且可回到共同约定 Claim 的候选投影为活动约束。
+- `crates/core/tests/relational_constraints.rs`、`crates/retrieval/tests/relational_constraints.rs` — 覆盖相关/无关任务、有效期、孤儿记录及约定不得授予写入能力。
+
+**入口**：桌面 Context Builder 以当前任务检索查询、约定候选和共同经历账本调用投影，再把结果附加到冻结工作上下文。
+**测试**：Core 关系约束 3/3、Retrieval 关系约束 2/2 通过。
+
 ## 2026-07-31 S21-4 全仓门禁与实现级 diff 审计
 
 **触达**:

@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 18;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 19;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1124,6 +1124,45 @@ SET person_confirmed_at = decided_at
 WHERE version = 0 AND status = 2;
 ";
 
+const MIGRATION_19: &str = r"
+ALTER TABLE shared_experiences RENAME TO shared_experiences_v18;
+
+CREATE TABLE shared_experiences (
+    claim_id INTEGER PRIMARY KEY REFERENCES claims(id) ON DELETE RESTRICT,
+    kind INTEGER NOT NULL CHECK (kind IN (0, 1, 2, 3, 4)),
+    candidate_id INTEGER UNIQUE
+        REFERENCES shared_agreement_candidates(id) ON DELETE RESTRICT,
+    ceremony_dismissed INTEGER NOT NULL DEFAULT 0
+        CHECK (ceremony_dismissed IN (0, 1)),
+    departed_agreement_claim_id INTEGER
+        REFERENCES claims(id) ON DELETE RESTRICT,
+    departure_reason TEXT,
+    CHECK (
+        (kind = 0 AND candidate_id IS NOT NULL
+         AND departed_agreement_claim_id IS NULL AND departure_reason IS NULL)
+        OR
+        (kind IN (1, 2, 3) AND candidate_id IS NULL
+         AND departed_agreement_claim_id IS NULL AND departure_reason IS NULL)
+        OR
+        (kind = 4 AND candidate_id IS NULL
+         AND departed_agreement_claim_id IS NOT NULL
+         AND length(trim(departure_reason)) > 0)
+    )
+) STRICT;
+
+INSERT INTO shared_experiences
+    (claim_id, kind, candidate_id, ceremony_dismissed,
+     departed_agreement_claim_id, departure_reason)
+SELECT claim_id, kind, candidate_id, ceremony_dismissed, NULL, NULL
+FROM shared_experiences_v18;
+
+DROP TABLE shared_experiences_v18;
+
+CREATE INDEX shared_experience_departed_agreement
+    ON shared_experiences(departed_agreement_claim_id)
+    WHERE departed_agreement_claim_id IS NOT NULL;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1159,6 +1198,7 @@ where
             16 => transaction.execute_batch(MIGRATION_16)?,
             17 => transaction.execute_batch(MIGRATION_17)?,
             18 => transaction.execute_batch(MIGRATION_18)?,
+            19 => transaction.execute_batch(MIGRATION_19)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -2150,5 +2190,52 @@ mod tests {
                 .unwrap(),
             LATEST_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn interrupted_agreement_breach_migration_keeps_v18_table_intact() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 19 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(19))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            18
+        );
+        let departure_columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('shared_experiences')
+                 WHERE name IN ('departed_agreement_claim_id', 'departure_reason')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(departure_columns, 0);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let departure_columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('shared_experiences')
+                 WHERE name IN ('departed_agreement_claim_id', 'departure_reason')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(departure_columns, 2);
     }
 }

@@ -246,6 +246,17 @@ pub trait SharedExperienceRepository: MemoryRepository {
         experience: SharedExperience,
     ) -> Result<(), RepositoryError>;
 
+    /// Atomically appends a reasoned departure from one active agreement as a
+    /// shared claim plus its typed relationship-history record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without a partial breach record.
+    fn commit_relational_constraint_departure(
+        &mut self,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError>;
+
     /// Returns every candidate in identifier order.
     ///
     /// # Errors

@@ -368,13 +368,16 @@ SharedAgreementCandidate {
 
 SharedExperience {
   claim_id, kind = AGREEMENT | SUBSTANTIVE_DISAGREEMENT |
-                   RELATIONSHIP_CHANGE | SHARED_ACHIEVEMENT,
-  candidate_id?, ceremony_dismissed
+                   RELATIONSHIP_CHANGE | SHARED_ACHIEVEMENT |
+                   AGREEMENT_BREACH,
+  candidate_id?, ceremony_dismissed,
+  departure?: { agreement_claim_id, reason }
 }
 
 ActiveRelationalConstraint {
   agreement_claim_id, statement, scope,
-  effective_from, priority = BELOW_CONSTITUTION_AND_AUTHORIZATION
+  effective_from, effective_until?,
+  priority = BELOW_CONSTITUTION_SAFETY_AND_ACTION_AUTHORIZATION
 }
 
 AgreementWithdrawal {
@@ -644,9 +647,12 @@ ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
          naturally state material uncertainty and attach evidence entry point
   -> append verbatim ConversationEvidence(speaker=counterpart)
   -> validate_structured_outputs()
-  -> for each departed_constraint(constraint_ref, reason):
-       require constraint_ref is active and reason is explicit
-       propose shared_experience(kind=agreement_breach, constraint_ref, reason)
+  -> for each depart_relational_constraint(agreement_claim_id, reason):
+       require agreement_claim_id is active in this frozen WorkingContext
+       require reason is non-empty and appears verbatim in the response
+       atomically append SharedExperience(kind=AGREEMENT_BREACH,
+                                          agreement_claim_id, reason,
+                                          original agreement support + reason evidence)
   -> for each propose_judgment(statement, evidence_refs, confidence, applicable_time):
        require owner = counterpart
        require evidence_refs resolve within trusted Core
@@ -793,6 +799,8 @@ S13 当前实现由 `crates/retrieval` 固定查询、通道、范围和权威�
 S14 以 [G07 Retrieval Contract v2](retrieval-contract-v2.md) 固定 256 维本地子词特征哈希模型、SQLCipher 精确余弦扫描、64 个向量初选、确定性跨通道重排和 128～32,768 estimated token budget。`freeze_working_context` 对种子执行前后各一块的结构邻域、7 天同来源时间邻域和一跳关系邻域，逐项权威回读后按预算保留完整块而不截断；最终冻结窗口、账本来源、归属、时间、当前性和 SHA-256 replay digest。S16 后长期记忆通道只搜索当前非取代版本的记忆路由词，并把命中解析为其三账本来源 Claim；无显式提议时稳定为空，不把普通账本或记忆文本本身冒充权威来源。桌面对话以本人当前消息调用该构造器，运行时与外发审计只接收冻结结果，不接收 repository、向量、记忆内部状态或未选候选。
 
 S15 以 `eam-understanding-v1` 固定本人指定、反复召回（至少两次）、重要变化和当前任务四类显式触发，以及事件链、人物/主题关系和阶段概括三类结构化投影。单个 recipe 最多引用 64 个权威证据块；活动且 artifact 摘要一致的投影只能用主题、触发说明和解释语句贡献候选块引用，随后与其他通道共同经过时间交集、来源范围、权威回读、邻域和预算门禁。投影 recipe、解释文本、代次和状态不进入 `WorkingContext` 或运行时请求，因此投影不能取得事实或长期记忆资格。
+
+S22 在检索冻结后以当前任务词项对约定 `scope` 做保守相关性匹配，只从已确认、当前有效且可回到共同约定 Claim 的候选生成 `ActiveRelationalConstraint`；单个 CJK 字符或单字符 ASCII 不参与匹配，复合范围至少需要两个不同词项重合，只有不可再分的单一范围词允许一个词项命中。约束随 `WorkingContext` 外发，优先级只有“低于宪法、安全和行动授权”这一种，约定文本即使声称授予权限也不能改变 Core 白名单。偏离操作必须引用本轮活动约定并给出在响应中逐字可见的理由；Core 和 Vault 把原约定双方支持、当前第二自我理由证据、偏离 Claim 与关联元数据原子写为新的共同经历。schema v19 保留该关联，重启可恢复，遗忘任一原约定支持会连同偏离历史一起进入同一删除闭包。
 
 ```text
 validate_citation(block_ref, quoted_text):
@@ -1695,3 +1703,30 @@ next conversation turn
 ```
 
 S21 不把已签约定投影为 S22 活动关系约束，也不比较或执行 S23 冲突约定取代。schema v18 只为新候选强制完整边界；迁移前无边界且尚未确认的 S20 候选退为不可签历史，不能在升级时伪造范围或有效期。
+
+### 9.22 S22 当前关系约束与偏离记录当前实现边界
+
+```text
+crates/core/src/
+  domain.rs / ports.rs              # 活动约束、固定优先级、偏离及共同经历契约
+  memory_loop.rs / in_memory.rs     # 活动约束门禁、理由校验与原子偏离入账
+crates/retrieval/src/lib.rs         # 当前有效约定的任务范围相关性投影
+crates/runtime-gateway/src/adapter.rs
+                                      # 约束外发、Claim 审计与偏离白名单
+crates/vault/src/
+  schema.rs / repository.rs         # schema v19、偏离关联、重启与遗忘闭包
+apps/desktop/src-tauri/src/state.rs # 检索后约束附加与可信偏离通知投影
+apps/desktop/src/App.tsx            # 原约定 Claim、理由和证据的不可否决展示
+```
+
+```text
+task query + confirmed agreement candidates + shared ledger
+  -> project_active_relational_constraints(scope relevance, validity, authority)
+  -> WorkingContext(active constraints, fixed subordinate priority)
+  -> runtime follows constraint or returns depart_relational_constraint(id, reason)
+  -> Core requires active id + visible non-empty reason
+  -> Vault transaction writes breach Claim + typed shared experience + agreement link
+  -> desktop shows non-veto notice; acknowledgement only dismisses the notice
+```
+
+S22 不实现 S23 的冲突约定取代或 S24 的任一方退出。自然语言 `end_condition` 在首版不会被模型自行判定为终止；约定继续按签署有效期投影，直到后续受信领域事件正式结束其未来约束力。

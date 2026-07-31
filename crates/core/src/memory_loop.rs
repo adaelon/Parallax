@@ -4,13 +4,15 @@ use crate::{
     ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
     ClaimStatus, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
     ForgetReceipt, ForgetRepository, ForgetRequest, JudgmentProposal, JudgmentRejection,
-    JudgmentRejectionReason, MemoryRepository, PersonTurnClassification, RepositoryError,
-    RuntimeError, RuntimeRequest, SessionId, SharedAgreementAssentRejection,
-    SharedAgreementAssentRejectionReason, SharedAgreementCandidate, SharedAgreementCandidateId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
-    SharedAgreementRevision, SharedExperience, SharedExperienceProposal, SharedExperienceRejection,
-    SharedExperienceRejectionReason, SharedExperienceRepository, Speaker,
-    StructuredOperationRejection, StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
+    JudgmentRejectionReason, MemoryRepository, PersonTurnClassification,
+    RelationalConstraintDeparture, RelationalConstraintDepartureRejection,
+    RelationalConstraintDepartureRejectionReason, RepositoryError, RuntimeError, RuntimeRequest,
+    SessionId, SharedAgreementAssentRejection, SharedAgreementAssentRejectionReason,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementResolution, SharedAgreementRevision, SharedExperience,
+    SharedExperienceProposal, SharedExperienceRejection, SharedExperienceRejectionReason,
+    SharedExperienceRepository, Speaker, StructuredOperationRejection,
+    StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +50,24 @@ struct SharedExperienceWriteOutcome {
 struct SharedAgreementAssentWriteOutcome {
     assented: Vec<SharedAgreementCandidateId>,
     rejected: Vec<SharedAgreementAssentRejection>,
+}
+
+struct ConstraintDepartureWriteOutcome {
+    recorded: Vec<ClaimId>,
+    rejected: Vec<RelationalConstraintDepartureRejection>,
+}
+
+fn reject_constraint_departure(
+    outcome: &mut ConstraintDepartureWriteOutcome,
+    proposal_index: usize,
+    reason: RelationalConstraintDepartureRejectionReason,
+) {
+    outcome
+        .rejected
+        .push(RelationalConstraintDepartureRejection::new(
+            proposal_index,
+            reason,
+        ));
 }
 
 impl fmt::Display for CoreError {
@@ -411,6 +431,11 @@ where
         )?;
         let agreement_assents =
             self.persist_shared_agreement_assents(&response, &counterpart_evidence)?;
+        let departures = self.persist_relational_constraint_departures(
+            &response,
+            &validation_context,
+            &counterpart_evidence,
+        )?;
         let shared = self.persist_shared_experience_proposals(
             &response,
             &validation_context,
@@ -435,8 +460,114 @@ where
         )
         .with_judgments(judgments.accepted, judgments.rejected)
         .with_agreement_assents(agreement_assents.assented, agreement_assents.rejected)
+        .with_constraint_departures(departures.recorded, departures.rejected)
         .with_shared_experiences(shared.pending_agreements, shared.admitted, shared.rejected)
         .with_rejected_operations(rejected_operations))
+    }
+
+    fn persist_relational_constraint_departures(
+        &mut self,
+        response: &crate::RuntimeResponse,
+        validation_context: &WorkingContext,
+        counterpart_evidence: &ConversationEvidence,
+    ) -> Result<ConstraintDepartureWriteOutcome, CoreError> {
+        let mut outcome = ConstraintDepartureWriteOutcome {
+            recorded: Vec::new(),
+            rejected: Vec::new(),
+        };
+        let agreements = self.repository.all_shared_experiences()?;
+        let mut seen = BTreeSet::new();
+        for (proposal_index, proposed) in response
+            .relational_constraint_departures()
+            .iter()
+            .enumerate()
+        {
+            let agreement_claim_id = proposed.agreement_claim_id();
+            if !seen.insert(agreement_claim_id) {
+                reject_constraint_departure(
+                    &mut outcome,
+                    proposal_index,
+                    RelationalConstraintDepartureRejectionReason::DuplicateDeparture(
+                        agreement_claim_id,
+                    ),
+                );
+                continue;
+            }
+            let Some(constraint) = validation_context
+                .active_relational_constraints()
+                .iter()
+                .find(|constraint| constraint.agreement_claim_id() == agreement_claim_id)
+            else {
+                reject_constraint_departure(
+                    &mut outcome,
+                    proposal_index,
+                    RelationalConstraintDepartureRejectionReason::ConstraintNotActive(
+                        agreement_claim_id,
+                    ),
+                );
+                continue;
+            };
+            let reason = proposed.reason().trim();
+            if reason.is_empty() {
+                reject_constraint_departure(
+                    &mut outcome,
+                    proposal_index,
+                    RelationalConstraintDepartureRejectionReason::EmptyReason,
+                );
+                continue;
+            }
+            if !response.text().contains(reason) {
+                reject_constraint_departure(
+                    &mut outcome,
+                    proposal_index,
+                    RelationalConstraintDepartureRejectionReason::ReasonNotInResponse,
+                );
+                continue;
+            }
+            let Some(agreement) = agreements.iter().find(|experience| {
+                experience.kind() == crate::SharedExperienceKind::Agreement
+                    && experience.claim().id() == agreement_claim_id
+            }) else {
+                reject_constraint_departure(
+                    &mut outcome,
+                    proposal_index,
+                    RelationalConstraintDepartureRejectionReason::AgreementNotFound(
+                        agreement_claim_id,
+                    ),
+                );
+                continue;
+            };
+            let departure = RelationalConstraintDeparture::new(agreement_claim_id, reason);
+            let support = agreement
+                .claim()
+                .support()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(EvidenceCitation::new(
+                    counterpart_evidence.id(),
+                    reason,
+                )))
+                .collect();
+            let claim_id = self.repository.next_claim_id();
+            let claim = Claim::new(
+                claim_id,
+                ClaimOwner::Shared,
+                format!(
+                    "偏离共同约定“{}”：{}",
+                    constraint.statement(),
+                    departure.reason()
+                ),
+                support,
+                None,
+                ApplicableTime::At(counterpart_evidence.recorded_at()),
+                counterpart_evidence.recorded_at(),
+            );
+            self.repository.commit_relational_constraint_departure(
+                SharedExperience::agreement_breach(claim, departure),
+            )?;
+            outcome.recorded.push(claim_id);
+        }
+        Ok(outcome)
     }
 
     fn persist_shared_agreement_assents(
@@ -770,6 +901,9 @@ fn validate_shared_experience_proposal(
 ) -> Result<(), SharedExperienceRejectionReason> {
     if proposal.statement().trim().is_empty() {
         return Err(SharedExperienceRejectionReason::EmptyStatement);
+    }
+    if proposal.kind() == crate::SharedExperienceKind::AgreementBreach {
+        return Err(SharedExperienceRejectionReason::AgreementBreachRequiresConstraintDeparture);
     }
     if proposal.kind() == crate::SharedExperienceKind::Agreement {
         let Some(scope) = proposal.agreement_scope() else {

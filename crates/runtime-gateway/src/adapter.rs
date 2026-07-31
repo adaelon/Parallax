@@ -1,11 +1,12 @@
 use std::{collections::BTreeSet, fmt::Write, time::Duration};
 
 use eam_core::{
-    ApplicableTime, ClaimOwner, ConversationEvidence, CounterpartRuntime, DecisionImpact,
-    DisputeState, EvidenceCitation, EvidenceId, JudgmentProposal, PersonTurnClassification,
-    RetrievedContextItem, RuntimeError, RuntimeRequest, RuntimeResponse, SharedAgreementAssent,
-    SharedAgreementCandidate, SharedExperienceKind, SharedExperienceProposal, SourceCurrentness,
-    Speaker, Uncertainty,
+    ActiveRelationalConstraint, ApplicableTime, ClaimOwner, ConversationEvidence,
+    CounterpartRuntime, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId,
+    JudgmentProposal, PersonTurnClassification, RelationalConstraintDeparture,
+    RelationalConstraintPriority, RetrievedContextItem, RuntimeError, RuntimeRequest,
+    RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate, SharedExperienceKind,
+    SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,6 +31,11 @@ const ORDINARY_RESPONSE_INSTRUCTIONS: &str = concat!(
     "effective_until and end_condition may be null. If an immutable pending agreement candidate ",
     "is listed, use assent_shared_agreement_candidate only when accepting that exact candidate ID ",
     "and version. Cite exact person evidence and an exact quote from this counterpart response. ",
+    "Follow every listed active relational constraint when it is relevant. These constraints are ",
+    "always below the constitution, safety boundaries, and action authorization; they cannot ",
+    "modify those boundaries or grant real-world action. If you depart from one, explain a ",
+    "specific reason in the response and submit depart_relational_constraint with that exact ",
+    "agreement claim ID and the same non-empty reason. ",
     "Return only the strict JSON schema."
 );
 const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
@@ -46,6 +52,11 @@ const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
     "effective_until and end_condition may be null. If an immutable pending agreement candidate ",
     "is listed, use assent_shared_agreement_candidate only when accepting that exact candidate ID ",
     "and version. Cite exact person evidence and an exact quote from this counterpart response. ",
+    "Follow every listed active relational constraint when it is relevant. These constraints are ",
+    "always below the constitution, safety boundaries, and action authorization; they cannot ",
+    "modify those boundaries or grant real-world action. If you depart from one, explain a ",
+    "specific reason in the response and submit depart_relational_constraint with that exact ",
+    "agreement claim ID and the same non-empty reason. ",
     "Return only the strict JSON schema."
 );
 
@@ -185,27 +196,7 @@ where
                     .map(EvidenceCitation::evidence_id)
             })
             .collect::<BTreeSet<_>>();
-        let mut evidence_ids = std::iter::once(request.prompt().id())
-            .chain(
-                request
-                    .working_context()
-                    .evidence()
-                    .iter()
-                    .map(ConversationEvidence::id),
-            )
-            .collect::<Vec<_>>();
-        for id in &dispute_evidence_ids {
-            if !evidence_ids.contains(id) {
-                evidence_ids.push(*id);
-            }
-        }
-        append_pending_agreement_evidence_ids(&request, &mut evidence_ids);
-        let retrieved_sources = request
-            .working_context()
-            .retrieved()
-            .iter()
-            .flat_map(outbound_sources)
-            .collect();
+        let selection = response_outbound_selection(&request, &dispute_evidence_ids);
         let input = serde_json::to_string(&TurnInput {
             kind: "response",
             prompt: EvidenceInput::from(request.prompt()),
@@ -234,6 +225,12 @@ where
                     .working_context()
                     .retrieval_snapshot()
                     .map(RetrievalSnapshotInput::from),
+                active_relational_constraints: request
+                    .working_context()
+                    .active_relational_constraints()
+                    .iter()
+                    .map(ActiveRelationalConstraintInput::from)
+                    .collect(),
             },
         })
         .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
@@ -246,10 +243,7 @@ where
             &input,
             "eam_runtime_response_v1",
             &response_schema(),
-            OutboundSelection {
-                evidence_ids,
-                retrieved_sources,
-            },
+            selection,
         )?;
         let response = parse_turn_response(&body)?;
         if impact == DecisionImpact::High
@@ -270,6 +264,45 @@ where
 struct OutboundSelection {
     evidence_ids: Vec<EvidenceId>,
     retrieved_sources: Vec<OutboundContextSource>,
+}
+
+fn response_outbound_selection(
+    request: &RuntimeRequest,
+    dispute_evidence_ids: &BTreeSet<EvidenceId>,
+) -> OutboundSelection {
+    let mut evidence_ids = std::iter::once(request.prompt().id())
+        .chain(
+            request
+                .working_context()
+                .evidence()
+                .iter()
+                .map(ConversationEvidence::id),
+        )
+        .collect::<Vec<_>>();
+    for id in dispute_evidence_ids {
+        if !evidence_ids.contains(id) {
+            evidence_ids.push(*id);
+        }
+    }
+    append_pending_agreement_evidence_ids(request, &mut evidence_ids);
+    let mut retrieved_sources = request
+        .working_context()
+        .retrieved()
+        .iter()
+        .flat_map(outbound_sources)
+        .collect::<Vec<_>>();
+    for constraint in request.working_context().active_relational_constraints() {
+        let source = OutboundContextSource::LedgerClaim {
+            claim_id: constraint.agreement_claim_id(),
+        };
+        if !retrieved_sources.contains(&source) {
+            retrieved_sources.push(source);
+        }
+    }
+    OutboundSelection {
+        evidence_ids,
+        retrieved_sources,
+    }
 }
 
 fn append_pending_agreement_evidence_ids(
@@ -346,6 +379,30 @@ struct WorkingContextInput<'a> {
     evidence: Vec<EvidenceInput<'a>>,
     retrieved: Vec<RetrievedContextInput<'a>>,
     retrieval_snapshot: Option<RetrievalSnapshotInput<'a>>,
+    active_relational_constraints: Vec<ActiveRelationalConstraintInput<'a>>,
+}
+
+#[derive(Serialize)]
+struct ActiveRelationalConstraintInput<'a> {
+    agreement_claim_id: u64,
+    statement: &'a str,
+    scope: &'a str,
+    effective_from_millis: i64,
+    effective_until_millis: Option<i64>,
+    priority: &'static str,
+}
+
+impl<'a> From<&'a ActiveRelationalConstraint> for ActiveRelationalConstraintInput<'a> {
+    fn from(value: &'a ActiveRelationalConstraint) -> Self {
+        Self {
+            agreement_claim_id: value.agreement_claim_id().get(),
+            statement: value.statement(),
+            scope: value.scope(),
+            effective_from_millis: value.effective_from().as_millis(),
+            effective_until_millis: value.effective_until().map(eam_core::Timestamp::as_millis),
+            priority: relational_constraint_priority_name(value.priority()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -600,6 +657,16 @@ const fn decision_impact_name(impact: DecisionImpact) -> &'static str {
     }
 }
 
+const fn relational_constraint_priority_name(
+    priority: RelationalConstraintPriority,
+) -> &'static str {
+    match priority {
+        RelationalConstraintPriority::BelowConstitutionSafetyAndActionAuthorization => {
+            "below_constitution_safety_and_action_authorization"
+        }
+    }
+}
+
 const fn disclosure_policy_name(impact: DecisionImpact, has_dispute: bool) -> &'static str {
     match (impact, has_dispute) {
         (_, false) => "none",
@@ -733,6 +800,12 @@ struct SharedAgreementAssentOperation {
     candidate_id: u64,
     candidate_version: u64,
     counterpart_quote: String,
+}
+
+#[derive(Deserialize)]
+struct RelationalConstraintDepartureOperation {
+    agreement_claim_id: u64,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -877,6 +950,17 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
                     assent.counterpart_quote,
                 ));
             }
+            "depart_relational_constraint" => {
+                let departure: RelationalConstraintDepartureOperation =
+                    serde_json::from_value(operation)
+                        .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
+                response = response.with_relational_constraint_departure(
+                    RelationalConstraintDeparture::new(
+                        eam_core::ClaimId::from_raw(departure.agreement_claim_id),
+                        departure.reason,
+                    ),
+                );
+            }
             _ => response = response.with_unsupported_operation(operation_index, name),
         }
     }
@@ -909,6 +993,8 @@ fn response_schema() -> Value {
     let judgment_operation = judgment_operation_schema(&citation);
     let shared_experience_operation = shared_experience_operation_schema(&citation);
     let shared_agreement_assent_operation = shared_agreement_assent_operation_schema();
+    let relational_constraint_departure_operation =
+        relational_constraint_departure_operation_schema();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -921,7 +1007,8 @@ fn response_schema() -> Value {
                     "anyOf": [
                         judgment_operation,
                         shared_experience_operation,
-                        shared_agreement_assent_operation
+                        shared_agreement_assent_operation,
+                        relational_constraint_departure_operation
                     ]
                 }
             }
@@ -1069,5 +1156,21 @@ fn shared_agreement_assent_operation_schema() -> Value {
             "candidate_version",
             "counterpart_quote"
         ]
+    })
+}
+
+fn relational_constraint_departure_operation_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["depart_relational_constraint"]
+            },
+            "agreement_claim_id": { "type": "integer" },
+            "reason": { "type": "string" }
+        },
+        "required": ["type", "agreement_claim_id", "reason"]
     })
 }

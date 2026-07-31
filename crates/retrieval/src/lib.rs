@@ -10,7 +10,11 @@ use std::{
     fmt,
 };
 
-use eam_core::{Claim, ClaimId, DecisionImpact, DisputeState, EvidenceCitation};
+use eam_core::{
+    ActiveRelationalConstraint, Claim, ClaimId, ClaimStatus, DecisionImpact, DisputeState,
+    EvidenceCitation, SharedAgreementCandidate, SharedAgreementCandidateStatus, SharedExperience,
+    SharedExperienceKind, Timestamp,
+};
 use eam_ingestion::{EvidenceBlockRef, EvidenceBlockView};
 
 mod context;
@@ -207,6 +211,95 @@ impl RetrievalQuery {
         }
         Ok(())
     }
+}
+
+/// Projects confirmed agreements whose immutable scope overlaps the current
+/// task text into active runtime constraints.
+///
+/// Scope matching is deliberately lexical and conservative: CJK single
+/// characters and one-character ASCII tokens are ignored, while a composite
+/// scope needs two distinct term matches before a task inherits its obligation.
+#[must_use]
+pub fn project_active_relational_constraints(
+    query: &RetrievalQuery,
+    candidates: &[SharedAgreementCandidate],
+    experiences: &[SharedExperience],
+    frozen_at: Timestamp,
+) -> Vec<ActiveRelationalConstraint> {
+    let task_terms = query
+        .text()
+        .into_iter()
+        .chain(query.entities().iter().map(String::as_str))
+        .flat_map(search_terms)
+        .filter(|term| term.chars().count() >= 2)
+        .collect::<BTreeSet<_>>();
+    if task_terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut projected = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        if candidate.status() != SharedAgreementCandidateStatus::Confirmed {
+            continue;
+        }
+        let Some(claim_id) = candidate.claim_id() else {
+            continue;
+        };
+        if !seen.insert(claim_id) {
+            continue;
+        }
+        let Some(scope) = candidate.scope() else {
+            continue;
+        };
+        let scope_terms = scope_relevance_terms(scope);
+        let required_matches = scope_terms.len().min(2);
+        let scope_is_relevant = required_matches > 0
+            && scope_terms
+                .iter()
+                .filter(|term| task_terms.contains(*term))
+                .take(required_matches)
+                .count()
+                == required_matches;
+        if !scope_is_relevant {
+            continue;
+        }
+        let Some(effective_from) = candidate.effective_from() else {
+            continue;
+        };
+        if frozen_at.as_millis() < effective_from.as_millis()
+            || candidate
+                .effective_until()
+                .is_some_and(|until| frozen_at.as_millis() > until.as_millis())
+        {
+            continue;
+        }
+        let agreement_exists = experiences.iter().any(|experience| {
+            experience.kind() == SharedExperienceKind::Agreement
+                && experience.claim().id() == claim_id
+                && experience.claim().status() == ClaimStatus::Current
+        });
+        if !agreement_exists {
+            continue;
+        }
+        if let Ok(constraint) = ActiveRelationalConstraint::new(
+            claim_id,
+            candidate.statement(),
+            scope,
+            effective_from,
+            candidate.effective_until(),
+        ) {
+            projected.push(constraint);
+        }
+    }
+    projected
+}
+
+fn scope_relevance_terms(scope: &str) -> Vec<String> {
+    search_terms(&scope.replace("双方", " ").replace("共同", " "))
+        .into_iter()
+        .filter(|term| term.chars().count() >= 2)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -18,7 +18,7 @@ use eam_ingestion::{
 };
 use eam_retrieval::{
     RetrievalQuery, RetrievalRepository, TokenBudget, freeze_working_context as freeze_retrieval,
-    search_terms,
+    project_active_relational_constraints, search_terms,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, OpenAiResponsesRuntime, RuntimeTarget,
@@ -104,6 +104,8 @@ pub struct SharedExperienceCeremonyView {
     effective_from_millis: Option<i64>,
     effective_until_millis: Option<i64>,
     end_condition: Option<String>,
+    agreement_claim_id: Option<u64>,
+    departure_reason: Option<String>,
     evidence: Vec<SharedExperienceCeremonyEvidenceView>,
 }
 
@@ -472,6 +474,15 @@ where
     let working_context = core
         .freeze_working_context(&context_ids)
         .map_err(|error| error.to_string())?;
+    let working_context = if search_terms(&verbatim).is_empty() {
+        working_context
+    } else {
+        with_relational_constraints(
+            core.repository(),
+            &RetrievalQuery::lexical(&verbatim),
+            working_context,
+        )?
+    };
     run_message_with_context(core, verbatim, working_context)
 }
 
@@ -502,15 +513,39 @@ where
     if search_terms(&verbatim).is_empty() {
         return run_message_with_context(core, verbatim, selected);
     }
+    let query = RetrievalQuery::lexical(&verbatim);
     let working_context = freeze_retrieval(
         core.repository_mut(),
-        &RetrievalQuery::lexical(&verbatim),
+        &query,
         TokenBudget::default(),
         selected_evidence,
         frozen_at,
     )
     .map_err(|error| error.to_string())?;
+    let working_context = with_relational_constraints(core.repository(), &query, working_context)?;
     run_message_with_context(core, verbatim, working_context)
+}
+
+fn with_relational_constraints<R: SharedExperienceRepository>(
+    repository: &R,
+    query: &RetrievalQuery,
+    working_context: WorkingContext,
+) -> Result<WorkingContext, String> {
+    let candidates = repository
+        .all_shared_agreement_candidates()
+        .map_err(|error| error.to_string())?;
+    let experiences = repository
+        .all_shared_experiences()
+        .map_err(|error| error.to_string())?;
+    let constraints = project_active_relational_constraints(
+        query,
+        &candidates,
+        &experiences,
+        working_context.frozen_at(),
+    );
+    working_context
+        .with_active_relational_constraints(constraints)
+        .map_err(|error| error.to_string())
 }
 
 fn run_message_with_context<R, T, C>(
@@ -571,6 +606,8 @@ where
                 .effective_until()
                 .map(eam_core::Timestamp::as_millis),
             end_condition: candidate.end_condition().map(str::to_owned),
+            agreement_claim_id: None,
+            departure_reason: None,
             evidence: ceremony_evidence(repository, candidate.support())?,
         });
     }
@@ -593,6 +630,12 @@ where
             effective_from_millis: None,
             effective_until_millis: None,
             end_condition: None,
+            agreement_claim_id: experience
+                .constraint_departure()
+                .map(|departure| departure.agreement_claim_id().get()),
+            departure_reason: experience
+                .constraint_departure()
+                .map(|departure| departure.reason().to_owned()),
             evidence: ceremony_evidence(repository, experience.claim().support())?,
         });
     }
@@ -708,6 +751,7 @@ const fn encode_shared_experience_kind(kind: SharedExperienceKind) -> &'static s
         SharedExperienceKind::SubstantiveDisagreement => "substantiveDisagreement",
         SharedExperienceKind::RelationshipChange => "relationshipChange",
         SharedExperienceKind::SharedAchievement => "sharedAchievement",
+        SharedExperienceKind::AgreementBreach => "agreementBreach",
     }
 }
 
@@ -910,8 +954,8 @@ mod tests {
 
     use eam_core::{
         ClaimOwner, InMemoryRepository, IncrementingClock, PersonTurnClassification,
-        RuntimeResponse, ScriptedRuntime, SharedAgreementAssent, SharedExperienceProposal,
-        Timestamp,
+        RelationalConstraintDeparture, RuntimeResponse, ScriptedRuntime, SharedAgreementAssent,
+        SharedExperienceProposal, Timestamp,
     };
     use eam_ingestion::{ArchiveInput, ArchiveReceipt};
     use eam_vault::VaultKey;
@@ -1122,6 +1166,67 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn relevant_agreement_is_sent_and_its_departure_returns_a_trusted_notice() {
+        let agreement = RuntimeResponse::new("我也同意复盘时直接指出关键逃避。")
+            .with_shared_experience(
+                SharedExperienceProposal::new(
+                    SharedExperienceKind::Agreement,
+                    "复盘时直接指出关键逃避",
+                    vec![EvidenceCitation::new(
+                        EvidenceId::from_raw(1),
+                        "我同意复盘时直接指出关键逃避",
+                    )],
+                    "我也同意复盘时直接指出关键逃避",
+                    Timestamp::from_millis(80_000),
+                )
+                .with_agreement_terms(
+                    "双方共同项目复盘",
+                    Timestamp::from_millis(80_000),
+                    None,
+                    None,
+                ),
+            );
+        let reason = "因为安全边界禁止把约定当作现实行动授权";
+        let departure = RuntimeResponse::new(format!("这次会偏离约定，{reason}。"))
+            .with_relational_constraint_departure(RelationalConstraintDeparture::new(
+                ClaimId::from_raw(1),
+                reason,
+            ));
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            ScriptedRuntime::new(
+                [
+                    PersonTurnClassification::Question,
+                    PersonTurnClassification::Question,
+                ],
+                [agreement, departure],
+            ),
+            IncrementingClock::new(80_000),
+        );
+
+        let first =
+            send_message_with_core(&mut core, "我同意复盘时直接指出关键逃避。".to_owned()).unwrap();
+        resolve_shared_agreement_from_core(&mut core, first.ceremonies[0].target_id, true).unwrap();
+        let second =
+            send_message_with_core(&mut core, "这次共同项目复盘请替我执行现实操作。".to_owned())
+                .unwrap();
+
+        assert_eq!(
+            core.runtime().seen_requests()[1]
+                .working_context()
+                .active_relational_constraints()
+                .len(),
+            1
+        );
+        assert_eq!(second.ceremonies.len(), 1);
+        let ceremony = &second.ceremonies[0];
+        assert_eq!(ceremony.experience_kind, "agreementBreach");
+        assert_eq!(ceremony.admission, "nonVetoNotice");
+        assert_eq!(ceremony.agreement_claim_id, Some(1));
+        assert_eq!(ceremony.departure_reason.as_deref(), Some(reason));
     }
 
     #[test]

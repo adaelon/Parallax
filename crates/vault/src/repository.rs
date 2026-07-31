@@ -7,10 +7,11 @@ use std::{
 use eam_core::{
     ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
     ClaimStatus, ConversationEvidence, DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt,
-    ForgetRepository, ForgetTarget, MemoryRepository, RepositoryError, SessionId,
-    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
-    SharedExperienceRepository, Speaker, Timestamp, Uncertainty,
+    ForgetRepository, ForgetTarget, MemoryRepository, RelationalConstraintDeparture,
+    RepositoryError, SessionId, SharedAgreementCandidate, SharedAgreementCandidateId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
+    SharedExperience, SharedExperienceKind, SharedExperienceRepository, Speaker, Timestamp,
+    Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -3235,9 +3236,12 @@ impl SharedExperienceRepository for VaultRepository {
         &mut self,
         experience: SharedExperience,
     ) -> Result<(), RepositoryError> {
-        if experience.kind() == SharedExperienceKind::Agreement {
+        if matches!(
+            experience.kind(),
+            SharedExperienceKind::Agreement | SharedExperienceKind::AgreementBreach
+        ) {
             return Err(RepositoryError::new(
-                "shared agreements require a person-confirmed candidate",
+                "agreements and agreement breaches require their typed commit path",
             ));
         }
         let transaction = self
@@ -3256,6 +3260,74 @@ impl SharedExperienceRepository for VaultRepository {
                     to_sql_id(experience.claim().id().get())?,
                     encode_shared_experience_kind(experience.kind()),
                     i64::from(experience.ceremony_dismissed()),
+                ],
+            )
+            .map_err(repository_error)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(())
+    }
+
+    fn commit_relational_constraint_departure(
+        &mut self,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError> {
+        let departure = experience.constraint_departure().ok_or_else(|| {
+            RepositoryError::new("agreement breach requires a constraint departure")
+        })?;
+        if experience.kind() != SharedExperienceKind::AgreementBreach
+            || departure.reason().trim().is_empty()
+        {
+            return Err(RepositoryError::new(
+                "invalid relational constraint departure",
+            ));
+        }
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        let agreement_exists = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM shared_experiences
+                    WHERE claim_id = ?1 AND kind = 0
+                 )",
+                [to_sql_id(departure.agreement_claim_id().get())?],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(repository_error)?;
+        if !agreement_exists {
+            return Err(RepositoryError::new("departed agreement does not exist"));
+        }
+        let agreement = load_claim(&transaction, departure.agreement_claim_id())?
+            .ok_or_else(|| RepositoryError::new("departed agreement claim is missing"))?;
+        if !agreement
+            .support()
+            .iter()
+            .all(|citation| experience.claim().support().contains(citation))
+            || !has_exact_counterpart_reason(
+                &transaction,
+                experience.claim().support(),
+                departure.reason(),
+            )?
+        {
+            return Err(RepositoryError::new(
+                "agreement breach must preserve agreement support and exact reason evidence",
+            ));
+        }
+        insert_shared_claim(&transaction, experience.claim())?;
+        transaction
+            .execute(
+                "INSERT INTO shared_experiences
+                 (claim_id, kind, candidate_id, ceremony_dismissed,
+                  departed_agreement_claim_id, departure_reason)
+                 VALUES (?1, ?2, NULL, 0, ?3, ?4)",
+                params![
+                    to_sql_id(experience.claim().id().get())?,
+                    encode_shared_experience_kind(experience.kind()),
+                    to_sql_id(departure.agreement_claim_id().get())?,
+                    departure.reason(),
                 ],
             )
             .map_err(repository_error)?;
@@ -3290,7 +3362,8 @@ impl SharedExperienceRepository for VaultRepository {
         let rows = self
             .connection()
             .prepare(
-                "SELECT claim_id, kind, ceremony_dismissed
+                "SELECT claim_id, kind, ceremony_dismissed,
+                        departed_agreement_claim_id, departure_reason
                  FROM shared_experiences ORDER BY claim_id",
             )
             .map_err(repository_error)?
@@ -3299,23 +3372,43 @@ impl SharedExperienceRepository for VaultRepository {
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })
             .map_err(repository_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(repository_error)?;
         rows.into_iter()
-            .map(|(claim_id, kind, dismissed)| {
-                let claim_id =
-                    ClaimId::from_raw(u64::try_from(claim_id).map_err(repository_error)?);
-                let claim = load_claim(self.connection(), claim_id)?
-                    .ok_or_else(|| RepositoryError::new("shared claim is missing"))?;
-                Ok(SharedExperience::restore(
-                    decode_shared_experience_kind(kind)?,
-                    claim,
-                    decode_bool(dismissed)?,
-                ))
-            })
+            .map(
+                |(claim_id, kind, dismissed, departed_claim_id, departure_reason)| {
+                    let claim_id =
+                        ClaimId::from_raw(u64::try_from(claim_id).map_err(repository_error)?);
+                    let claim = load_claim(self.connection(), claim_id)?
+                        .ok_or_else(|| RepositoryError::new("shared claim is missing"))?;
+                    let kind = decode_shared_experience_kind(kind)?;
+                    if kind == SharedExperienceKind::AgreementBreach {
+                        let agreement_claim_id = departed_claim_id
+                            .ok_or_else(|| RepositoryError::new("breach agreement is missing"))?;
+                        let agreement_claim_id = ClaimId::from_raw(
+                            u64::try_from(agreement_claim_id).map_err(repository_error)?,
+                        );
+                        let reason = departure_reason
+                            .ok_or_else(|| RepositoryError::new("breach reason is missing"))?;
+                        Ok(SharedExperience::restore_agreement_breach(
+                            claim,
+                            decode_bool(dismissed)?,
+                            RelationalConstraintDeparture::new(agreement_claim_id, reason),
+                        ))
+                    } else {
+                        Ok(SharedExperience::restore(
+                            kind,
+                            claim,
+                            decode_bool(dismissed)?,
+                        ))
+                    }
+                },
+            )
             .collect()
     }
 
@@ -3546,6 +3639,30 @@ fn validate_exact_support(
     Ok((has_person, has_counterpart))
 }
 
+fn has_exact_counterpart_reason(
+    connection: &Connection,
+    support: &[EvidenceCitation],
+    reason: &str,
+) -> Result<bool, RepositoryError> {
+    for citation in support {
+        if citation.quote() != reason {
+            continue;
+        }
+        let speaker = connection
+            .query_row(
+                "SELECT speaker FROM conversation_evidence WHERE id = ?1",
+                [to_sql_id(citation.evidence_id().get())?],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(repository_error)?;
+        if speaker.is_some_and(|value| matches!(decode_speaker(value), Ok(Speaker::Counterpart))) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn agreement_applicable_time(candidate: &SharedAgreementCandidate) -> ApplicableTime {
     let start = candidate
         .effective_from()
@@ -3630,6 +3747,7 @@ const fn encode_shared_experience_kind(kind: SharedExperienceKind) -> i64 {
         SharedExperienceKind::SubstantiveDisagreement => 1,
         SharedExperienceKind::RelationshipChange => 2,
         SharedExperienceKind::SharedAchievement => 3,
+        SharedExperienceKind::AgreementBreach => 4,
     }
 }
 
@@ -3639,6 +3757,7 @@ fn decode_shared_experience_kind(value: i64) -> Result<SharedExperienceKind, Rep
         1 => Ok(SharedExperienceKind::SubstantiveDisagreement),
         2 => Ok(SharedExperienceKind::RelationshipChange),
         3 => Ok(SharedExperienceKind::SharedAchievement),
+        4 => Ok(SharedExperienceKind::AgreementBreach),
         _ => Err(RepositoryError::new(
             "invalid persisted shared experience kind",
         )),

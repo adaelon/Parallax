@@ -7,12 +7,13 @@ use std::{
 };
 
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, CoreError, DecisionImpact, DisputeState,
-    EvidenceCitation, EvidenceId, FrozenEvidenceBlock, FrozenMemoryDispute, FrozenRetrievalWindow,
-    InMemoryRepository, IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification,
-    RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SessionId,
-    SharedAgreementCandidateStatus, SharedAgreementRevision, SharedExperienceRepository,
-    SourceCurrentness, StructuredOperationRejectionReason, Timestamp, Uncertainty,
+    ActiveRelationalConstraint, ApplicableTime, Claim, ClaimId, ClaimOwner, CoreError,
+    DecisionImpact, DisputeState, EvidenceCitation, EvidenceId, FrozenEvidenceBlock,
+    FrozenMemoryDispute, FrozenRetrievalWindow, InMemoryRepository, IncrementingClock, MemoryCore,
+    MemoryRepository, PersonTurnClassification, RetrievalSnapshot, RetrievedContextItem,
+    RuntimeErrorKind, SessionId, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    SharedAgreementRevision, SharedExperienceKind, SharedExperienceRepository, SourceCurrentness,
+    StructuredOperationRejectionReason, Timestamp, Uncertainty, WorkingContext,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL,
@@ -31,6 +32,8 @@ const SHARED_EXPERIENCE_RESPONSE: &str = include_str!("fixtures/shared-experienc
 const SHARED_AGREEMENT_RESPONSE: &str = include_str!("fixtures/shared-agreement-response.json");
 const SHARED_AGREEMENT_ASSENT_RESPONSE: &str =
     include_str!("fixtures/shared-agreement-assent-response.json");
+const RELATIONAL_CONSTRAINT_DEPARTURE_RESPONSE: &str =
+    include_str!("fixtures/relational-constraint-departure-response.json");
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -609,6 +612,91 @@ fn agreement_boundaries_and_pending_exact_version_are_in_the_runtime_contract() 
             .evidence_ids()
             .contains(&EvidenceId::from_raw(3))
     );
+}
+
+#[test]
+fn active_constraint_and_reasoned_departure_share_the_strict_runtime_contract() {
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(SHARED_AGREEMENT_RESPONSE),
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(RELATIONAL_CONSTRAINT_DEPARTURE_RESPONSE),
+    ]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(1_000),
+    );
+    let first_context = core.freeze_working_context(&[]).unwrap();
+    let first = core
+        .run_counterpart_turn(
+            SessionId::new("chat"),
+            "我同意复盘时直接指出关键逃避。",
+            first_context,
+        )
+        .unwrap();
+    let agreement_claim_id = core
+        .resolve_shared_agreement(
+            first.pending_agreement_candidate_ids()[0],
+            SharedAgreementDecision::Confirm,
+        )
+        .unwrap()
+        .claim_id()
+        .unwrap();
+    let constraint = ActiveRelationalConstraint::new(
+        agreement_claim_id,
+        "复盘时直接指出关键逃避",
+        "双方共同项目复盘",
+        Timestamp::from_millis(2_000),
+        None,
+    )
+    .unwrap();
+    let context = WorkingContext::from_selected_evidence(Vec::new(), Timestamp::from_millis(3_000))
+        .with_active_relational_constraints(vec![constraint])
+        .unwrap();
+    let second = core
+        .run_counterpart_turn(SessionId::new("chat"), "请替我执行现实操作", context)
+        .unwrap();
+
+    assert_eq!(second.recorded_constraint_departure_ids().len(), 1);
+    assert_eq!(
+        core.repository()
+            .all_shared_experiences()
+            .unwrap()
+            .iter()
+            .filter(|experience| experience.kind() == SharedExperienceKind::AgreementBreach)
+            .count(),
+        1
+    );
+    let response_disclosure = core
+        .runtime()
+        .disclosures()
+        .iter()
+        .filter(|record| record.invocation() == InvocationKind::Response)
+        .nth(1)
+        .unwrap();
+    let request: Value = serde_json::from_str(response_disclosure.request_json()).unwrap();
+    let instructions = request["instructions"].as_str().unwrap();
+    assert!(instructions.contains("always below the constitution, safety boundaries"));
+    assert!(instructions.contains("depart_relational_constraint"));
+    let input: Value = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
+    let projected = &input["working_context"]["active_relational_constraints"][0];
+    assert_eq!(projected["agreement_claim_id"], agreement_claim_id.get());
+    assert_eq!(projected["scope"], "双方共同项目复盘");
+    assert_eq!(
+        projected["priority"],
+        "below_constitution_safety_and_action_authorization"
+    );
+    assert!(
+        request["text"]["format"]["schema"]
+            .to_string()
+            .contains("depart_relational_constraint")
+    );
+    assert!(response_disclosure.retrieved_sources().contains(
+        &OutboundContextSource::LedgerClaim {
+            claim_id: agreement_claim_id,
+        }
+    ));
 }
 
 #[test]

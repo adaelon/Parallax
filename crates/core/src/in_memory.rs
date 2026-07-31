@@ -228,9 +228,59 @@ impl SharedExperienceRepository for InMemoryRepository {
         &mut self,
         experience: SharedExperience,
     ) -> Result<(), RepositoryError> {
-        if experience.kind() == SharedExperienceKind::Agreement {
+        if matches!(
+            experience.kind(),
+            SharedExperienceKind::Agreement | SharedExperienceKind::AgreementBreach
+        ) {
             return Err(RepositoryError::new(
-                "shared agreements require a person-confirmed candidate",
+                "agreements and agreement breaches require their typed commit path",
+            ));
+        }
+        validate_shared_experience_storage(&self.evidence, &experience)?;
+        let claim_id = experience.claim().id();
+        if self.claims.contains_key(&claim_id) || self.shared_experiences.contains_key(&claim_id) {
+            return Err(RepositoryError::new("duplicate shared claim id"));
+        }
+        self.claims.insert(claim_id, experience.claim().clone());
+        self.shared_experiences.insert(claim_id, experience);
+        Ok(())
+    }
+
+    fn commit_relational_constraint_departure(
+        &mut self,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError> {
+        let departure = experience.constraint_departure().ok_or_else(|| {
+            RepositoryError::new("agreement breach requires a constraint departure")
+        })?;
+        if experience.kind() != SharedExperienceKind::AgreementBreach
+            || departure.reason().trim().is_empty()
+        {
+            return Err(RepositoryError::new(
+                "invalid relational constraint departure",
+            ));
+        }
+        let agreement = self
+            .shared_experiences
+            .get(&departure.agreement_claim_id())
+            .filter(|agreement| agreement.kind() == SharedExperienceKind::Agreement)
+            .ok_or_else(|| RepositoryError::new("departed agreement does not exist"))?;
+        if !agreement
+            .claim()
+            .support()
+            .iter()
+            .all(|citation| experience.claim().support().contains(citation))
+            || !experience.claim().support().iter().any(|citation| {
+                self.evidence
+                    .get(&citation.evidence_id())
+                    .is_some_and(|source| {
+                        source.speaker() == Speaker::Counterpart
+                            && citation.quote() == departure.reason()
+                    })
+            })
+        {
+            return Err(RepositoryError::new(
+                "agreement breach must preserve agreement support and exact reason evidence",
             ));
         }
         validate_shared_experience_storage(&self.evidence, &experience)?;

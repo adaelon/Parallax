@@ -531,6 +531,7 @@ pub enum SharedExperienceKind {
     SubstantiveDisagreement,
     RelationshipChange,
     SharedAchievement,
+    AgreementBreach,
 }
 
 impl SharedExperienceKind {
@@ -850,6 +851,123 @@ pub struct SharedAgreementResolution {
     claim_id: Option<ClaimId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationalConstraintPriority {
+    BelowConstitutionSafetyAndActionAuthorization,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveRelationalConstraint {
+    agreement_claim_id: ClaimId,
+    statement: String,
+    scope: String,
+    effective_from: Timestamp,
+    effective_until: Option<Timestamp>,
+}
+
+impl ActiveRelationalConstraint {
+    /// Constructs a constraint projected from one already-confirmed agreement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationalConstraintError`] when the immutable agreement
+    /// boundaries cannot form a usable runtime constraint.
+    pub fn new(
+        agreement_claim_id: ClaimId,
+        statement: impl Into<String>,
+        scope: impl Into<String>,
+        effective_from: Timestamp,
+        effective_until: Option<Timestamp>,
+    ) -> Result<Self, RelationalConstraintError> {
+        let statement = statement.into();
+        let scope = scope.into();
+        if statement.trim().is_empty() || scope.trim().is_empty() {
+            return Err(RelationalConstraintError::EmptyBoundary);
+        }
+        if effective_until.is_some_and(|until| until.as_millis() < effective_from.as_millis()) {
+            return Err(RelationalConstraintError::InvalidValidity);
+        }
+        Ok(Self {
+            agreement_claim_id,
+            statement,
+            scope,
+            effective_from,
+            effective_until,
+        })
+    }
+
+    #[must_use]
+    pub const fn agreement_claim_id(&self) -> ClaimId {
+        self.agreement_claim_id
+    }
+
+    #[must_use]
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn effective_from(&self) -> Timestamp {
+        self.effective_from
+    }
+
+    #[must_use]
+    pub const fn effective_until(&self) -> Option<Timestamp> {
+        self.effective_until
+    }
+
+    #[must_use]
+    pub const fn priority(&self) -> RelationalConstraintPriority {
+        RelationalConstraintPriority::BelowConstitutionSafetyAndActionAuthorization
+    }
+
+    #[must_use]
+    pub const fn is_active_at(&self, at: Timestamp) -> bool {
+        at.as_millis() >= self.effective_from.as_millis()
+            && match self.effective_until {
+                Some(until) => at.as_millis() <= until.as_millis(),
+                None => true,
+            }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationalConstraintError {
+    EmptyBoundary,
+    InvalidValidity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationalConstraintDeparture {
+    agreement_claim_id: ClaimId,
+    reason: String,
+}
+
+impl RelationalConstraintDeparture {
+    #[must_use]
+    pub fn new(agreement_claim_id: ClaimId, reason: impl Into<String>) -> Self {
+        Self {
+            agreement_claim_id,
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn agreement_claim_id(&self) -> ClaimId {
+        self.agreement_claim_id
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 impl SharedAgreementResolution {
     #[must_use]
     pub const fn new(
@@ -885,6 +1003,7 @@ pub struct SharedExperience {
     kind: SharedExperienceKind,
     claim: Claim,
     ceremony_dismissed: bool,
+    constraint_departure: Option<RelationalConstraintDeparture>,
 }
 
 impl SharedExperience {
@@ -893,6 +1012,19 @@ impl SharedExperience {
             kind,
             claim,
             ceremony_dismissed: false,
+            constraint_departure: None,
+        }
+    }
+
+    pub(crate) const fn agreement_breach(
+        claim: Claim,
+        departure: RelationalConstraintDeparture,
+    ) -> Self {
+        Self {
+            kind: SharedExperienceKind::AgreementBreach,
+            claim,
+            ceremony_dismissed: false,
+            constraint_departure: Some(departure),
         }
     }
 
@@ -907,6 +1039,22 @@ impl SharedExperience {
             kind,
             claim,
             ceremony_dismissed,
+            constraint_departure: None,
+        }
+    }
+
+    /// Restores a constraint departure from trusted persistence.
+    #[must_use]
+    pub const fn restore_agreement_breach(
+        claim: Claim,
+        ceremony_dismissed: bool,
+        departure: RelationalConstraintDeparture,
+    ) -> Self {
+        Self {
+            kind: SharedExperienceKind::AgreementBreach,
+            claim,
+            ceremony_dismissed,
+            constraint_departure: Some(departure),
         }
     }
 
@@ -923,6 +1071,11 @@ impl SharedExperience {
     #[must_use]
     pub const fn ceremony_dismissed(&self) -> bool {
         self.ceremony_dismissed
+    }
+
+    #[must_use]
+    pub const fn constraint_departure(&self) -> Option<&RelationalConstraintDeparture> {
+        self.constraint_departure.as_ref()
     }
 
     pub(crate) fn dismiss_ceremony(&mut self) {
@@ -1011,6 +1164,7 @@ pub struct WorkingContext {
     evidence: Vec<ConversationEvidence>,
     retrieved: Vec<RetrievedContextItem>,
     retrieval_snapshot: Option<RetrievalSnapshot>,
+    active_relational_constraints: Vec<ActiveRelationalConstraint>,
     decision_impact: DecisionImpact,
     frozen_at: Timestamp,
 }
@@ -1021,6 +1175,7 @@ impl WorkingContext {
             evidence,
             retrieved: Vec::new(),
             retrieval_snapshot: None,
+            active_relational_constraints: Vec::new(),
             decision_impact: DecisionImpact::Ordinary,
             frozen_at,
         }
@@ -1068,6 +1223,34 @@ impl WorkingContext {
         Ok(self)
     }
 
+    /// Attaches the task-relevant agreement constraints selected by trusted
+    /// retrieval. Every constraint must be active at this snapshot and unique.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkingContextError`] for an expired/future or duplicate
+    /// agreement projection.
+    pub fn with_active_relational_constraints(
+        mut self,
+        constraints: Vec<ActiveRelationalConstraint>,
+    ) -> Result<Self, WorkingContextError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for constraint in &constraints {
+            if !constraint.is_active_at(self.frozen_at) {
+                return Err(WorkingContextError::InactiveRelationalConstraint(
+                    constraint.agreement_claim_id(),
+                ));
+            }
+            if !seen.insert(constraint.agreement_claim_id()) {
+                return Err(WorkingContextError::DuplicateRelationalConstraint(
+                    constraint.agreement_claim_id(),
+                ));
+            }
+        }
+        self.active_relational_constraints = constraints;
+        Ok(self)
+    }
+
     #[must_use]
     pub const fn with_decision_impact(mut self, impact: DecisionImpact) -> Self {
         self.decision_impact = impact;
@@ -1087,6 +1270,11 @@ impl WorkingContext {
     #[must_use]
     pub const fn retrieval_snapshot(&self) -> Option<&RetrievalSnapshot> {
         self.retrieval_snapshot.as_ref()
+    }
+
+    #[must_use]
+    pub fn active_relational_constraints(&self) -> &[ActiveRelationalConstraint] {
+        &self.active_relational_constraints
     }
 
     #[must_use]
@@ -1438,6 +1626,8 @@ pub enum WorkingContextError {
     BudgetExceeded,
     TokenAccountingMismatch,
     EmptyEvidenceWindow,
+    InactiveRelationalConstraint(ClaimId),
+    DuplicateRelationalConstraint(ClaimId),
 }
 
 impl fmt::Display for WorkingContextError {
@@ -1448,6 +1638,12 @@ impl fmt::Display for WorkingContextError {
                 "retrieved working context token accounting does not match its frozen snapshot"
             }
             Self::EmptyEvidenceWindow => "retrieved working context contains an empty window",
+            Self::InactiveRelationalConstraint(_) => {
+                "working context contains a relational constraint outside its validity interval"
+            }
+            Self::DuplicateRelationalConstraint(_) => {
+                "working context contains the same relational constraint more than once"
+            }
         })
     }
 }
@@ -1645,6 +1841,7 @@ pub struct RuntimeResponse {
     judgment_proposals: Vec<JudgmentProposal>,
     shared_experience_proposals: Vec<SharedExperienceProposal>,
     shared_agreement_assents: Vec<SharedAgreementAssent>,
+    relational_constraint_departures: Vec<RelationalConstraintDeparture>,
     unsupported_operations: Vec<UnsupportedStructuredOperation>,
 }
 
@@ -1657,6 +1854,7 @@ impl RuntimeResponse {
             judgment_proposals: Vec::new(),
             shared_experience_proposals: Vec::new(),
             shared_agreement_assents: Vec::new(),
+            relational_constraint_departures: Vec::new(),
             unsupported_operations: Vec::new(),
         }
     }
@@ -1682,6 +1880,15 @@ impl RuntimeResponse {
     #[must_use]
     pub fn with_shared_agreement_assent(mut self, assent: SharedAgreementAssent) -> Self {
         self.shared_agreement_assents.push(assent);
+        self
+    }
+
+    #[must_use]
+    pub fn with_relational_constraint_departure(
+        mut self,
+        departure: RelationalConstraintDeparture,
+    ) -> Self {
+        self.relational_constraint_departures.push(departure);
         self
     }
 
@@ -1719,6 +1926,11 @@ impl RuntimeResponse {
     #[must_use]
     pub fn shared_agreement_assents(&self) -> &[SharedAgreementAssent] {
         &self.shared_agreement_assents
+    }
+
+    #[must_use]
+    pub fn relational_constraint_departures(&self) -> &[RelationalConstraintDeparture] {
+        &self.relational_constraint_departures
     }
 
     #[must_use]
@@ -1808,6 +2020,7 @@ pub struct JudgmentRejection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SharedExperienceRejectionReason {
     EmptyStatement,
+    AgreementBreachRequiresConstraintDeparture,
     MissingPersonSupport,
     EvidenceOutsideWorkingContext(EvidenceId),
     EvidenceNotFromPerson(EvidenceId),
@@ -1866,6 +2079,43 @@ impl SharedAgreementAssentRejection {
 pub struct SharedExperienceRejection {
     proposal_index: usize,
     reason: SharedExperienceRejectionReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelationalConstraintDepartureRejectionReason {
+    ConstraintNotActive(ClaimId),
+    AgreementNotFound(ClaimId),
+    EmptyReason,
+    ReasonNotInResponse,
+    DuplicateDeparture(ClaimId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationalConstraintDepartureRejection {
+    proposal_index: usize,
+    reason: RelationalConstraintDepartureRejectionReason,
+}
+
+impl RelationalConstraintDepartureRejection {
+    pub(crate) const fn new(
+        proposal_index: usize,
+        reason: RelationalConstraintDepartureRejectionReason,
+    ) -> Self {
+        Self {
+            proposal_index,
+            reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn proposal_index(&self) -> usize {
+        self.proposal_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &RelationalConstraintDepartureRejectionReason {
+        &self.reason
+    }
 }
 
 impl SharedExperienceRejection {
@@ -1954,6 +2204,8 @@ pub struct TurnOutcome {
     rejected_shared_experiences: Vec<SharedExperienceRejection>,
     assented_agreement_candidate_ids: Vec<SharedAgreementCandidateId>,
     rejected_agreement_assents: Vec<SharedAgreementAssentRejection>,
+    recorded_constraint_departure_ids: Vec<ClaimId>,
+    rejected_constraint_departures: Vec<RelationalConstraintDepartureRejection>,
     rejected_operations: Vec<StructuredOperationRejection>,
     validated_citations: Vec<EvidenceCitation>,
 }
@@ -1976,6 +2228,8 @@ impl TurnOutcome {
             rejected_shared_experiences: Vec::new(),
             assented_agreement_candidate_ids: Vec::new(),
             rejected_agreement_assents: Vec::new(),
+            recorded_constraint_departure_ids: Vec::new(),
+            rejected_constraint_departures: Vec::new(),
             rejected_operations: Vec::new(),
             validated_citations,
         }
@@ -2010,6 +2264,16 @@ impl TurnOutcome {
     ) -> Self {
         self.assented_agreement_candidate_ids = assented;
         self.rejected_agreement_assents = rejected;
+        self
+    }
+
+    pub(crate) fn with_constraint_departures(
+        mut self,
+        recorded: Vec<ClaimId>,
+        rejected: Vec<RelationalConstraintDepartureRejection>,
+    ) -> Self {
+        self.recorded_constraint_departure_ids = recorded;
+        self.rejected_constraint_departures = rejected;
         self
     }
 
@@ -2069,6 +2333,16 @@ impl TurnOutcome {
     #[must_use]
     pub fn rejected_agreement_assents(&self) -> &[SharedAgreementAssentRejection] {
         &self.rejected_agreement_assents
+    }
+
+    #[must_use]
+    pub fn recorded_constraint_departure_ids(&self) -> &[ClaimId] {
+        &self.recorded_constraint_departure_ids
+    }
+
+    #[must_use]
+    pub fn rejected_constraint_departures(&self) -> &[RelationalConstraintDepartureRejection] {
+        &self.rejected_constraint_departures
     }
 
     #[must_use]
