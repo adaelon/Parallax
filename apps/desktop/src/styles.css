@@ -275,6 +275,112 @@ h1 {
   font-size: 0.8rem;
 }
 
+.ceremony-layer {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1.25rem;
+  background: rgb(8 10 8 / 72%);
+  backdrop-filter: blur(12px);
+}
+
+.ceremony-card {
+  width: min(100%, 36rem);
+  max-height: min(88vh, 46rem);
+  padding: clamp(1.3rem, 4vw, 2rem);
+  overflow-y: auto;
+  border: 1px solid rgb(169 195 159 / 26%);
+  border-radius: 1.4rem;
+  background:
+    radial-gradient(circle at 100% 0, rgb(143 177 132 / 14%), transparent 18rem),
+    #1b1f19;
+  box-shadow: 0 2rem 7rem rgb(0 0 0 / 55%);
+}
+
+.ceremony-card h2 {
+  margin: 0.55rem 0 0;
+  font-family: Georgia, "Noto Serif SC", serif;
+  font-size: clamp(1.65rem, 5vw, 2.35rem);
+  font-weight: 500;
+}
+
+.ceremony-statement {
+  margin: 1rem 0 1.2rem;
+  color: #eff1ea;
+  font-size: 1.05rem;
+  line-height: 1.7;
+}
+
+.ceremony-evidence {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.ceremony-evidence blockquote {
+  display: grid;
+  gap: 0.32rem;
+  margin: 0;
+  padding: 0.8rem 0.9rem;
+  border-left: 0.18rem solid #71836b;
+  border-radius: 0.35rem 0.8rem 0.8rem 0.35rem;
+  color: #cbd0c7;
+  background: rgb(255 255 255 / 4%);
+  line-height: 1.55;
+}
+
+.ceremony-evidence blockquote span {
+  color: #91a48a;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.ceremony-note,
+.ceremony-queue {
+  color: #8e9489;
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+.ceremony-note {
+  margin: 1rem 0 0;
+}
+
+.ceremony-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.7rem;
+  margin-top: 1.25rem;
+}
+
+.ceremony-actions button {
+  padding: 0.7rem 1rem;
+  border: 0;
+  border-radius: 0.75rem;
+  color: #11150f;
+  background: #abc5a1;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.ceremony-actions button.secondary-action {
+  border: 1px solid rgb(255 255 255 / 12%);
+  color: #b9bdb5;
+  background: transparent;
+}
+
+.ceremony-actions button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.ceremony-queue {
+  margin: 0.8rem 0 0;
+  text-align: right;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;

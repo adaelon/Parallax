@@ -6,8 +6,10 @@ use std::{
 };
 
 use eam_core::{
-    Clock, ConversationEvidence, CounterpartRuntime, EvidenceId, MemoryCore, MemoryRepository,
-    SessionId, Speaker, SystemClock, WorkingContext,
+    ClaimId, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
+    MemoryCore, MemoryRepository, SessionId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementResolution, SharedExperienceKind,
+    SharedExperienceRepository, Speaker, SystemClock, WorkingContext,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_ingestion::{
@@ -78,6 +80,34 @@ pub struct ConversationTurnView {
 pub struct ConversationTurnResult {
     person: ConversationTurnView,
     counterpart: ConversationTurnView,
+    ceremonies: Vec<SharedExperienceCeremonyView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedExperienceCeremonyEvidenceView {
+    evidence_id: u64,
+    speaker: &'static str,
+    quote: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedExperienceCeremonyView {
+    target_id: u64,
+    target_kind: &'static str,
+    experience_kind: &'static str,
+    admission: &'static str,
+    statement: String,
+    evidence: Vec<SharedExperienceCeremonyEvidenceView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedAgreementResolutionView {
+    candidate_id: u64,
+    status: &'static str,
+    claim_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -185,6 +215,43 @@ impl ManagedHost {
     pub fn send_message(&self, verbatim: String) -> Result<ConversationTurnResult, String> {
         match &mut *self.lock() {
             HostSlot::Ready(host) => send_message_with_retrieval(&mut host.core, verbatim),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn list_shared_experience_ceremonies(
+        &self,
+    ) -> Result<Vec<SharedExperienceCeremonyView>, String> {
+        match &*self.lock() {
+            HostSlot::Ready(host) => list_shared_experience_ceremonies_from_core(&host.core),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn resolve_shared_agreement(
+        &self,
+        candidate_id: u64,
+        confirm: bool,
+    ) -> Result<SharedAgreementResolutionView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                resolve_shared_agreement_from_core(&mut host.core, candidate_id, confirm)
+            }
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn dismiss_shared_experience_ceremony(&self, claim_id: u64) -> Result<(), String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                dismiss_shared_experience_ceremony_from_core(&mut host.core, claim_id)
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -350,7 +417,7 @@ fn send_message_with_core<R, T, C>(
     verbatim: String,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: MemoryRepository,
+    R: SharedExperienceRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -374,7 +441,7 @@ fn send_message_with_retrieval<R, T, C>(
     verbatim: String,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: MemoryRepository + RetrievalRepository,
+    R: SharedExperienceRepository + RetrievalRepository,
     <R as RetrievalRepository>::Error: std::fmt::Display,
     T: CounterpartRuntime,
     C: Clock,
@@ -413,7 +480,7 @@ fn run_message_with_context<R, T, C>(
     working_context: WorkingContext,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: MemoryRepository,
+    R: SharedExperienceRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -426,10 +493,150 @@ where
         .map_err(|error| error.to_string())?;
     let person = conversation_turn(core, outcome.person_evidence_id())?;
     let counterpart = conversation_turn(core, outcome.counterpart_evidence_id())?;
+    let ceremonies = list_shared_experience_ceremonies_from_core(core)?;
     Ok(ConversationTurnResult {
         person,
         counterpart,
+        ceremonies,
     })
+}
+
+fn list_shared_experience_ceremonies_from_core<R, T, C>(
+    core: &MemoryCore<R, T, C>,
+) -> Result<Vec<SharedExperienceCeremonyView>, String>
+where
+    R: SharedExperienceRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    let repository = core.repository();
+    let mut ceremonies = Vec::new();
+    for candidate in repository
+        .all_shared_agreement_candidates()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|candidate| candidate.status() == SharedAgreementCandidateStatus::AwaitingPerson)
+    {
+        ceremonies.push(SharedExperienceCeremonyView {
+            target_id: candidate.id().get(),
+            target_kind: "agreementCandidate",
+            experience_kind: "agreement",
+            admission: "confirmationRequired",
+            statement: candidate.statement().to_owned(),
+            evidence: ceremony_evidence(repository, candidate.support())?,
+        });
+    }
+    for experience in repository
+        .all_shared_experiences()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|experience| {
+            experience.kind() != SharedExperienceKind::Agreement && !experience.ceremony_dismissed()
+        })
+    {
+        ceremonies.push(SharedExperienceCeremonyView {
+            target_id: experience.claim().id().get(),
+            target_kind: "sharedExperience",
+            experience_kind: encode_shared_experience_kind(experience.kind()),
+            admission: "nonVetoNotice",
+            statement: experience.claim().statement().to_owned(),
+            evidence: ceremony_evidence(repository, experience.claim().support())?,
+        });
+    }
+    Ok(ceremonies)
+}
+
+fn ceremony_evidence<R: MemoryRepository>(
+    repository: &R,
+    support: &[EvidenceCitation],
+) -> Result<Vec<SharedExperienceCeremonyEvidenceView>, String> {
+    support
+        .iter()
+        .map(|citation| {
+            let source = repository
+                .evidence(citation.evidence_id())
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "ceremony evidence {} is missing",
+                        citation.evidence_id().get()
+                    )
+                })?;
+            Ok(SharedExperienceCeremonyEvidenceView {
+                evidence_id: source.id().get(),
+                speaker: encode_speaker(source.speaker()),
+                quote: citation.quote().to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn resolve_shared_agreement_from_core<R, T, C>(
+    core: &mut MemoryCore<R, T, C>,
+    candidate_id: u64,
+    confirm: bool,
+) -> Result<SharedAgreementResolutionView, String>
+where
+    R: SharedExperienceRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    let resolution = core
+        .resolve_shared_agreement(
+            eam_core::SharedAgreementCandidateId::from_raw(candidate_id),
+            if confirm {
+                SharedAgreementDecision::Confirm
+            } else {
+                SharedAgreementDecision::Defer
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(SharedAgreementResolutionView::from(resolution))
+}
+
+fn dismiss_shared_experience_ceremony_from_core<R, T, C>(
+    core: &mut MemoryCore<R, T, C>,
+    claim_id: u64,
+) -> Result<(), String>
+where
+    R: SharedExperienceRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    core.dismiss_shared_experience_ceremony(ClaimId::from_raw(claim_id))
+        .map_err(|error| error.to_string())?
+        .then_some(())
+        .ok_or_else(|| format!("shared experience {claim_id} does not exist"))
+}
+
+const fn encode_shared_experience_kind(kind: SharedExperienceKind) -> &'static str {
+    match kind {
+        SharedExperienceKind::Agreement => "agreement",
+        SharedExperienceKind::SubstantiveDisagreement => "substantiveDisagreement",
+        SharedExperienceKind::RelationshipChange => "relationshipChange",
+        SharedExperienceKind::SharedAchievement => "sharedAchievement",
+    }
+}
+
+const fn encode_speaker(speaker: Speaker) -> &'static str {
+    match speaker {
+        Speaker::Person => "person",
+        Speaker::Counterpart => "counterpart",
+    }
+}
+
+impl From<SharedAgreementResolution> for SharedAgreementResolutionView {
+    fn from(value: SharedAgreementResolution) -> Self {
+        Self {
+            candidate_id: value.candidate_id().get(),
+            status: match value.status() {
+                SharedAgreementCandidateStatus::AwaitingPerson => "awaitingPerson",
+                SharedAgreementCandidateStatus::Deferred => "deferred",
+                SharedAgreementCandidateStatus::Confirmed => "confirmed",
+            },
+            claim_id: value.claim_id().map(ClaimId::get),
+        }
+    }
 }
 
 fn validate_message(verbatim: &str) -> Result<(), String> {
@@ -608,8 +815,8 @@ mod tests {
     };
 
     use eam_core::{
-        InMemoryRepository, IncrementingClock, PersonTurnClassification, RuntimeResponse,
-        ScriptedRuntime,
+        ClaimOwner, InMemoryRepository, IncrementingClock, PersonTurnClassification,
+        RuntimeResponse, ScriptedRuntime, SharedExperienceProposal, Timestamp,
     };
     use eam_ingestion::{ArchiveInput, ArchiveReceipt};
     use eam_vault::VaultKey;
@@ -760,6 +967,97 @@ mod tests {
                 .map(ConversationEvidence::verbatim)
                 .collect::<Vec<_>>(),
             vec!["第一问", "第一答"]
+        );
+    }
+
+    #[test]
+    fn agreement_ceremony_is_trusted_state_and_confirmation_writes_shared_claim() {
+        let response = RuntimeResponse::new("我也同意直接指出关键逃避。").with_shared_experience(
+            SharedExperienceProposal::new(
+                SharedExperienceKind::Agreement,
+                "发现关键逃避时直接指出",
+                vec![EvidenceCitation::new(
+                    EvidenceId::from_raw(1),
+                    "我同意直接指出关键逃避",
+                )],
+                "我也同意直接指出关键逃避",
+                Timestamp::from_millis(50_000),
+            ),
+        );
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+            IncrementingClock::new(50_000),
+        );
+
+        let result =
+            send_message_with_core(&mut core, "我同意直接指出关键逃避。".to_owned()).unwrap();
+        assert_eq!(result.ceremonies.len(), 1);
+        let ceremony = &result.ceremonies[0];
+        assert_eq!(ceremony.target_kind, "agreementCandidate");
+        assert_eq!(ceremony.admission, "confirmationRequired");
+        assert_eq!(ceremony.evidence.len(), 2);
+        assert!(core.repository().all_claims().unwrap().is_empty());
+
+        let resolution =
+            resolve_shared_agreement_from_core(&mut core, ceremony.target_id, true).unwrap();
+        assert_eq!(resolution.status, "confirmed");
+        assert_eq!(
+            core.repository()
+                .all_claims()
+                .unwrap()
+                .iter()
+                .filter(|claim| claim.owner() == ClaimOwner::Shared)
+                .count(),
+            1
+        );
+        assert!(
+            list_shared_experience_ceremonies_from_core(&core)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn disagreement_notice_can_close_without_removing_shared_history() {
+        let response = RuntimeResponse::new("我不同意把它视为无关紧要。").with_shared_experience(
+            SharedExperienceProposal::new(
+                SharedExperienceKind::SubstantiveDisagreement,
+                "双方对这件事的重要性持不相容立场",
+                vec![EvidenceCitation::new(
+                    EvidenceId::from_raw(1),
+                    "这件事无关紧要",
+                )],
+                "我不同意把它视为无关紧要",
+                Timestamp::from_millis(60_000),
+            ),
+        );
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+            IncrementingClock::new(60_000),
+        );
+
+        let result = send_message_with_core(&mut core, "这件事无关紧要。".to_owned()).unwrap();
+        assert_eq!(result.ceremonies.len(), 1);
+        let ceremony = &result.ceremonies[0];
+        assert_eq!(ceremony.experience_kind, "substantiveDisagreement");
+        assert_eq!(ceremony.admission, "nonVetoNotice");
+        dismiss_shared_experience_ceremony_from_core(&mut core, ceremony.target_id).unwrap();
+
+        assert!(
+            list_shared_experience_ceremonies_from_core(&core)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            core.repository()
+                .all_claims()
+                .unwrap()
+                .iter()
+                .filter(|claim| claim.owner() == ClaimOwner::Shared)
+                .count(),
+            1
         );
     }
 

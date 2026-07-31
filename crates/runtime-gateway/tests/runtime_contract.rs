@@ -26,6 +26,7 @@ const CLASSIFICATION_RESPONSE: &str = include_str!("fixtures/classification-resp
 const TURN_RESPONSE: &str = include_str!("fixtures/turn-response.json");
 const UNSUPPORTED_OPERATION_RESPONSE: &str =
     include_str!("fixtures/unsupported-operation-response.json");
+const SHARED_EXPERIENCE_RESPONSE: &str = include_str!("fixtures/shared-experience-response.json");
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -480,6 +481,44 @@ fn core_rejects_an_operation_outside_the_structured_whitelist() {
         &StructuredOperationRejectionReason::NotWhitelisted("write_vault".to_owned())
     );
     assert!(core.repository().all_claims().unwrap().is_empty());
+}
+
+#[test]
+fn shared_experience_operation_is_whitelisted_and_keeps_typed_evidence() {
+    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(SHARED_EXPERIENCE_RESPONSE)]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(1_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+
+    let outcome = core
+        .run_counterpart_turn(SessionId::new("chat"), "这件事无关紧要。", context)
+        .unwrap();
+
+    assert_eq!(outcome.admitted_shared_experience_ids().len(), 1);
+    assert!(outcome.pending_agreement_candidate_ids().is_empty());
+    assert!(outcome.rejected_shared_experiences().is_empty());
+    assert!(outcome.rejected_operations().is_empty());
+    let shared = core
+        .repository()
+        .all_claims()
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.owner() == ClaimOwner::Shared)
+        .unwrap();
+    assert_eq!(shared.support().len(), 2);
+
+    let request: Value =
+        serde_json::from_str(core.runtime().disclosures().last().unwrap().request_json()).unwrap();
+    let operations = &request["text"]["format"]["schema"]["properties"]["operations"];
+    assert!(operations.to_string().contains("propose_shared_experience"));
+    let instructions = request["instructions"].as_str().unwrap();
+    assert!(instructions.contains("substantive disagreement with incompatible"));
+    assert!(
+        instructions.contains("if removing the digital counterpart leaves the event fully intact")
+    );
 }
 
 #[test]

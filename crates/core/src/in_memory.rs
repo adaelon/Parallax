@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use crate::{
     Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus,
     ConversationEvidence, EvidenceId, ForgetReceipt, ForgetRepository, ForgetTarget,
-    MemoryRepository, RepositoryError, Timestamp,
+    MemoryRepository, RepositoryError, SharedAgreementCandidate, SharedAgreementCandidateId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
+    SharedExperience, SharedExperienceKind, SharedExperienceRepository, Speaker, Timestamp,
 };
 
 #[derive(Debug)]
@@ -12,6 +14,9 @@ pub struct InMemoryRepository {
     next_claim_id: u64,
     evidence: BTreeMap<EvidenceId, ConversationEvidence>,
     claims: BTreeMap<ClaimId, Claim>,
+    next_shared_agreement_candidate_id: u64,
+    shared_agreement_candidates: BTreeMap<SharedAgreementCandidateId, SharedAgreementCandidate>,
+    shared_experiences: BTreeMap<ClaimId, SharedExperience>,
     deletion_intents: BTreeMap<ForgetTarget, ForgetReceipt>,
     next_deletion_intent_id: u64,
 }
@@ -30,10 +35,208 @@ impl InMemoryRepository {
             next_claim_id: 1,
             evidence: BTreeMap::new(),
             claims: BTreeMap::new(),
+            next_shared_agreement_candidate_id: 1,
+            shared_agreement_candidates: BTreeMap::new(),
+            shared_experiences: BTreeMap::new(),
             deletion_intents: BTreeMap::new(),
             next_deletion_intent_id: 1,
         }
     }
+}
+
+impl SharedExperienceRepository for InMemoryRepository {
+    fn next_shared_agreement_candidate_id(&mut self) -> SharedAgreementCandidateId {
+        let id = SharedAgreementCandidateId::from_raw(self.next_shared_agreement_candidate_id);
+        self.next_shared_agreement_candidate_id = self
+            .next_shared_agreement_candidate_id
+            .checked_add(1)
+            .expect("shared agreement candidate identifier space exhausted");
+        id
+    }
+
+    fn stage_shared_agreement_candidate(
+        &mut self,
+        candidate: SharedAgreementCandidate,
+    ) -> Result<(), RepositoryError> {
+        validate_candidate_storage(&self.evidence, &candidate)?;
+        if candidate.status() != SharedAgreementCandidateStatus::AwaitingPerson
+            || candidate.decided_at().is_some()
+            || candidate.claim_id().is_some()
+        {
+            return Err(RepositoryError::new(
+                "new shared agreement candidate must await person confirmation",
+            ));
+        }
+        if self
+            .shared_agreement_candidates
+            .insert(candidate.id(), candidate)
+            .is_some()
+        {
+            return Err(RepositoryError::new(
+                "duplicate shared agreement candidate id",
+            ));
+        }
+        Ok(())
+    }
+
+    fn shared_agreement_candidate(
+        &self,
+        id: SharedAgreementCandidateId,
+    ) -> Result<Option<SharedAgreementCandidate>, RepositoryError> {
+        Ok(self.shared_agreement_candidates.get(&id).cloned())
+    }
+
+    fn commit_shared_agreement_decision(
+        &mut self,
+        id: SharedAgreementCandidateId,
+        decision: SharedAgreementDecision,
+        confirmed: Option<SharedExperience>,
+        decided_at: Timestamp,
+    ) -> Result<SharedAgreementResolution, RepositoryError> {
+        let candidate = self
+            .shared_agreement_candidates
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| RepositoryError::new("shared agreement candidate does not exist"))?;
+        if candidate.status() != SharedAgreementCandidateStatus::AwaitingPerson {
+            return Err(RepositoryError::new(
+                "shared agreement candidate is not awaiting person confirmation",
+            ));
+        }
+
+        let (status, claim_id) = match decision {
+            SharedAgreementDecision::Confirm => {
+                let experience = confirmed.ok_or_else(|| {
+                    RepositoryError::new("confirmed agreement requires a shared claim")
+                })?;
+                if experience.kind() != SharedExperienceKind::Agreement
+                    || experience.claim().statement() != candidate.statement()
+                    || experience.claim().support() != candidate.support()
+                {
+                    return Err(RepositoryError::new(
+                        "confirmed agreement does not match its immutable candidate",
+                    ));
+                }
+                validate_shared_experience_storage(&self.evidence, &experience)?;
+                let claim_id = experience.claim().id();
+                if self.claims.contains_key(&claim_id)
+                    || self.shared_experiences.contains_key(&claim_id)
+                {
+                    return Err(RepositoryError::new("duplicate shared claim id"));
+                }
+                self.claims.insert(claim_id, experience.claim().clone());
+                self.shared_experiences.insert(claim_id, experience);
+                (SharedAgreementCandidateStatus::Confirmed, Some(claim_id))
+            }
+            SharedAgreementDecision::Defer => {
+                if confirmed.is_some() {
+                    return Err(RepositoryError::new(
+                        "deferred agreement cannot append a shared claim",
+                    ));
+                }
+                (SharedAgreementCandidateStatus::Deferred, None)
+            }
+        };
+
+        self.shared_agreement_candidates
+            .get_mut(&id)
+            .expect("validated candidate remains present")
+            .resolve(status, decided_at, claim_id);
+        Ok(SharedAgreementResolution::new(id, status, claim_id))
+    }
+
+    fn commit_shared_experience(
+        &mut self,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError> {
+        if experience.kind() == SharedExperienceKind::Agreement {
+            return Err(RepositoryError::new(
+                "shared agreements require a person-confirmed candidate",
+            ));
+        }
+        validate_shared_experience_storage(&self.evidence, &experience)?;
+        let claim_id = experience.claim().id();
+        if self.claims.contains_key(&claim_id) || self.shared_experiences.contains_key(&claim_id) {
+            return Err(RepositoryError::new("duplicate shared claim id"));
+        }
+        self.claims.insert(claim_id, experience.claim().clone());
+        self.shared_experiences.insert(claim_id, experience);
+        Ok(())
+    }
+
+    fn all_shared_agreement_candidates(
+        &self,
+    ) -> Result<Vec<SharedAgreementCandidate>, RepositoryError> {
+        Ok(self.shared_agreement_candidates.values().cloned().collect())
+    }
+
+    fn all_shared_experiences(&self) -> Result<Vec<SharedExperience>, RepositoryError> {
+        Ok(self.shared_experiences.values().cloned().collect())
+    }
+
+    fn dismiss_shared_experience_ceremony(
+        &mut self,
+        claim_id: ClaimId,
+    ) -> Result<bool, RepositoryError> {
+        let Some(experience) = self.shared_experiences.get_mut(&claim_id) else {
+            return Ok(false);
+        };
+        experience.dismiss_ceremony();
+        Ok(true)
+    }
+}
+
+fn validate_candidate_storage(
+    evidence: &BTreeMap<EvidenceId, ConversationEvidence>,
+    candidate: &SharedAgreementCandidate,
+) -> Result<(), RepositoryError> {
+    if candidate.statement().trim().is_empty() || candidate.support().len() < 2 {
+        return Err(RepositoryError::new("invalid shared agreement candidate"));
+    }
+    validate_shared_support(evidence, candidate.support())
+}
+
+fn validate_shared_experience_storage(
+    evidence: &BTreeMap<EvidenceId, ConversationEvidence>,
+    experience: &SharedExperience,
+) -> Result<(), RepositoryError> {
+    let claim = experience.claim();
+    if claim.owner() != ClaimOwner::Shared
+        || claim.status() != ClaimStatus::Current
+        || claim.statement().trim().is_empty()
+        || claim.support().len() < 2
+    {
+        return Err(RepositoryError::new("invalid shared experience claim"));
+    }
+    validate_shared_support(evidence, claim.support())
+}
+
+fn validate_shared_support(
+    evidence: &BTreeMap<EvidenceId, ConversationEvidence>,
+    support: &[crate::EvidenceCitation],
+) -> Result<(), RepositoryError> {
+    let mut has_person = false;
+    let mut has_counterpart = false;
+    for citation in support {
+        let source = evidence
+            .get(&citation.evidence_id())
+            .ok_or_else(|| RepositoryError::new("shared support evidence does not exist"))?;
+        if citation.quote().is_empty() || !source.verbatim().contains(citation.quote()) {
+            return Err(RepositoryError::new(
+                "shared support is not an exact evidence quote",
+            ));
+        }
+        match source.speaker() {
+            Speaker::Person => has_person = true,
+            Speaker::Counterpart => has_counterpart = true,
+        }
+    }
+    if !has_person || !has_counterpart {
+        return Err(RepositoryError::new(
+            "shared history requires evidence from both participants",
+        ));
+    }
+    Ok(())
 }
 
 impl ForgetRepository for InMemoryRepository {
@@ -83,13 +286,39 @@ impl ForgetRepository for InMemoryRepository {
         for claim_id in &affected_claims {
             self.claims.remove(claim_id);
         }
+        let affected_candidates = self
+            .shared_agreement_candidates
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .support()
+                    .iter()
+                    .any(|citation| citation.evidence_id() == evidence_id)
+                    || candidate
+                        .claim_id()
+                        .is_some_and(|claim_id| affected_claims.contains(&claim_id))
+            })
+            .map(SharedAgreementCandidate::id)
+            .collect::<Vec<_>>();
+        for candidate_id in &affected_candidates {
+            self.shared_agreement_candidates.remove(candidate_id);
+        }
+        let affected_experiences = self
+            .shared_experiences
+            .keys()
+            .filter(|claim_id| affected_claims.contains(claim_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for claim_id in &affected_experiences {
+            self.shared_experiences.remove(claim_id);
+        }
         self.evidence.remove(&evidence_id);
 
         let receipt = ForgetReceipt::new(
             self.next_deletion_intent_id,
             target,
             1 + affected_claims.len(),
-            0,
+            affected_candidates.len() + affected_experiences.len(),
             0,
         );
         self.next_deletion_intent_id += 1;

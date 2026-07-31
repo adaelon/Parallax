@@ -366,6 +366,12 @@ SharedAgreementCandidate {
   counterpart_assented_at?, person_confirmed_at?
 }
 
+SharedExperience {
+  claim_id, kind = AGREEMENT | SUBSTANTIVE_DISAGREEMENT |
+                   RELATIONSHIP_CHANGE | SHARED_ACHIEVEMENT,
+  candidate_id?, ceremony_dismissed
+}
+
 ActiveRelationalConstraint {
   agreement_claim_id, statement, scope,
   effective_from, priority = BELOW_CONSTITUTION_AND_AUTHORIZATION
@@ -1607,3 +1613,46 @@ reopen -> deletion_intent survives; forgotten target IDs are not reused
 ```
 
 S19 不把隐藏、删除投递文件或 `SOURCE_REMOVED` 当遗忘，不承诺 SSD 未分配块或用户旧备份的法证级擦除，也不实现 S30 的备份格式、加密快照与恢复重放执行器。
+
+### 9.20 S20 共同经历分类与分类型仪式当前实现边界
+
+```text
+crates/core/src/
+  domain.rs / ports.rs              # 四类共同经历、候选、确认/暂缓和仪式状态契约
+  memory_loop.rs / in_memory.rs     # 双方逐字证据门禁、分类型入账与内存原子适配
+crates/runtime-gateway/src/
+  adapter.rs                        # propose_shared_experience 严格结构化白名单
+crates/vault/src/
+  schema.rs / repository.rs         # schema v17 候选、共享 Claim 与通知状态持久化
+apps/desktop/src-tauri/src/
+  state.rs / lib.rs                 # 可信仪式投影与三个白名单 command
+apps/desktop/src/
+  App.tsx / styles.css              # 分类型确认/非否决弹窗与双方原话展示
+```
+
+```text
+propose_shared_experience(kind, statement, person_support, counterpart_quote, occurred_at)
+  -> runtime receives four narrow relational kinds and the remove-counterpart exclusion rule
+  -> require kind in four narrow relational event kinds
+  -> require exact person evidence + exact current counterpart response
+  -> AGREEMENT: persist candidate only; no shared Claim before person ceremony
+  -> other kinds: atomically append Claim(owner=shared) + non-veto notice state
+
+resolve_shared_agreement(candidate, CONFIRM | DEFER)
+  -> CONFIRM: atomically append the immutable candidate as shared Claim
+  -> DEFER: retain candidate result without shared ledger entry
+
+dismiss_shared_experience_ceremony(claim)
+  -> update notice state only; preserve shared Claim and evidence history
+
+list_shared_experience_ceremonies()
+  -> Core/Vault 投影 AWAITING_PERSON 候选与未关闭非约定关系事件
+  -> WebView 只获得 target id、固定类型、准确表述和双方逐字引用
+  -> confirmationRequired: confirm | defer
+  -> nonVetoNotice: acknowledge and close only
+
+send_message() failure after an earlier atomic write
+  -> reload both conversation evidence and pending ceremonies from trusted Core state
+```
+
+S20 不实现 S21 的候选文本版本、修改后重新取得第二自我同意、范围/有效期和双签替代流程，也不投影 S22 的活动关系约束。

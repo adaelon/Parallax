@@ -7,8 +7,10 @@ use std::{
 use eam_core::{
     ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
     ClaimStatus, ConversationEvidence, DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt,
-    ForgetRepository, ForgetTarget, MemoryRepository, RepositoryError, SessionId, Speaker,
-    Timestamp, Uncertainty,
+    ForgetRepository, ForgetTarget, MemoryRepository, RepositoryError, SessionId,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
+    SharedExperienceRepository, Speaker, Timestamp, Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -83,6 +85,7 @@ pub struct VaultRepository {
     database_path: PathBuf,
     next_evidence_id: u64,
     next_claim_id: u64,
+    next_shared_agreement_candidate_id: u64,
     next_archive_id: u64,
 }
 
@@ -122,6 +125,8 @@ impl VaultRepository {
             FORGET_TARGET_CONVERSATION_EVIDENCE,
         )?;
         let next_claim_id = next_identifier(&connection, "claims")?;
+        let next_shared_agreement_candidate_id =
+            next_identifier(&connection, "shared_agreement_candidates")?;
         let next_archive_id = next_identifier_with_deletion_watermark(
             &connection,
             "archived_evidence",
@@ -136,6 +141,7 @@ impl VaultRepository {
             database_path,
             next_evidence_id,
             next_claim_id,
+            next_shared_agreement_candidate_id,
             next_archive_id,
         })
     }
@@ -2952,6 +2958,478 @@ impl MemoryRepository for VaultRepository {
             .into_iter()
             .map(|stored| stored.decode(self.connection()))
             .collect()
+    }
+}
+
+impl SharedExperienceRepository for VaultRepository {
+    fn next_shared_agreement_candidate_id(&mut self) -> SharedAgreementCandidateId {
+        let id = SharedAgreementCandidateId::from_raw(self.next_shared_agreement_candidate_id);
+        self.next_shared_agreement_candidate_id = self
+            .next_shared_agreement_candidate_id
+            .checked_add(1)
+            .expect("shared agreement candidate identifier space exhausted");
+        id
+    }
+
+    fn stage_shared_agreement_candidate(
+        &mut self,
+        candidate: SharedAgreementCandidate,
+    ) -> Result<(), RepositoryError> {
+        if candidate.status() != SharedAgreementCandidateStatus::AwaitingPerson
+            || candidate.decided_at().is_some()
+            || candidate.claim_id().is_some()
+            || candidate.statement().trim().is_empty()
+        {
+            return Err(RepositoryError::new(
+                "new shared agreement candidate must await person confirmation",
+            ));
+        }
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        validate_shared_support(&transaction, candidate.support())?;
+        transaction
+            .execute(
+                "INSERT INTO shared_agreement_candidates
+                 (id, statement, occurred_at, recorded_at, status, decided_at,
+                  confirmed_claim_id)
+                 VALUES (?1, ?2, ?3, ?4, 0, NULL, NULL)",
+                params![
+                    to_sql_id(candidate.id().get())?,
+                    candidate.statement(),
+                    candidate.occurred_at().as_millis(),
+                    candidate.recorded_at().as_millis(),
+                ],
+            )
+            .map_err(repository_error)?;
+        insert_shared_candidate_support(&transaction, &candidate)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(())
+    }
+
+    fn shared_agreement_candidate(
+        &self,
+        id: SharedAgreementCandidateId,
+    ) -> Result<Option<SharedAgreementCandidate>, RepositoryError> {
+        load_shared_agreement_candidate(self.connection(), id)
+    }
+
+    fn commit_shared_agreement_decision(
+        &mut self,
+        id: SharedAgreementCandidateId,
+        decision: SharedAgreementDecision,
+        confirmed: Option<SharedExperience>,
+        decided_at: Timestamp,
+    ) -> Result<SharedAgreementResolution, RepositoryError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        let candidate = load_shared_agreement_candidate(&transaction, id)?
+            .ok_or_else(|| RepositoryError::new("shared agreement candidate does not exist"))?;
+        if candidate.status() != SharedAgreementCandidateStatus::AwaitingPerson {
+            return Err(RepositoryError::new(
+                "shared agreement candidate is not awaiting person confirmation",
+            ));
+        }
+
+        let (status, claim_id) = match decision {
+            SharedAgreementDecision::Confirm => {
+                let experience = confirmed.ok_or_else(|| {
+                    RepositoryError::new("confirmed agreement requires a shared claim")
+                })?;
+                if experience.kind() != SharedExperienceKind::Agreement
+                    || experience.claim().statement() != candidate.statement()
+                    || experience.claim().support() != candidate.support()
+                {
+                    return Err(RepositoryError::new(
+                        "confirmed agreement does not match its immutable candidate",
+                    ));
+                }
+                insert_shared_claim(&transaction, experience.claim())?;
+                transaction
+                    .execute(
+                        "INSERT INTO shared_experiences
+                         (claim_id, kind, candidate_id, ceremony_dismissed)
+                         VALUES (?1, ?2, ?3, 1)",
+                        params![
+                            to_sql_id(experience.claim().id().get())?,
+                            encode_shared_experience_kind(experience.kind()),
+                            to_sql_id(id.get())?,
+                        ],
+                    )
+                    .map_err(repository_error)?;
+                (
+                    SharedAgreementCandidateStatus::Confirmed,
+                    Some(experience.claim().id()),
+                )
+            }
+            SharedAgreementDecision::Defer => {
+                if confirmed.is_some() {
+                    return Err(RepositoryError::new(
+                        "deferred agreement cannot append a shared claim",
+                    ));
+                }
+                (SharedAgreementCandidateStatus::Deferred, None)
+            }
+        };
+        transaction
+            .execute(
+                "UPDATE shared_agreement_candidates
+                 SET status = ?1, decided_at = ?2, confirmed_claim_id = ?3
+                 WHERE id = ?4 AND status = 0",
+                params![
+                    encode_shared_agreement_status(status),
+                    decided_at.as_millis(),
+                    claim_id.map(ClaimId::get).map(to_sql_id).transpose()?,
+                    to_sql_id(id.get())?,
+                ],
+            )
+            .map_err(repository_error)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(SharedAgreementResolution::new(id, status, claim_id))
+    }
+
+    fn commit_shared_experience(
+        &mut self,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError> {
+        if experience.kind() == SharedExperienceKind::Agreement {
+            return Err(RepositoryError::new(
+                "shared agreements require a person-confirmed candidate",
+            ));
+        }
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        insert_shared_claim(&transaction, experience.claim())?;
+        transaction
+            .execute(
+                "INSERT INTO shared_experiences
+                 (claim_id, kind, candidate_id, ceremony_dismissed)
+                 VALUES (?1, ?2, NULL, ?3)",
+                params![
+                    to_sql_id(experience.claim().id().get())?,
+                    encode_shared_experience_kind(experience.kind()),
+                    i64::from(experience.ceremony_dismissed()),
+                ],
+            )
+            .map_err(repository_error)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(())
+    }
+
+    fn all_shared_agreement_candidates(
+        &self,
+    ) -> Result<Vec<SharedAgreementCandidate>, RepositoryError> {
+        let ids = self
+            .connection()
+            .prepare("SELECT id FROM shared_agreement_candidates ORDER BY id")
+            .map_err(repository_error)?
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(repository_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_error)?;
+        ids.into_iter()
+            .map(|id| {
+                let id = u64::try_from(id).map_err(repository_error)?;
+                load_shared_agreement_candidate(
+                    self.connection(),
+                    SharedAgreementCandidateId::from_raw(id),
+                )?
+                .ok_or_else(|| RepositoryError::new("persisted candidate is missing"))
+            })
+            .collect()
+    }
+
+    fn all_shared_experiences(&self) -> Result<Vec<SharedExperience>, RepositoryError> {
+        let rows = self
+            .connection()
+            .prepare(
+                "SELECT claim_id, kind, ceremony_dismissed
+                 FROM shared_experiences ORDER BY claim_id",
+            )
+            .map_err(repository_error)?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(repository_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_error)?;
+        rows.into_iter()
+            .map(|(claim_id, kind, dismissed)| {
+                let claim_id =
+                    ClaimId::from_raw(u64::try_from(claim_id).map_err(repository_error)?);
+                let claim = load_claim(self.connection(), claim_id)?
+                    .ok_or_else(|| RepositoryError::new("shared claim is missing"))?;
+                Ok(SharedExperience::restore(
+                    decode_shared_experience_kind(kind)?,
+                    claim,
+                    decode_bool(dismissed)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn dismiss_shared_experience_ceremony(
+        &mut self,
+        claim_id: ClaimId,
+    ) -> Result<bool, RepositoryError> {
+        let affected = self
+            .connection()
+            .execute(
+                "UPDATE shared_experiences SET ceremony_dismissed = 1
+                 WHERE claim_id = ?1",
+                [to_sql_id(claim_id.get())?],
+            )
+            .map_err(repository_error)?;
+        Ok(affected == 1)
+    }
+}
+
+fn load_shared_agreement_candidate(
+    connection: &Connection,
+    id: SharedAgreementCandidateId,
+) -> Result<Option<SharedAgreementCandidate>, RepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT statement, occurred_at, recorded_at, status, decided_at,
+                    confirmed_claim_id
+             FROM shared_agreement_candidates WHERE id = ?1",
+            [to_sql_id(id.get())?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(repository_error)?;
+    let Some((statement, occurred_at, recorded_at, status, decided_at, claim_id)) = stored else {
+        return Ok(None);
+    };
+    let support = load_shared_candidate_support(connection, id)?;
+    let claim_id = claim_id
+        .map(|value| {
+            u64::try_from(value)
+                .map(ClaimId::from_raw)
+                .map_err(repository_error)
+        })
+        .transpose()?;
+    Ok(Some(SharedAgreementCandidate::restore(
+        id,
+        statement,
+        support,
+        Timestamp::from_millis(occurred_at),
+        Timestamp::from_millis(recorded_at),
+        decode_shared_agreement_status(status)?,
+        decided_at.map(Timestamp::from_millis),
+        claim_id,
+    )))
+}
+
+fn load_shared_candidate_support(
+    connection: &Connection,
+    id: SharedAgreementCandidateId,
+) -> Result<Vec<EvidenceCitation>, RepositoryError> {
+    connection
+        .prepare(
+            "SELECT evidence_id, quote
+             FROM shared_agreement_candidate_support
+             WHERE candidate_id = ?1 ORDER BY ordinal",
+        )
+        .map_err(repository_error)?
+        .query_map([to_sql_id(id.get())?], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(repository_error)?
+        .map(|stored| {
+            let (evidence_id, quote) = stored.map_err(repository_error)?;
+            let evidence_id = u64::try_from(evidence_id).map_err(repository_error)?;
+            Ok(EvidenceCitation::new(
+                EvidenceId::from_raw(evidence_id),
+                quote,
+            ))
+        })
+        .collect()
+}
+
+fn insert_shared_candidate_support(
+    transaction: &rusqlite::Transaction<'_>,
+    candidate: &SharedAgreementCandidate,
+) -> Result<(), RepositoryError> {
+    for (ordinal, citation) in candidate.support().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO shared_agreement_candidate_support
+                 (candidate_id, ordinal, evidence_id, quote)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    to_sql_id(candidate.id().get())?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(citation.evidence_id().get())?,
+                    citation.quote(),
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
+fn validate_shared_support(
+    connection: &Connection,
+    support: &[EvidenceCitation],
+) -> Result<(), RepositoryError> {
+    if support.len() < 2 {
+        return Err(RepositoryError::new(
+            "shared history requires evidence from both participants",
+        ));
+    }
+    let mut has_person = false;
+    let mut has_counterpart = false;
+    for citation in support {
+        let source = connection
+            .query_row(
+                "SELECT speaker, verbatim FROM conversation_evidence WHERE id = ?1",
+                [to_sql_id(citation.evidence_id().get())?],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(repository_error)?
+            .ok_or_else(|| RepositoryError::new("shared support evidence does not exist"))?;
+        if citation.quote().is_empty() || !source.1.contains(citation.quote()) {
+            return Err(RepositoryError::new(
+                "shared support is not an exact evidence quote",
+            ));
+        }
+        match decode_speaker(source.0)? {
+            Speaker::Person => has_person = true,
+            Speaker::Counterpart => has_counterpart = true,
+        }
+    }
+    if !has_person || !has_counterpart {
+        return Err(RepositoryError::new(
+            "shared history requires evidence from both participants",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_shared_claim(
+    transaction: &rusqlite::Transaction<'_>,
+    claim: &Claim,
+) -> Result<(), RepositoryError> {
+    if claim.owner() != ClaimOwner::Shared
+        || claim.status() != ClaimStatus::Current
+        || claim.supersedes().is_some()
+        || claim.superseded_by().is_some()
+        || claim.statement().trim().is_empty()
+    {
+        return Err(RepositoryError::new("invalid shared experience claim"));
+    }
+    validate_shared_support(transaction, claim.support())?;
+    let (applicable_kind, applicable_start, applicable_end) =
+        encode_applicable_time(claim.applicable_time());
+    transaction
+        .execute(
+            "INSERT INTO claims
+             (id, owner, statement, uncertainty, applicable_kind,
+              applicable_start, applicable_end, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                to_sql_id(claim.id().get())?,
+                encode_owner(claim.owner()),
+                claim.statement(),
+                claim.uncertainty().map(encode_uncertainty),
+                applicable_kind,
+                applicable_start,
+                applicable_end,
+                claim.recorded_at().as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    for (ordinal, citation) in claim.support().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO claim_support (claim_id, ordinal, evidence_id, quote)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    to_sql_id(claim.id().get())?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(citation.evidence_id().get())?,
+                    citation.quote(),
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    insert_current_claim_state_event(transaction, claim.id(), claim.recorded_at())?;
+    Ok(())
+}
+
+const fn encode_shared_experience_kind(kind: SharedExperienceKind) -> i64 {
+    match kind {
+        SharedExperienceKind::Agreement => 0,
+        SharedExperienceKind::SubstantiveDisagreement => 1,
+        SharedExperienceKind::RelationshipChange => 2,
+        SharedExperienceKind::SharedAchievement => 3,
+    }
+}
+
+fn decode_shared_experience_kind(value: i64) -> Result<SharedExperienceKind, RepositoryError> {
+    match value {
+        0 => Ok(SharedExperienceKind::Agreement),
+        1 => Ok(SharedExperienceKind::SubstantiveDisagreement),
+        2 => Ok(SharedExperienceKind::RelationshipChange),
+        3 => Ok(SharedExperienceKind::SharedAchievement),
+        _ => Err(RepositoryError::new(
+            "invalid persisted shared experience kind",
+        )),
+    }
+}
+
+const fn encode_shared_agreement_status(status: SharedAgreementCandidateStatus) -> i64 {
+    match status {
+        SharedAgreementCandidateStatus::AwaitingPerson => 0,
+        SharedAgreementCandidateStatus::Deferred => 1,
+        SharedAgreementCandidateStatus::Confirmed => 2,
+    }
+}
+
+fn decode_shared_agreement_status(
+    value: i64,
+) -> Result<SharedAgreementCandidateStatus, RepositoryError> {
+    match value {
+        0 => Ok(SharedAgreementCandidateStatus::AwaitingPerson),
+        1 => Ok(SharedAgreementCandidateStatus::Deferred),
+        2 => Ok(SharedAgreementCandidateStatus::Confirmed),
+        _ => Err(RepositoryError::new(
+            "invalid persisted shared agreement candidate status",
+        )),
+    }
+}
+
+fn decode_bool(value: i64) -> Result<bool, RepositoryError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(RepositoryError::new("invalid persisted boolean")),
     }
 }
 
@@ -7480,6 +7958,7 @@ fn forget_target_exists(connection: &Connection, target: ForgetTarget) -> Result
 struct ConversationForgetPlan {
     evidence_id_sql: i64,
     claim_ids: BTreeSet<u64>,
+    shared_agreement_candidate_ids: BTreeSet<u64>,
     memory_ids: BTreeSet<u64>,
     initial_impacted: bool,
     identity_from: Option<i64>,
@@ -7523,6 +8002,18 @@ fn plan_conversation_forget(
         evidence_id_sql,
     )?;
     let claim_predicate = id_predicate("claim_id", &claim_ids);
+    let shared_agreement_candidate_ids = query_u64_ids(
+        transaction,
+        &format!(
+            "SELECT candidate_id FROM shared_agreement_candidate_support
+             WHERE evidence_id = ?1
+             UNION SELECT id FROM shared_agreement_candidates
+             WHERE {}
+             ORDER BY candidate_id",
+            id_predicate("confirmed_claim_id", &claim_ids)
+        ),
+        evidence_id_sql,
+    )?;
     let initial_impacted = transaction.query_row(
         &format!(
             "SELECT EXISTS(SELECT 1 FROM initial_self_introduction
@@ -7550,6 +8041,7 @@ fn plan_conversation_forget(
     Ok(ConversationForgetPlan {
         evidence_id_sql,
         claim_ids,
+        shared_agreement_candidate_ids,
         memory_ids,
         initial_impacted,
         identity_from,
@@ -7715,16 +8207,39 @@ fn delete_conversation_claim_closure(
             [plan.evidence_id_sql],
         )?;
     }
+    let claim_predicate = id_predicate("claim_id", &plan.claim_ids);
+    let candidate_predicate = id_predicate("candidate_id", &plan.shared_agreement_candidate_ids);
+    counts.derived += transaction.execute(
+        &format!(
+            "DELETE FROM shared_experiences
+             WHERE {claim_predicate} OR {candidate_predicate}"
+        ),
+        [],
+    )?;
+    if !plan.shared_agreement_candidate_ids.is_empty() {
+        counts.derived += transaction.execute(
+            &format!("DELETE FROM shared_agreement_candidate_support WHERE {candidate_predicate}"),
+            [],
+        )?;
+        counts.derived += transaction.execute(
+            &format!(
+                "DELETE FROM shared_agreement_candidates WHERE {}",
+                id_predicate("id", &plan.shared_agreement_candidate_ids)
+            ),
+            [],
+        )?;
+    }
     if plan.claim_ids.is_empty() {
         return Ok(());
     }
-    let predicate = id_predicate("claim_id", &plan.claim_ids);
     counts.derived += transaction.execute(
-        &format!("DELETE FROM claim_state_events WHERE {predicate}"),
+        &format!("DELETE FROM claim_state_events WHERE {claim_predicate}"),
         [],
     )?;
-    counts.authority +=
-        transaction.execute(&format!("DELETE FROM claim_support WHERE {predicate}"), [])?;
+    counts.authority += transaction.execute(
+        &format!("DELETE FROM claim_support WHERE {claim_predicate}"),
+        [],
+    )?;
     counts.authority += delete_claims_leaf_first(transaction, &plan.claim_ids)?;
     Ok(())
 }

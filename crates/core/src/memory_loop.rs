@@ -5,8 +5,11 @@ use crate::{
     ClaimStatus, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
     ForgetReceipt, ForgetRepository, ForgetRequest, JudgmentProposal, JudgmentRejection,
     JudgmentRejectionReason, MemoryRepository, PersonTurnClassification, RepositoryError,
-    RuntimeError, RuntimeRequest, SessionId, Speaker, StructuredOperationRejection,
-    StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
+    RuntimeError, RuntimeRequest, SessionId, SharedAgreementCandidate, SharedAgreementCandidateId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
+    SharedExperience, SharedExperienceProposal, SharedExperienceRejection,
+    SharedExperienceRejectionReason, SharedExperienceRepository, Speaker,
+    StructuredOperationRejection, StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,10 +23,23 @@ pub enum CoreError {
     ClaimNotCurrent(ClaimId),
     ForgetNotConfirmed,
     ForgetTargetNotFound,
+    SharedAgreementCandidateNotFound(SharedAgreementCandidateId),
+    SharedAgreementCandidateNotAwaitingPerson(SharedAgreementCandidateId),
     MissingEvidence(EvidenceId),
     InvalidResponseCitation(JudgmentRejectionReason),
     Repository(RepositoryError),
     Runtime(RuntimeError),
+}
+
+struct JudgmentWriteOutcome {
+    accepted: Vec<ClaimId>,
+    rejected: Vec<JudgmentRejection>,
+}
+
+struct SharedExperienceWriteOutcome {
+    pending_agreements: Vec<SharedAgreementCandidateId>,
+    admitted: Vec<ClaimId>,
+    rejected: Vec<SharedExperienceRejection>,
 }
 
 impl fmt::Display for CoreError {
@@ -44,6 +60,18 @@ impl fmt::Display for CoreError {
                 formatter.write_str("forget requires explicit person confirmation")
             }
             Self::ForgetTargetNotFound => formatter.write_str("forget target does not exist"),
+            Self::SharedAgreementCandidateNotFound(id) => {
+                write!(
+                    formatter,
+                    "shared agreement candidate {} does not exist",
+                    id.get()
+                )
+            }
+            Self::SharedAgreementCandidateNotAwaitingPerson(id) => write!(
+                formatter,
+                "shared agreement candidate {} is not awaiting person confirmation",
+                id.get()
+            ),
             Self::MissingEvidence(id) => write!(formatter, "evidence {} does not exist", id.get()),
             Self::InvalidResponseCitation(reason) => {
                 write!(
@@ -239,89 +267,6 @@ where
         Ok(WorkingContext::new(evidence, self.clock.now()))
     }
 
-    /// Runs a person/counterpart turn against a previously frozen context.
-    ///
-    /// Runtime free text is retained only as conversation evidence. Structured
-    /// judgment proposals are independently source-validated before ledger entry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CoreError`] for an empty turn, adapter/runtime failure, missing
-    /// prompt evidence, or a response-level citation that cannot be verified.
-    pub fn run_counterpart_turn(
-        &mut self,
-        session_id: SessionId,
-        person_verbatim: impl Into<String>,
-        working_context: WorkingContext,
-    ) -> Result<TurnOutcome, CoreError> {
-        let (person_evidence_id, classification) =
-            self.record_person_turn(session_id.clone(), person_verbatim)?;
-        let prompt = self
-            .repository
-            .evidence(person_evidence_id)?
-            .ok_or(CoreError::MissingEvidence(person_evidence_id))?;
-
-        let request = RuntimeRequest::new(prompt.clone(), working_context);
-        let validation_context = request.working_context().clone();
-        let response = self.runtime.respond(request)?;
-
-        for citation in response.citations() {
-            if let Err(reason) = validate_citation(citation, &validation_context, &prompt) {
-                return Err(CoreError::InvalidResponseCitation(reason));
-            }
-        }
-
-        let counterpart_evidence = self.append_conversation_evidence(
-            session_id,
-            Speaker::Counterpart,
-            response.text().to_owned(),
-        )?;
-
-        let mut accepted_judgment_ids = Vec::new();
-        let mut rejected_judgments = Vec::new();
-        let rejected_operations = response
-            .unsupported_operations()
-            .iter()
-            .map(|operation| {
-                StructuredOperationRejection::new(
-                    operation.operation_index(),
-                    StructuredOperationRejectionReason::NotWhitelisted(operation.name().to_owned()),
-                )
-            })
-            .collect();
-        for (proposal_index, proposal) in response.judgment_proposals().iter().enumerate() {
-            match validate_judgment(proposal, &validation_context, &prompt) {
-                Ok(()) => {
-                    let claim_id = self.repository.next_claim_id();
-                    let claim = Claim::new(
-                        claim_id,
-                        ClaimOwner::Counterpart,
-                        proposal.statement().to_owned(),
-                        proposal.support().to_vec(),
-                        Some(proposal.uncertainty()),
-                        proposal.applicable_time(),
-                        counterpart_evidence.recorded_at(),
-                    );
-                    self.repository.append_claim(claim)?;
-                    accepted_judgment_ids.push(claim_id);
-                }
-                Err(reason) => {
-                    rejected_judgments.push(JudgmentRejection::new(proposal_index, reason));
-                }
-            }
-        }
-
-        Ok(TurnOutcome::new(
-            person_evidence_id,
-            counterpart_evidence.id(),
-            classification,
-            accepted_judgment_ids,
-            rejected_judgments,
-            rejected_operations,
-            response.citations().to_vec(),
-        ))
-    }
-
     /// Resolves and verifies an exact quote against retained verbatim evidence.
     ///
     /// # Errors
@@ -388,6 +333,237 @@ where
     }
 }
 
+impl<R, T, C> MemoryCore<R, T, C>
+where
+    R: SharedExperienceRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    /// Runs a person/counterpart turn against a previously frozen context.
+    ///
+    /// Runtime free text is retained only as conversation evidence. Structured
+    /// judgment and shared-experience proposals are independently source-
+    /// validated before any ledger admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] for an empty turn, adapter/runtime failure, missing
+    /// prompt evidence, or a response-level citation that cannot be verified.
+    pub fn run_counterpart_turn(
+        &mut self,
+        session_id: SessionId,
+        person_verbatim: impl Into<String>,
+        working_context: WorkingContext,
+    ) -> Result<TurnOutcome, CoreError> {
+        let (person_evidence_id, classification) =
+            self.record_person_turn(session_id.clone(), person_verbatim)?;
+        let prompt = self
+            .repository
+            .evidence(person_evidence_id)?
+            .ok_or(CoreError::MissingEvidence(person_evidence_id))?;
+
+        let request = RuntimeRequest::new(prompt.clone(), working_context);
+        let validation_context = request.working_context().clone();
+        let response = self.runtime.respond(request)?;
+
+        for citation in response.citations() {
+            if let Err(reason) = validate_citation(citation, &validation_context, &prompt) {
+                return Err(CoreError::InvalidResponseCitation(reason));
+            }
+        }
+
+        let counterpart_evidence = self.append_conversation_evidence(
+            session_id,
+            Speaker::Counterpart,
+            response.text().to_owned(),
+        )?;
+        let judgments = self.persist_judgment_proposals(
+            &response,
+            &validation_context,
+            &prompt,
+            &counterpart_evidence,
+        )?;
+        let shared = self.persist_shared_experience_proposals(
+            &response,
+            &validation_context,
+            &prompt,
+            &counterpart_evidence,
+        )?;
+        let rejected_operations = response
+            .unsupported_operations()
+            .iter()
+            .map(|operation| {
+                StructuredOperationRejection::new(
+                    operation.operation_index(),
+                    StructuredOperationRejectionReason::NotWhitelisted(operation.name().to_owned()),
+                )
+            })
+            .collect();
+        Ok(TurnOutcome::new(
+            person_evidence_id,
+            counterpart_evidence.id(),
+            classification,
+            response.citations().to_vec(),
+        )
+        .with_judgments(judgments.accepted, judgments.rejected)
+        .with_shared_experiences(shared.pending_agreements, shared.admitted, shared.rejected)
+        .with_rejected_operations(rejected_operations))
+    }
+
+    fn persist_judgment_proposals(
+        &mut self,
+        response: &crate::RuntimeResponse,
+        validation_context: &WorkingContext,
+        prompt: &ConversationEvidence,
+        counterpart_evidence: &ConversationEvidence,
+    ) -> Result<JudgmentWriteOutcome, CoreError> {
+        let mut outcome = JudgmentWriteOutcome {
+            accepted: Vec::new(),
+            rejected: Vec::new(),
+        };
+        for (proposal_index, proposal) in response.judgment_proposals().iter().enumerate() {
+            match validate_judgment(proposal, validation_context, prompt) {
+                Ok(()) => {
+                    let claim_id = self.repository.next_claim_id();
+                    let claim = Claim::new(
+                        claim_id,
+                        ClaimOwner::Counterpart,
+                        proposal.statement().to_owned(),
+                        proposal.support().to_vec(),
+                        Some(proposal.uncertainty()),
+                        proposal.applicable_time(),
+                        counterpart_evidence.recorded_at(),
+                    );
+                    self.repository.append_claim(claim)?;
+                    outcome.accepted.push(claim_id);
+                }
+                Err(reason) => outcome
+                    .rejected
+                    .push(JudgmentRejection::new(proposal_index, reason)),
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn persist_shared_experience_proposals(
+        &mut self,
+        response: &crate::RuntimeResponse,
+        validation_context: &WorkingContext,
+        prompt: &ConversationEvidence,
+        counterpart_evidence: &ConversationEvidence,
+    ) -> Result<SharedExperienceWriteOutcome, CoreError> {
+        let mut outcome = SharedExperienceWriteOutcome {
+            pending_agreements: Vec::new(),
+            admitted: Vec::new(),
+            rejected: Vec::new(),
+        };
+        for (proposal_index, proposal) in response.shared_experience_proposals().iter().enumerate()
+        {
+            let validation = validate_shared_experience_proposal(
+                proposal,
+                validation_context,
+                prompt,
+                response.text(),
+            );
+            if let Err(reason) = validation {
+                outcome
+                    .rejected
+                    .push(SharedExperienceRejection::new(proposal_index, reason));
+                continue;
+            }
+            let support = proposal
+                .person_support()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(EvidenceCitation::new(
+                    counterpart_evidence.id(),
+                    proposal.counterpart_quote(),
+                )))
+                .collect::<Vec<_>>();
+            if proposal.kind().requires_person_confirmation() {
+                let candidate = SharedAgreementCandidate::awaiting_person(
+                    self.repository.next_shared_agreement_candidate_id(),
+                    proposal.statement().to_owned(),
+                    support,
+                    proposal.occurred_at(),
+                    counterpart_evidence.recorded_at(),
+                );
+                let candidate_id = candidate.id();
+                self.repository
+                    .stage_shared_agreement_candidate(candidate)?;
+                outcome.pending_agreements.push(candidate_id);
+                continue;
+            }
+            let claim_id = self.repository.next_claim_id();
+            let claim = Claim::new(
+                claim_id,
+                ClaimOwner::Shared,
+                proposal.statement().to_owned(),
+                support,
+                None,
+                ApplicableTime::At(proposal.occurred_at()),
+                counterpart_evidence.recorded_at(),
+            );
+            self.repository
+                .commit_shared_experience(SharedExperience::admitted(proposal.kind(), claim))?;
+            outcome.admitted.push(claim_id);
+        }
+        Ok(outcome)
+    }
+
+    /// Resolves the person-facing admission ceremony for one immutable shared
+    /// agreement candidate.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown or already-resolved candidates and adapter failures.
+    pub fn resolve_shared_agreement(
+        &mut self,
+        candidate_id: SharedAgreementCandidateId,
+        decision: SharedAgreementDecision,
+    ) -> Result<SharedAgreementResolution, CoreError> {
+        let candidate = self
+            .repository
+            .shared_agreement_candidate(candidate_id)?
+            .ok_or(CoreError::SharedAgreementCandidateNotFound(candidate_id))?;
+        if candidate.status() != SharedAgreementCandidateStatus::AwaitingPerson {
+            return Err(CoreError::SharedAgreementCandidateNotAwaitingPerson(
+                candidate_id,
+            ));
+        }
+        let decided_at = self.clock.now();
+        let confirmed = (decision == SharedAgreementDecision::Confirm).then(|| {
+            let claim = Claim::new(
+                self.repository.next_claim_id(),
+                ClaimOwner::Shared,
+                candidate.statement().to_owned(),
+                candidate.support().to_vec(),
+                None,
+                ApplicableTime::At(candidate.occurred_at()),
+                decided_at,
+            );
+            SharedExperience::admitted(crate::SharedExperienceKind::Agreement, claim)
+        });
+        self.repository
+            .commit_shared_agreement_decision(candidate_id, decision, confirmed, decided_at)
+            .map_err(CoreError::from)
+    }
+
+    /// Dismisses a ceremony without modifying the admitted shared claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when ceremony state cannot be updated.
+    pub fn dismiss_shared_experience_ceremony(
+        &mut self,
+        claim_id: ClaimId,
+    ) -> Result<bool, CoreError> {
+        self.repository
+            .dismiss_shared_experience_ceremony(claim_id)
+            .map_err(CoreError::from)
+    }
+}
+
 fn validate_judgment(
     proposal: &JudgmentProposal,
     working_context: &WorkingContext,
@@ -404,6 +580,57 @@ fn validate_judgment(
     }
     for citation in proposal.support() {
         validate_citation(citation, working_context, prompt)?;
+    }
+    Ok(())
+}
+
+fn validate_shared_experience_proposal(
+    proposal: &SharedExperienceProposal,
+    working_context: &WorkingContext,
+    prompt: &ConversationEvidence,
+    counterpart_text: &str,
+) -> Result<(), SharedExperienceRejectionReason> {
+    if proposal.statement().trim().is_empty() {
+        return Err(SharedExperienceRejectionReason::EmptyStatement);
+    }
+    if proposal.person_support().is_empty() {
+        return Err(SharedExperienceRejectionReason::MissingPersonSupport);
+    }
+    for citation in proposal.person_support() {
+        let evidence = if prompt.id() == citation.evidence_id() {
+            prompt
+        } else {
+            working_context
+                .evidence()
+                .iter()
+                .find(|evidence| evidence.id() == citation.evidence_id())
+                .ok_or(
+                    SharedExperienceRejectionReason::EvidenceOutsideWorkingContext(
+                        citation.evidence_id(),
+                    ),
+                )?
+        };
+        if evidence.speaker() != Speaker::Person {
+            return Err(SharedExperienceRejectionReason::EvidenceNotFromPerson(
+                citation.evidence_id(),
+            ));
+        }
+        if citation.quote().is_empty() {
+            return Err(SharedExperienceRejectionReason::EmptyPersonQuote(
+                citation.evidence_id(),
+            ));
+        }
+        if !evidence.verbatim().contains(citation.quote()) {
+            return Err(SharedExperienceRejectionReason::PersonQuoteMismatch(
+                citation.evidence_id(),
+            ));
+        }
+    }
+    if proposal.counterpart_quote().is_empty() {
+        return Err(SharedExperienceRejectionReason::EmptyCounterpartQuote);
+    }
+    if !counterpart_text.contains(proposal.counterpart_quote()) {
+        return Err(SharedExperienceRejectionReason::CounterpartQuoteMismatch);
     }
     Ok(())
 }

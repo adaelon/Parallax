@@ -36,6 +36,22 @@ impl ClaimId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SharedAgreementCandidateId(u64);
+
+impl SharedAgreementCandidateId {
+    /// Restores an identifier supplied by a trusted persistence adapter.
+    #[must_use]
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForgetTarget {
     ConversationEvidence(EvidenceId),
     ArchivedEvidence(u64),
@@ -507,6 +523,230 @@ pub struct ClaimCorrectionReceipt {
     rebuilt_memories: usize,
     invalidated_projections: usize,
     reindexed_claims: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedExperienceKind {
+    Agreement,
+    SubstantiveDisagreement,
+    RelationshipChange,
+    SharedAchievement,
+}
+
+impl SharedExperienceKind {
+    #[must_use]
+    pub const fn requires_person_confirmation(self) -> bool {
+        matches!(self, Self::Agreement)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedAgreementCandidateStatus {
+    AwaitingPerson,
+    Deferred,
+    Confirmed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedAgreementDecision {
+    Confirm,
+    Defer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgreementCandidate {
+    id: SharedAgreementCandidateId,
+    statement: String,
+    support: Vec<EvidenceCitation>,
+    occurred_at: Timestamp,
+    recorded_at: Timestamp,
+    status: SharedAgreementCandidateStatus,
+    decided_at: Option<Timestamp>,
+    claim_id: Option<ClaimId>,
+}
+
+impl SharedAgreementCandidate {
+    pub(crate) fn awaiting_person(
+        id: SharedAgreementCandidateId,
+        statement: String,
+        support: Vec<EvidenceCitation>,
+        occurred_at: Timestamp,
+        recorded_at: Timestamp,
+    ) -> Self {
+        Self {
+            id,
+            statement,
+            support,
+            occurred_at,
+            recorded_at,
+            status: SharedAgreementCandidateStatus::AwaitingPerson,
+            decided_at: None,
+            claim_id: None,
+        }
+    }
+
+    /// Restores a candidate and its admission state from trusted persistence.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        id: SharedAgreementCandidateId,
+        statement: String,
+        support: Vec<EvidenceCitation>,
+        occurred_at: Timestamp,
+        recorded_at: Timestamp,
+        status: SharedAgreementCandidateStatus,
+        decided_at: Option<Timestamp>,
+        claim_id: Option<ClaimId>,
+    ) -> Self {
+        Self {
+            id,
+            statement,
+            support,
+            occurred_at,
+            recorded_at,
+            status,
+            decided_at,
+            claim_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> SharedAgreementCandidateId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    #[must_use]
+    pub fn support(&self) -> &[EvidenceCitation] {
+        &self.support
+    }
+
+    #[must_use]
+    pub const fn occurred_at(&self) -> Timestamp {
+        self.occurred_at
+    }
+
+    #[must_use]
+    pub const fn recorded_at(&self) -> Timestamp {
+        self.recorded_at
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> SharedAgreementCandidateStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn decided_at(&self) -> Option<Timestamp> {
+        self.decided_at
+    }
+
+    #[must_use]
+    pub const fn claim_id(&self) -> Option<ClaimId> {
+        self.claim_id
+    }
+
+    pub(crate) fn resolve(
+        &mut self,
+        status: SharedAgreementCandidateStatus,
+        decided_at: Timestamp,
+        claim_id: Option<ClaimId>,
+    ) {
+        self.status = status;
+        self.decided_at = Some(decided_at);
+        self.claim_id = claim_id;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgreementResolution {
+    candidate_id: SharedAgreementCandidateId,
+    status: SharedAgreementCandidateStatus,
+    claim_id: Option<ClaimId>,
+}
+
+impl SharedAgreementResolution {
+    #[must_use]
+    pub const fn new(
+        candidate_id: SharedAgreementCandidateId,
+        status: SharedAgreementCandidateStatus,
+        claim_id: Option<ClaimId>,
+    ) -> Self {
+        Self {
+            candidate_id,
+            status,
+            claim_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn candidate_id(&self) -> SharedAgreementCandidateId {
+        self.candidate_id
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> SharedAgreementCandidateStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn claim_id(&self) -> Option<ClaimId> {
+        self.claim_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedExperience {
+    kind: SharedExperienceKind,
+    claim: Claim,
+    ceremony_dismissed: bool,
+}
+
+impl SharedExperience {
+    pub(crate) const fn admitted(kind: SharedExperienceKind, claim: Claim) -> Self {
+        Self {
+            kind,
+            claim,
+            ceremony_dismissed: false,
+        }
+    }
+
+    /// Restores an admitted shared experience from trusted persistence.
+    #[must_use]
+    pub const fn restore(
+        kind: SharedExperienceKind,
+        claim: Claim,
+        ceremony_dismissed: bool,
+    ) -> Self {
+        Self {
+            kind,
+            claim,
+            ceremony_dismissed,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> SharedExperienceKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn claim(&self) -> &Claim {
+        &self.claim
+    }
+
+    #[must_use]
+    pub const fn ceremony_dismissed(&self) -> bool {
+        self.ceremony_dismissed
+    }
+
+    pub(crate) fn dismiss_ceremony(&mut self) {
+        self.ceremony_dismissed = true;
+    }
 }
 
 impl ClaimCorrectionReceipt {
@@ -1041,6 +1281,59 @@ pub struct JudgmentProposal {
     applicable_time: ApplicableTime,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedExperienceProposal {
+    kind: SharedExperienceKind,
+    statement: String,
+    person_support: Vec<EvidenceCitation>,
+    counterpart_quote: String,
+    occurred_at: Timestamp,
+}
+
+impl SharedExperienceProposal {
+    #[must_use]
+    pub fn new(
+        kind: SharedExperienceKind,
+        statement: impl Into<String>,
+        person_support: Vec<EvidenceCitation>,
+        counterpart_quote: impl Into<String>,
+        occurred_at: Timestamp,
+    ) -> Self {
+        Self {
+            kind,
+            statement: statement.into(),
+            person_support,
+            counterpart_quote: counterpart_quote.into(),
+            occurred_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> SharedExperienceKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    #[must_use]
+    pub fn person_support(&self) -> &[EvidenceCitation] {
+        &self.person_support
+    }
+
+    #[must_use]
+    pub fn counterpart_quote(&self) -> &str {
+        &self.counterpart_quote
+    }
+
+    #[must_use]
+    pub const fn occurred_at(&self) -> Timestamp {
+        self.occurred_at
+    }
+}
+
 impl JudgmentProposal {
     #[must_use]
     pub fn new(
@@ -1083,6 +1376,7 @@ pub struct RuntimeResponse {
     text: String,
     citations: Vec<EvidenceCitation>,
     judgment_proposals: Vec<JudgmentProposal>,
+    shared_experience_proposals: Vec<SharedExperienceProposal>,
     unsupported_operations: Vec<UnsupportedStructuredOperation>,
 }
 
@@ -1093,6 +1387,7 @@ impl RuntimeResponse {
             text: text.into(),
             citations: Vec::new(),
             judgment_proposals: Vec::new(),
+            shared_experience_proposals: Vec::new(),
             unsupported_operations: Vec::new(),
         }
     }
@@ -1106,6 +1401,12 @@ impl RuntimeResponse {
     #[must_use]
     pub fn with_judgment(mut self, proposal: JudgmentProposal) -> Self {
         self.judgment_proposals.push(proposal);
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_experience(mut self, proposal: SharedExperienceProposal) -> Self {
+        self.shared_experience_proposals.push(proposal);
         self
     }
 
@@ -1133,6 +1434,11 @@ impl RuntimeResponse {
     #[must_use]
     pub fn judgment_proposals(&self) -> &[JudgmentProposal] {
         &self.judgment_proposals
+    }
+
+    #[must_use]
+    pub fn shared_experience_proposals(&self) -> &[SharedExperienceProposal] {
+        &self.shared_experience_proposals
     }
 
     #[must_use]
@@ -1208,6 +1514,46 @@ pub struct JudgmentRejection {
     reason: JudgmentRejectionReason,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedExperienceRejectionReason {
+    EmptyStatement,
+    MissingPersonSupport,
+    EvidenceOutsideWorkingContext(EvidenceId),
+    EvidenceNotFromPerson(EvidenceId),
+    EmptyPersonQuote(EvidenceId),
+    PersonQuoteMismatch(EvidenceId),
+    EmptyCounterpartQuote,
+    CounterpartQuoteMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedExperienceRejection {
+    proposal_index: usize,
+    reason: SharedExperienceRejectionReason,
+}
+
+impl SharedExperienceRejection {
+    pub(crate) const fn new(
+        proposal_index: usize,
+        reason: SharedExperienceRejectionReason,
+    ) -> Self {
+        Self {
+            proposal_index,
+            reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn proposal_index(&self) -> usize {
+        self.proposal_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &SharedExperienceRejectionReason {
+        &self.reason
+    }
+}
+
 impl JudgmentRejection {
     pub(crate) const fn new(proposal_index: usize, reason: JudgmentRejectionReason) -> Self {
         Self {
@@ -1267,6 +1613,9 @@ pub struct TurnOutcome {
     person_classification: PersonTurnClassification,
     accepted_judgment_ids: Vec<ClaimId>,
     rejected_judgments: Vec<JudgmentRejection>,
+    pending_agreement_candidate_ids: Vec<SharedAgreementCandidateId>,
+    admitted_shared_experience_ids: Vec<ClaimId>,
+    rejected_shared_experiences: Vec<SharedExperienceRejection>,
     rejected_operations: Vec<StructuredOperationRejection>,
     validated_citations: Vec<EvidenceCitation>,
 }
@@ -1276,20 +1625,50 @@ impl TurnOutcome {
         person_evidence_id: EvidenceId,
         counterpart_evidence_id: EvidenceId,
         person_classification: PersonTurnClassification,
-        accepted_judgment_ids: Vec<ClaimId>,
-        rejected_judgments: Vec<JudgmentRejection>,
-        rejected_operations: Vec<StructuredOperationRejection>,
         validated_citations: Vec<EvidenceCitation>,
     ) -> Self {
         Self {
             person_evidence_id,
             counterpart_evidence_id,
             person_classification,
-            accepted_judgment_ids,
-            rejected_judgments,
-            rejected_operations,
+            accepted_judgment_ids: Vec::new(),
+            rejected_judgments: Vec::new(),
+            pending_agreement_candidate_ids: Vec::new(),
+            admitted_shared_experience_ids: Vec::new(),
+            rejected_shared_experiences: Vec::new(),
+            rejected_operations: Vec::new(),
             validated_citations,
         }
+    }
+
+    pub(crate) fn with_judgments(
+        mut self,
+        accepted: Vec<ClaimId>,
+        rejected: Vec<JudgmentRejection>,
+    ) -> Self {
+        self.accepted_judgment_ids = accepted;
+        self.rejected_judgments = rejected;
+        self
+    }
+
+    pub(crate) fn with_shared_experiences(
+        mut self,
+        pending_agreements: Vec<SharedAgreementCandidateId>,
+        admitted: Vec<ClaimId>,
+        rejected: Vec<SharedExperienceRejection>,
+    ) -> Self {
+        self.pending_agreement_candidate_ids = pending_agreements;
+        self.admitted_shared_experience_ids = admitted;
+        self.rejected_shared_experiences = rejected;
+        self
+    }
+
+    pub(crate) fn with_rejected_operations(
+        mut self,
+        rejected: Vec<StructuredOperationRejection>,
+    ) -> Self {
+        self.rejected_operations = rejected;
+        self
     }
 
     #[must_use]
@@ -1315,6 +1694,21 @@ impl TurnOutcome {
     #[must_use]
     pub fn rejected_judgments(&self) -> &[JudgmentRejection] {
         &self.rejected_judgments
+    }
+
+    #[must_use]
+    pub fn pending_agreement_candidate_ids(&self) -> &[SharedAgreementCandidateId] {
+        &self.pending_agreement_candidate_ids
+    }
+
+    #[must_use]
+    pub fn admitted_shared_experience_ids(&self) -> &[ClaimId] {
+        &self.admitted_shared_experience_ids
+    }
+
+    #[must_use]
+    pub fn rejected_shared_experiences(&self) -> &[SharedExperienceRejection] {
+        &self.rejected_shared_experiences
     }
 
     #[must_use]

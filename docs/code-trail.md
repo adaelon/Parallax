@@ -1,5 +1,49 @@
 # 代码链路
 
+## 2026-07-31 S20-4 全仓门禁与实现级 diff 审计
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:ORDINARY_RESPONSE_INSTRUCTIONS/HIGH_IMPACT_RESPONSE_INSTRUCTIONS` — 把四类狭义关系事件、双方立场/参与门禁及“移除第二自我后仍成立则排除”判据送入真实运行时分类契约。
+- `crates/core/src/in_memory.rs:validate_shared_support` — 与 Vault 对齐，拒绝只由同一参与方多段证据构成的共同历史。
+- `apps/desktop/src/App.tsx:App.submitMessage` — 发送失败时同时重载对话和仪式，恢复此前已原子落盘的候选或非否决通知。
+- `crates/core/tests/shared_experiences.rs`、`crates/runtime-gateway/tests/runtime_contract.rs`、`apps/desktop/src/App.test.tsx` — 固定同方证据拒绝、运行时分类指令和失败后仪式重发现。
+
+**入口**：真实模型先按狭义关系事件契约决定是否提交结构化提议；Core/Vault 再执行双方逐字证据门禁，桌面失败恢复始终回到可信持久状态。
+**测试**：Core 共同经历 7/7、运行时 contract 12/12、React 4/4 与 TypeScript 类型检查通过；最终全仓门禁见本片 checkpoint。
+
+## 2026-07-31 S20-3 桌面分类型仪式可信状态路径
+
+**触达**:
+- `apps/desktop/src-tauri/src/state.rs:list_shared_experience_ceremonies_from_core/resolve_shared_agreement_from_core/dismiss_shared_experience_ceremony_from_core` — 只从 Core/Vault 投影候选和已入账通知，解析双方逐字证据并保持关闭通知不删 Claim。
+- `apps/desktop/src-tauri/src/lib.rs:list_shared_experience_ceremonies/resolve_shared_agreement/dismiss_shared_experience_ceremony` — 以三个白名单 command 暴露仪式读取、确认/暂缓和非否决关闭。
+- `apps/desktop/src/App.tsx:App.resolveCeremony` — 共同约定显示确认入账/暂不记录；实质分歧、关系变化和共同完成只允许知悉关闭。
+- `apps/desktop/src/App.test.tsx` — 固定候选与分歧视图，验证准确表述、双方原话、命令参数及无否认入口。
+
+**入口**：应用启动恢复未处理仪式，或 `send_message` 返回本轮新仪式；React 只能提交候选 ID/共享 Claim ID，不能构造或改写领域记录。
+**测试**：`cargo test -p desktop-app --lib --no-fail-fast` 14/14、`npm test -- --run` 4/4、`npm run typecheck` 通过。
+
+## 2026-07-31 S20-2 schema v17 与 Vault 共同经历持久化
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_17` — 新增未入共享账本的约定候选、双方逐字支持及已入账共同经历/仪式关闭状态，迁移保持单事务回滚。
+- `crates/vault/src/repository.rs:SharedExperienceRepository` — 原子暂存候选、确认或暂缓、直接写共享 Claim、关闭通知且不撤销历史，并在重启后恢复全部状态。
+- `crates/vault/src/repository.rs:plan_conversation_forget/delete_conversation_claim_closure` — 把未确认候选和已入账共同经历纳入对话证据遗忘闭包。
+- `crates/vault/tests/shared_experience_persistence.rs` — 覆盖候选/确认/分歧/通知/遗忘的 SQLCipher 跨重启语义。
+
+**入口**：Core 只经 `SharedExperienceRepository` 写 schema v17；候选在本人确认前没有 `claims` 行，非约定关系事件以共享 Claim 与独立仪式状态同事务提交。
+**测试**：`cargo test -p vault --test shared_experience_persistence --no-fail-fast` 3/3、schema 19/19、S19 遗忘定向与持久化回归通过。
+
+## 2026-07-31 S20-1 共同经历分类与 Core 入账门禁
+
+**触达**:
+- `crates/core/src/domain.rs:SharedExperienceKind/SharedExperienceProposal/SharedAgreementCandidate` — 冻结共同约定、实质分歧、关系变化和共同完成重要事情四类领域值及候选/入账结果。
+- `crates/core/src/memory_loop.rs:MemoryCore::run_counterpart_turn/resolve_shared_agreement` — 验证本人逐字证据与当前第二自我原话，约定等待本人仪式，其他关系事件直接写共享账本。
+- `crates/core/src/in_memory.rs:SharedExperienceRepository` — 原子模拟候选确认、暂缓、共享 Claim 入账与通知关闭不删历史。
+- `crates/runtime-gateway/src/adapter.rs:parse_turn_response/response_schema` — 将 `propose_shared_experience` 加入结构化输出白名单并保持未知操作拒绝。
+
+**入口**：模型运行时只能提交四类结构化共同经历提议；Core 解析双方证据后返回候选或已入账共享 Claim，普通自由文本不触发该路径。
+**测试**：`cargo test -p core --no-fail-fast` 20/20、`cargo test -p runtime-gateway --test runtime_contract --no-fail-fast` 12/12，覆盖普通问答/本人外部经历拒绝、约定确认与暂缓、实质分歧直接入账、缺失双方证据拒绝及运行时白名单。
+
 ## 2026-07-30 S19-3 交叉回归加固与全仓门禁
 
 **触达**:

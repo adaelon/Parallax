@@ -6,7 +6,9 @@ use std::{
 
 use crate::{
     Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceId, ForgetReceipt,
-    ForgetTarget, PersonTurnClassification, RuntimeRequest, RuntimeResponse, Timestamp,
+    ForgetTarget, PersonTurnClassification, RuntimeRequest, RuntimeResponse,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
+    SharedAgreementResolution, SharedExperience, Timestamp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +168,81 @@ pub trait ForgetRepository: MemoryRepository {
         target: ForgetTarget,
         requested_at: Timestamp,
     ) -> Result<Option<ForgetReceipt>, RepositoryError>;
+}
+
+pub trait SharedExperienceRepository: MemoryRepository {
+    fn next_shared_agreement_candidate_id(&mut self) -> SharedAgreementCandidateId;
+
+    /// Persists a candidate outside the shared ledger until the person resolves
+    /// its confirmation ceremony.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without admitting a shared claim.
+    fn stage_shared_agreement_candidate(
+        &mut self,
+        candidate: SharedAgreementCandidate,
+    ) -> Result<(), RepositoryError>;
+
+    /// Resolves one candidate together with its immutable evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the candidate store cannot be queried.
+    fn shared_agreement_candidate(
+        &self,
+        id: SharedAgreementCandidateId,
+    ) -> Result<Option<SharedAgreementCandidate>, RepositoryError>;
+
+    /// Atomically records a person's confirmation or deferral. Confirmation
+    /// appends the supplied shared claim and experience; deferral appends none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without partially resolving the candidate.
+    fn commit_shared_agreement_decision(
+        &mut self,
+        id: SharedAgreementCandidateId,
+        decision: SharedAgreementDecision,
+        confirmed: Option<SharedExperience>,
+        decided_at: Timestamp,
+    ) -> Result<SharedAgreementResolution, RepositoryError>;
+
+    /// Atomically appends a non-veto shared experience and its shared claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without a partial ledger entry.
+    fn commit_shared_experience(
+        &mut self,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError>;
+
+    /// Returns every candidate in identifier order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the candidate store cannot be queried.
+    fn all_shared_agreement_candidates(
+        &self,
+    ) -> Result<Vec<SharedAgreementCandidate>, RepositoryError>;
+
+    /// Returns every admitted shared experience in claim order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the shared ledger cannot be queried.
+    fn all_shared_experiences(&self) -> Result<Vec<SharedExperience>, RepositoryError>;
+
+    /// Dismisses only the ceremonial notice; the shared claim remains immutable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without modifying shared history.
+    fn dismiss_shared_experience_ceremony(
+        &mut self,
+        claim_id: ClaimId,
+    ) -> Result<bool, RepositoryError>;
 }
 
 /// Runtime implementations receive only typed values selected by the trusted

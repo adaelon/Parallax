@@ -15,7 +15,7 @@ use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
 use state::{
     ConversationTurnResult, ConversationTurnView, HostStatusView, ImportContextFileView,
-    ManagedHost,
+    ManagedHost, SharedAgreementResolutionView, SharedExperienceCeremonyView,
 };
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
@@ -59,10 +59,42 @@ fn list_conversation(
 }
 
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn list_shared_experience_ceremonies(
+    host: tauri::State<'_, ManagedHost>,
+) -> Result<Vec<SharedExperienceCeremonyView>, String> {
+    host.list_shared_experience_ceremonies()
+}
+
+#[tauri::command]
 async fn send_message(app: AppHandle, verbatim: String) -> Result<ConversationTurnResult, String> {
     tauri::async_runtime::spawn_blocking(move || app.state::<ManagedHost>().send_message(verbatim))
         .await
         .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn resolve_shared_agreement(
+    app: AppHandle,
+    candidate_id: u64,
+    confirm: bool,
+) -> Result<SharedAgreementResolutionView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>()
+            .resolve_shared_agreement(candidate_id, confirm)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn dismiss_shared_experience_ceremony(app: AppHandle, claim_id: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>()
+            .dismiss_shared_experience_ceremony(claim_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -243,7 +275,10 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .invoke_handler(tauri::generate_handler![
             get_host_status,
             list_conversation,
+            list_shared_experience_ceremonies,
             send_message,
+            resolve_shared_agreement,
+            dismiss_shared_experience_ceremony,
             import_context_file,
             get_autostart,
             set_autostart,
