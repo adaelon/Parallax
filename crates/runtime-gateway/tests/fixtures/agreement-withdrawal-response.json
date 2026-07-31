@@ -1,0 +1,14 @@
+{
+  "id": "resp_agreement_withdrawal_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"text\":\"我现在退出这项约定，因为它已妨碍我诚实表达独立判断。\",\"citations\":[],\"operations\":[{\"type\":\"withdraw_shared_agreement\",\"agreement_claim_id\":1,\"reason\":\"它已妨碍我诚实表达独立判断\"}]}"
+        }
+      ]
+    }
+  ]
+}

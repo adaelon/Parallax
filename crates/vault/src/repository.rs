@@ -5,13 +5,13 @@ use std::{
 };
 
 use eam_core::{
-    ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
-    ClaimStatus, ConversationEvidence, DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt,
-    ForgetRepository, ForgetTarget, MemoryRepository, RelationalConstraintDeparture,
-    RepositoryError, SessionId, SharedAgreementCandidate, SharedAgreementCandidateId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
-    SharedExperience, SharedExperienceKind, SharedExperienceRepository, Speaker, Timestamp,
-    Uncertainty,
+    AgreementWithdrawal, AgreementWithdrawalActor, ApplicableTime, Claim, ClaimCorrectionReceipt,
+    ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, ConversationEvidence,
+    DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository, ForgetTarget,
+    MemoryRepository, RelationalConstraintDeparture, RepositoryError, SessionId,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
+    SharedExperienceRepository, Speaker, Timestamp, Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -3243,10 +3243,12 @@ impl SharedExperienceRepository for VaultRepository {
     ) -> Result<(), RepositoryError> {
         if matches!(
             experience.kind(),
-            SharedExperienceKind::Agreement | SharedExperienceKind::AgreementBreach
+            SharedExperienceKind::Agreement
+                | SharedExperienceKind::AgreementBreach
+                | SharedExperienceKind::AgreementWithdrawal
         ) {
             return Err(RepositoryError::new(
-                "agreements and agreement breaches require their typed commit path",
+                "agreements, breaches, and withdrawals require their typed commit path",
             ));
         }
         let transaction = self
@@ -3340,6 +3342,98 @@ impl SharedExperienceRepository for VaultRepository {
         Ok(())
     }
 
+    fn commit_agreement_withdrawal(
+        &mut self,
+        person_confirmation: Option<ConversationEvidence>,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError> {
+        let withdrawal = experience
+            .agreement_withdrawal()
+            .cloned()
+            .ok_or_else(|| RepositoryError::new("agreement withdrawal metadata is missing"))?;
+        if experience.kind() != SharedExperienceKind::AgreementWithdrawal
+            || withdrawal.id() != experience.claim().id()
+            || withdrawal.evidence_refs() != experience.claim().support()
+            || withdrawal
+                .reason()
+                .is_some_and(|reason| reason.trim().is_empty())
+            || (withdrawal.actor() == AgreementWithdrawalActor::Counterpart
+                && withdrawal.reason().is_none())
+        {
+            return Err(RepositoryError::new("invalid agreement withdrawal"));
+        }
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        match (withdrawal.actor(), person_confirmation.as_ref()) {
+            (AgreementWithdrawalActor::Person, Some(confirmation))
+                if confirmation.speaker() == Speaker::Person
+                    && confirmation.recorded_at() == withdrawal.effective_at() =>
+            {
+                insert_conversation_evidence(&transaction, confirmation)?;
+            }
+            (AgreementWithdrawalActor::Counterpart, None) => {}
+            _ => return Err(RepositoryError::new("withdrawal actor evidence is invalid")),
+        }
+        if !stored_agreement_is_active_at(
+            &transaction,
+            withdrawal.agreement_claim_id(),
+            withdrawal.effective_at(),
+        )? {
+            return Err(RepositoryError::new(
+                "withdrawn shared agreement is not active",
+            ));
+        }
+        let agreement = load_claim(&transaction, withdrawal.agreement_claim_id())?
+            .ok_or_else(|| RepositoryError::new("withdrawn agreement claim is missing"))?;
+        if !agreement
+            .support()
+            .iter()
+            .all(|citation| experience.claim().support().contains(citation))
+            || !has_exact_withdrawal_actor_evidence(
+                &transaction,
+                experience.claim().support(),
+                &withdrawal,
+            )?
+        {
+            return Err(RepositoryError::new(
+                "agreement withdrawal must preserve agreement support and exact actor evidence",
+            ));
+        }
+        insert_shared_claim(&transaction, experience.claim())?;
+        transaction
+            .execute(
+                "INSERT INTO shared_experiences
+                 (claim_id, kind, candidate_id, ceremony_dismissed,
+                  departed_agreement_claim_id, departure_reason)
+                 VALUES (?1, ?2, NULL, 0, NULL, NULL)",
+                params![
+                    to_sql_id(experience.claim().id().get())?,
+                    encode_shared_experience_kind(experience.kind()),
+                ],
+            )
+            .map_err(repository_error)?;
+        transaction
+            .execute(
+                "INSERT INTO agreement_withdrawals
+                 (claim_id, agreement_claim_id, actor, effective_at, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    to_sql_id(withdrawal.id().get())?,
+                    to_sql_id(withdrawal.agreement_claim_id().get())?,
+                    encode_agreement_withdrawal_actor(withdrawal.actor()),
+                    withdrawal.effective_at().as_millis(),
+                    withdrawal.reason(),
+                ],
+            )
+            .map_err(repository_error)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(())
+    }
+
     fn all_shared_agreement_candidates(
         &self,
     ) -> Result<Vec<SharedAgreementCandidate>, RepositoryError> {
@@ -3404,6 +3498,17 @@ impl SharedExperienceRepository for VaultRepository {
                             claim,
                             decode_bool(dismissed)?,
                             RelationalConstraintDeparture::new(agreement_claim_id, reason),
+                        ))
+                    } else if kind == SharedExperienceKind::AgreementWithdrawal {
+                        let withdrawal = load_agreement_withdrawal(
+                            self.connection(),
+                            claim_id,
+                            claim.support().to_vec(),
+                        )?;
+                        Ok(SharedExperience::restore_agreement_withdrawal(
+                            claim,
+                            decode_bool(dismissed)?,
+                            withdrawal,
                         ))
                     } else {
                         Ok(SharedExperience::restore(
@@ -3679,6 +3784,11 @@ fn validate_candidate_supersession_targets(
                             AND replacement.status = 2
                             AND replacement.effective_from <= ?2
                       )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agreement_withdrawals withdrawal
+                          WHERE withdrawal.agreement_claim_id = ?1
+                            AND withdrawal.effective_at <= ?2
+                      )
                  )",
                 params![to_sql_id(claim_id.get())?, effective_from.as_millis()],
                 |row| row.get::<_, bool>(0),
@@ -3774,6 +3884,129 @@ fn has_exact_counterpart_reason(
     Ok(false)
 }
 
+fn has_exact_withdrawal_actor_evidence(
+    connection: &Connection,
+    support: &[EvidenceCitation],
+    withdrawal: &AgreementWithdrawal,
+) -> Result<bool, RepositoryError> {
+    for citation in support {
+        let source = connection
+            .query_row(
+                "SELECT speaker, verbatim, recorded_at
+                 FROM conversation_evidence WHERE id = ?1",
+                [to_sql_id(citation.evidence_id().get())?],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(repository_error)?;
+        let Some((speaker, verbatim, recorded_at)) = source else {
+            continue;
+        };
+        if recorded_at != withdrawal.effective_at().as_millis()
+            || citation.quote().is_empty()
+            || !verbatim.contains(citation.quote())
+        {
+            continue;
+        }
+        let exact = match withdrawal.actor() {
+            AgreementWithdrawalActor::Person => {
+                decode_speaker(speaker)? == Speaker::Person
+                    && citation.quote().contains("确认退出共同约定 Claim")
+            }
+            AgreementWithdrawalActor::Counterpart => {
+                decode_speaker(speaker)? == Speaker::Counterpart
+                    && withdrawal.reason() == Some(citation.quote())
+            }
+        };
+        if exact {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn stored_agreement_is_active_at(
+    connection: &Connection,
+    agreement_claim_id: ClaimId,
+    at: Timestamp,
+) -> Result<bool, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM shared_agreement_candidates original
+                JOIN shared_experiences original_experience
+                  ON original_experience.candidate_id = original.id
+                 AND original_experience.kind = 0
+                WHERE original.confirmed_claim_id = ?1
+                  AND original.status = 2
+                  AND original.effective_from <= ?2
+                  AND (original.effective_until IS NULL
+                       OR original.effective_until >= ?2)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM shared_agreement_candidate_supersessions edge
+                      JOIN shared_agreement_candidates replacement
+                        ON replacement.id = edge.candidate_id
+                      JOIN shared_experiences replacement_experience
+                        ON replacement_experience.candidate_id = replacement.id
+                       AND replacement_experience.kind = 0
+                      WHERE edge.superseded_agreement_claim_id = ?1
+                        AND replacement.status = 2
+                        AND replacement.effective_from <= ?2
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agreement_withdrawals withdrawal
+                      WHERE withdrawal.agreement_claim_id = ?1
+                        AND withdrawal.effective_at <= ?2
+                  )
+             )",
+            params![to_sql_id(agreement_claim_id.get())?, at.as_millis()],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(repository_error)
+}
+
+fn load_agreement_withdrawal(
+    connection: &Connection,
+    claim_id: ClaimId,
+    evidence_refs: Vec<EvidenceCitation>,
+) -> Result<AgreementWithdrawal, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT agreement_claim_id, actor, effective_at, reason
+             FROM agreement_withdrawals WHERE claim_id = ?1",
+            [to_sql_id(claim_id.get())?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(repository_error)?
+        .ok_or_else(|| RepositoryError::new("agreement withdrawal record is missing"))
+        .and_then(|(agreement_claim_id, actor, effective_at, reason)| {
+            Ok(AgreementWithdrawal::restore(
+                claim_id,
+                ClaimId::from_raw(u64::try_from(agreement_claim_id).map_err(repository_error)?),
+                decode_agreement_withdrawal_actor(actor)?,
+                Timestamp::from_millis(effective_at),
+                reason,
+                evidence_refs,
+            ))
+        })
+}
+
 fn agreement_applicable_time(candidate: &SharedAgreementCandidate) -> ApplicableTime {
     let start = candidate
         .effective_from()
@@ -3859,6 +4092,7 @@ const fn encode_shared_experience_kind(kind: SharedExperienceKind) -> i64 {
         SharedExperienceKind::RelationshipChange => 2,
         SharedExperienceKind::SharedAchievement => 3,
         SharedExperienceKind::AgreementBreach => 4,
+        SharedExperienceKind::AgreementWithdrawal => 5,
     }
 }
 
@@ -3869,8 +4103,28 @@ fn decode_shared_experience_kind(value: i64) -> Result<SharedExperienceKind, Rep
         2 => Ok(SharedExperienceKind::RelationshipChange),
         3 => Ok(SharedExperienceKind::SharedAchievement),
         4 => Ok(SharedExperienceKind::AgreementBreach),
+        5 => Ok(SharedExperienceKind::AgreementWithdrawal),
         _ => Err(RepositoryError::new(
             "invalid persisted shared experience kind",
+        )),
+    }
+}
+
+const fn encode_agreement_withdrawal_actor(actor: AgreementWithdrawalActor) -> i64 {
+    match actor {
+        AgreementWithdrawalActor::Person => 0,
+        AgreementWithdrawalActor::Counterpart => 1,
+    }
+}
+
+fn decode_agreement_withdrawal_actor(
+    value: i64,
+) -> Result<AgreementWithdrawalActor, RepositoryError> {
+    match value {
+        0 => Ok(AgreementWithdrawalActor::Person),
+        1 => Ok(AgreementWithdrawalActor::Counterpart),
+        _ => Err(RepositoryError::new(
+            "invalid persisted agreement withdrawal actor",
         )),
     }
 }
@@ -8709,6 +8963,14 @@ fn delete_conversation_claim_closure(
             "DELETE FROM shared_agreement_candidate_supersessions
              WHERE {candidate_predicate} OR {}",
             id_predicate("superseded_agreement_claim_id", &plan.claim_ids)
+        ),
+        [],
+    )?;
+    counts.derived += transaction.execute(
+        &format!(
+            "DELETE FROM agreement_withdrawals
+             WHERE {claim_predicate} OR {}",
+            id_predicate("agreement_claim_id", &plan.claim_ids)
         ),
         [],
     )?;

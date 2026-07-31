@@ -1765,3 +1765,40 @@ new agreement proposal(statement, scope, validity, supersedes[])
 ```
 
 S23 不实现 S24 的任一方退出，也不尝试一般自然语言蕴含、范围相减或隐式“最新版本优先”。自动冲突检测只覆盖具有显式相反否定极性的直接冲突；无法可靠自动识别的语义冲突仍必须由结构化提议显式列出整份取代目标，并接受 Core/Vault 活动目标校验。
+
+### 9.24 S24 任一方退出约定与非对称仪式当前实现边界
+
+```text
+crates/core/src/
+  domain.rs / memory_loop.rs        # 独立退出事件、非对称理由门禁与生效时间
+  in_memory.rs / ports.rs           # 原子提交、活动复核与遗忘闭包
+crates/retrieval/src/lib.rs         # 退出生效前后未来关系约束投影
+crates/runtime-gateway/src/adapter.rs
+                                      # 第二自我退出严格 JSON 与白名单操作
+crates/vault/src/
+  schema.rs / repository.rs         # schema v21、退出关系、重启与遗忘顺序
+apps/desktop/src-tauri/src/
+  lib.rs / state.rs                 # 活动约定清单、本人退出窄 command、可信仪式投影
+apps/desktop/src/App.tsx            # 本人防误触确认与第二自我不可否决通知
+```
+
+```text
+counterpart path:
+  frozen active constraint
+    -> withdraw_shared_agreement(claim_id, non-empty reason)
+    -> strict parse + Core active/reason/response-quote validation
+    -> atomic withdrawal + shared history
+    -> notice exposes actor/reason/effective_at
+    -> person may acknowledge or continue responding; no veto action
+
+person path:
+  list_active_shared_agreements
+    -> select one trusted current Agreement Claim
+    -> cancel confirmation => no withdrawal command
+    -> confirm(reason optional)
+    -> withdraw_shared_agreement_as_person
+    -> atomic confirmation evidence + withdrawal + shared history
+    -> refresh non-veto ceremonial result
+```
+
+S24 不复用约定取代、关系约束偏离或遗忘语义。退出只从 `effective_at` 起停止原约定未来投影；原签署、履行、违约与退出历史继续可追溯。本人理由为空时保存为无理由退出，第二自我理由为空、缺字段、不在响应中逐字出现或目标不活动时均不得退出。

@@ -257,6 +257,19 @@ pub trait SharedExperienceRepository: MemoryRepository {
         experience: SharedExperience,
     ) -> Result<(), RepositoryError>;
 
+    /// Atomically appends a prospective agreement withdrawal and its shared
+    /// history claim. Person withdrawals also append the supplied confirmation
+    /// evidence in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without partially ending the agreement.
+    fn commit_agreement_withdrawal(
+        &mut self,
+        person_confirmation: Option<ConversationEvidence>,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError>;
+
     /// Returns every candidate in identifier order.
     ///
     /// # Errors

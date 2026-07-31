@@ -1,5 +1,51 @@
 # 代码链路
 
+## 2026-07-31 S24-4 全仓门禁、迁移基线与实现级收口
+
+**触达**:
+- `crates/vault/tests/claim_correction_persistence.rs`、`encrypted_repository.rs`、`identity_persistence.rs`、`memory_persistence.rs`、`self_bundle_persistence.rs`、`windows_unlock.rs` — 将库重启后的 schema 基线同步为 v21，不放宽其余恢复断言。
+- `crates/core/src/memory_loop.rs:record_counterpart_agreement_withdrawal` — 提取单次退出落账并把活动约定查找改为显式错误，满足无 panic 与函数长度门禁。
+- `crates/runtime-gateway/src/adapter.rs:parse_agreement_withdrawal_operation`、`crates/vault/tests/shared_experience_persistence.rs:persist_person_withdrawal_with_breach` — 分离严格解析与测试准备链路，保持原行为并通过 Clippy。
+- `docs/architecture.md:§9.24`、`docs/code-trail.md:S24-1～S24-4` — 对齐领域、schema、运行时、桌面和非对称仪式的完整真实链路。
+
+**入口**：S24-1～S24-3 的完整实现 diff 经全仓行为测试、静态检查、桌面/前端构建、链接与 JSON 夹具审计后进入提交。
+**测试**：Rust 全仓 224/224、fmt、Clippy `-D warnings`、桌面 all-targets、React 9/9、TypeScript 与生产构建通过。
+
+## 2026-07-31 S24-3 运行时独立退出与桌面非对称仪式
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:parse_turn_response/response_schema` — 白名单解析独立 `withdraw_shared_agreement`，要求活动约定 Claim 与必填理由；缺字段作为无效响应 fail closed，未知操作维持零写入拒绝。
+- `apps/desktop/src-tauri/src/state.rs:list_active_shared_agreements_from_core/withdraw_shared_agreement_as_person_from_core/list_shared_experience_ceremonies_from_core` — 只投影当前活动约定，接通本人确认退出，并从可信退出事件展示行为方、生效时间与理由。
+- `apps/desktop/src-tauri/src/lib.rs:list_active_shared_agreements/withdraw_shared_agreement_as_person` — 注册两个窄白名单 command，不向 WebView 暴露仓储或通用 Core 能力。
+- `apps/desktop/src/App.tsx:openAgreementManager/confirmPersonWithdrawal/acknowledgeCounterpartWithdrawal` — 取消防误触确认时零调用，确认时理由可空；第二自我退出通知只提供“已知悉/继续回应”，没有否决入口。
+- `crates/runtime-gateway/tests/runtime_contract.rs`、`apps/desktop/src-tauri/src/state.rs`、`apps/desktop/src/App.test.tsx` — 固定严格 JSON、活动清单、本人确认和第二自我不可否决通知。
+
+**入口**：第二自我在相关冻结工作上下文中提交结构化退出；本人从桌面“管理共同约定”选择活动约定并经确认弹窗调用窄 command。
+**测试**：Runtime contract 17/17、桌面 Rust 18/18、React 9/9 与 TypeScript 类型检查通过。
+
+## 2026-07-31 S24-2 schema v21、重启恢复与遗忘闭包
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_21` — 扩展共同经历 kind 并新增退出表，约束本人理由可选、第二自我理由必填，迁移保持单事务回滚。
+- `crates/vault/src/repository.rs:commit_agreement_withdrawal/all_shared_experiences` — 原子持久化并恢复退出 actor、生效时间、理由和共享 Claim 证据，重复或非活动目标拒绝。
+- `crates/vault/src/repository.rs:delete_conversation_claim_closure` — 遗忘时先删除退出关系，再删除共同经历和原约定 Claim，维持同一递归删除闭包。
+- `crates/vault/tests/shared_experience_persistence.rs`、`crates/vault/src/schema.rs` — 覆盖重启、旧违约保留、生效前后投影、遗忘闭包与 v21 中断迁移。
+
+**入口**：Core 通过 `SharedExperienceRepository::commit_agreement_withdrawal` 写入本人确认或第二自我结构化退出；重启由 Vault 还原同一领域事件。
+**测试**：Vault 共同经历 7/7、schema 迁移 23/23 通过。
+
+## 2026-07-31 S24-1 独立退出领域契约与未来投影
+
+**触达**:
+- `crates/core/src/domain.rs:AgreementWithdrawal/agreement_is_active_at` — 新增独立退出 actor、理由、证据与生效时间模型，并把已生效退出纳入活动约定判定。
+- `crates/core/src/memory_loop.rs:withdraw_shared_agreement_as_person/persist_agreement_withdrawals` — 本人仅在确认后退出，第二自我仅凭响应中逐字非空理由立即退出，均写为不可否决共同经历。
+- `crates/core/src/in_memory.rs:commit_agreement_withdrawal` — 原子校验活动目标、行为方证据、原约定支持与重复退出，不复用违约或取代路径。
+- `crates/retrieval/src/lib.rs:project_active_relational_constraints` — 从退出生效时间起停止原约定未来投影，保留生效前投影与全部历史。
+- `crates/core/tests/shared_experiences.rs`、`crates/retrieval/tests/relational_constraints.rs` — 固定未确认不退出、理由缺失拒绝、立即不可否决退出及生效前后投影。
+
+**入口**：本人结构化确认调用 `withdraw_shared_agreement_as_person`；第二自我在冻结工作上下文中提交独立 `AgreementWithdrawalProposal`。
+**测试**：Core 共同经历 13/13、Retrieval 关系约束 4/4 通过。
+
 ## 2026-07-31 S23-4 全仓门禁、实现级 diff 审计与文档对齐
 
 **触达**:

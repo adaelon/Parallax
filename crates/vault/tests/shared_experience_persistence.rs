@@ -1,8 +1,8 @@
 use eam_core::{
-    ActiveRelationalConstraint, ClaimId, ClaimOwner, EvidenceCitation, EvidenceId, ForgetRequest,
-    ForgetTarget, IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification,
-    RelationalConstraintDeparture, RuntimeResponse, ScriptedRuntime, SessionId,
-    SharedAgreementAssent, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    ActiveRelationalConstraint, AgreementWithdrawalActor, ClaimId, ClaimOwner, EvidenceCitation,
+    EvidenceId, ForgetRequest, ForgetTarget, IncrementingClock, MemoryCore, MemoryRepository,
+    PersonTurnClassification, RelationalConstraintDeparture, RuntimeResponse, ScriptedRuntime,
+    SessionId, SharedAgreementAssent, SharedAgreementCandidateStatus, SharedAgreementDecision,
     SharedAgreementRevision, SharedExperienceKind, SharedExperienceProposal,
     SharedExperienceRepository, Timestamp, WorkingContext,
 };
@@ -48,6 +48,72 @@ fn disagreement_response() -> RuntimeResponse {
     )
 }
 
+fn persist_person_withdrawal_with_breach(
+    vault_path: &std::path::Path,
+    reason: &str,
+) -> (ClaimId, ClaimId) {
+    let departure = RuntimeResponse::new("我会偏离一次，因为当前安全边界优先。")
+        .with_relational_constraint_departure(RelationalConstraintDeparture::new(
+            ClaimId::from_raw(1),
+            "当前安全边界优先",
+        ));
+    let repository = VaultRepository::open(vault_path, VaultKey::new([0x98; 32])).unwrap();
+    let mut core = MemoryCore::new(
+        repository,
+        ScriptedRuntime::new(
+            [
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+            ],
+            [agreement_response(), departure],
+        ),
+        IncrementingClock::new(2_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let staged = core
+        .run_counterpart_turn(
+            SessionId::new("shared"),
+            "我同意以后直接指出关键逃避。",
+            context,
+        )
+        .unwrap();
+    let agreement_claim_id = core
+        .resolve_shared_agreement(
+            staged.pending_agreement_candidate_ids()[0],
+            SharedAgreementDecision::Confirm,
+        )
+        .unwrap()
+        .claim_id()
+        .unwrap();
+    let constraint = ActiveRelationalConstraint::new(
+        agreement_claim_id,
+        "发现关键逃避时直接指出",
+        "双方的重要议题讨论",
+        Timestamp::from_millis(2_000),
+        None,
+    )
+    .unwrap();
+    let context = core
+        .freeze_working_context(&[])
+        .unwrap()
+        .with_active_relational_constraints(vec![constraint])
+        .unwrap();
+    core.run_counterpart_turn(SessionId::new("shared"), "这次请破例。", context)
+        .unwrap();
+    let withdrawal_claim_id = core
+        .withdraw_shared_agreement_as_person(
+            SessionId::new("shared"),
+            agreement_claim_id,
+            true,
+            Some(reason.to_owned()),
+        )
+        .unwrap()
+        .unwrap();
+    let (repository, _, _) = core.into_parts();
+    repository.close().unwrap();
+    (agreement_claim_id, withdrawal_claim_id)
+}
+
 #[test]
 fn agreement_candidate_survives_reopen_without_entering_shared_ledger_until_confirmed() {
     let vault = tempdir().unwrap();
@@ -77,7 +143,7 @@ fn agreement_candidate_survives_reopen_without_entering_shared_ledger_until_conf
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 20);
+    assert_eq!(repository.schema_version().unwrap(), 21);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].id(), candidate_id);
@@ -182,7 +248,7 @@ fn reasoned_agreement_breach_survives_reopen_and_forgets_with_its_agreement() {
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0xC7; 32])).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 20);
+    assert_eq!(repository.schema_version().unwrap(), 21);
     let experiences = repository.all_shared_experiences().unwrap();
     assert_eq!(experiences.len(), 2);
     let breach = experiences
@@ -199,6 +265,75 @@ fn reasoned_agreement_breach_survives_reopen_and_forgets_with_its_agreement() {
         repository,
         ScriptedRuntime::default(),
         IncrementingClock::new(4_000),
+    );
+    core.forget(ForgetRequest::new(
+        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
+        true,
+    ))
+    .unwrap();
+    assert!(
+        core.repository()
+            .all_shared_agreement_candidates()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        core.repository()
+            .all_shared_experiences()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn withdrawal_survives_reopen_preserves_breach_and_forgets_as_one_closure() {
+    let vault = tempdir().unwrap();
+    let reason = "这项承诺已妨碍我保持独立判断";
+    let (agreement_claim_id, withdrawal_claim_id) =
+        persist_person_withdrawal_with_breach(vault.path(), reason);
+
+    let repository = VaultRepository::open(vault.path(), VaultKey::new([0x98; 32])).unwrap();
+    assert_eq!(repository.schema_version().unwrap(), 21);
+    let candidates = repository.all_shared_agreement_candidates().unwrap();
+    let experiences = repository.all_shared_experiences().unwrap();
+    assert_eq!(experiences.len(), 3);
+    assert!(experiences.iter().any(|experience| {
+        experience.kind() == SharedExperienceKind::AgreementBreach
+            && experience
+                .constraint_departure()
+                .is_some_and(|departure| departure.agreement_claim_id() == agreement_claim_id)
+    }));
+    let withdrawal = experiences
+        .iter()
+        .find(|experience| experience.claim().id() == withdrawal_claim_id)
+        .unwrap()
+        .agreement_withdrawal()
+        .unwrap();
+    assert_eq!(withdrawal.actor(), AgreementWithdrawalActor::Person);
+    assert_eq!(withdrawal.reason(), Some(reason));
+    assert_eq!(withdrawal.agreement_claim_id(), agreement_claim_id);
+    assert_eq!(withdrawal.evidence_refs().len(), 3);
+
+    let query = RetrievalQuery::lexical("双方的重要议题讨论");
+    let before = project_active_relational_constraints(
+        &query,
+        &candidates,
+        &experiences,
+        Timestamp::from_millis(withdrawal.effective_at().as_millis() - 1),
+    );
+    assert_eq!(before.len(), 1);
+    let after = project_active_relational_constraints(
+        &query,
+        &candidates,
+        &experiences,
+        withdrawal.effective_at(),
+    );
+    assert!(after.is_empty());
+
+    let mut core = MemoryCore::new(
+        repository,
+        ScriptedRuntime::default(),
+        IncrementingClock::new(9_000),
     );
     core.forget(ForgetRequest::new(
         ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
@@ -535,7 +670,7 @@ fn supersession_survives_reopen_preserves_old_breach_and_forgets_as_one_closure(
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0x97; 32])).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 20);
+    assert_eq!(repository.schema_version().unwrap(), 21);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     let replacement = repository
         .shared_agreement_candidate(replacement_candidate_id)

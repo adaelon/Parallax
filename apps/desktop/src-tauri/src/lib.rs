@@ -14,8 +14,8 @@ use std::{
 use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
 use state::{
-    ConversationTurnResult, ConversationTurnView, HostStatusView, ImportContextFileView,
-    ManagedHost, SharedAgreementResolutionView, SharedAgreementRevisionView,
+    ActiveSharedAgreementView, ConversationTurnResult, ConversationTurnView, HostStatusView,
+    ImportContextFileView, ManagedHost, SharedAgreementResolutionView, SharedAgreementRevisionView,
     SharedExperienceCeremonyView,
 };
 use tauri::{
@@ -68,6 +68,14 @@ fn list_shared_experience_ceremonies(
 }
 
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn list_active_shared_agreements(
+    host: tauri::State<'_, ManagedHost>,
+) -> Result<Vec<ActiveSharedAgreementView>, String> {
+    host.list_active_shared_agreements()
+}
+
+#[tauri::command]
 async fn send_message(app: AppHandle, verbatim: String) -> Result<ConversationTurnResult, String> {
     tauri::async_runtime::spawn_blocking(move || app.state::<ManagedHost>().send_message(verbatim))
         .await
@@ -83,6 +91,21 @@ async fn resolve_shared_agreement(
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<ManagedHost>()
             .resolve_shared_agreement(candidate_id, confirm)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn withdraw_shared_agreement_as_person(
+    app: AppHandle,
+    agreement_claim_id: u64,
+    confirmed: bool,
+    reason: Option<String>,
+) -> Result<Option<u64>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>()
+            .withdraw_shared_agreement_as_person(agreement_claim_id, confirmed, reason)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -304,8 +327,10 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             get_host_status,
             list_conversation,
             list_shared_experience_ceremonies,
+            list_active_shared_agreements,
             send_message,
             resolve_shared_agreement,
+            withdraw_shared_agreement_as_person,
             revise_shared_agreement,
             dismiss_shared_experience_ceremony,
             import_context_file,

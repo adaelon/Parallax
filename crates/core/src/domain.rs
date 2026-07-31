@@ -532,6 +532,7 @@ pub enum SharedExperienceKind {
     RelationshipChange,
     SharedAchievement,
     AgreementBreach,
+    AgreementWithdrawal,
 }
 
 impl SharedExperienceKind {
@@ -915,6 +916,62 @@ pub fn shared_agreements_conflict(
         && agreement_texts_overlap(proposed.statement(), existing.statement())
 }
 
+/// Returns whether one confirmed agreement still contributes future
+/// relational constraints at the supplied instant.
+#[must_use]
+pub fn agreement_is_active_at(
+    agreement_claim_id: ClaimId,
+    candidates: &[SharedAgreementCandidate],
+    experiences: &[SharedExperience],
+    at: Timestamp,
+) -> bool {
+    let agreement_exists = experiences.iter().any(|experience| {
+        experience.kind() == SharedExperienceKind::Agreement
+            && experience.claim().id() == agreement_claim_id
+            && experience.claim().status() == ClaimStatus::Current
+    });
+    let Some(original) = candidates.iter().find(|candidate| {
+        candidate.status() == SharedAgreementCandidateStatus::Confirmed
+            && candidate.claim_id() == Some(agreement_claim_id)
+    }) else {
+        return false;
+    };
+    if !agreement_exists
+        || original
+            .effective_from()
+            .is_none_or(|from| at.as_millis() < from.as_millis())
+        || original
+            .effective_until()
+            .is_some_and(|until| at.as_millis() > until.as_millis())
+    {
+        return false;
+    }
+    let superseded = candidates.iter().any(|candidate| {
+        candidate.status() == SharedAgreementCandidateStatus::Confirmed
+            && candidate.claim_id().is_some_and(|claim_id| {
+                experiences.iter().any(|experience| {
+                    experience.kind() == SharedExperienceKind::Agreement
+                        && experience.claim().id() == claim_id
+                        && experience.claim().status() == ClaimStatus::Current
+                })
+            })
+            && candidate
+                .effective_from()
+                .is_some_and(|from| from.as_millis() <= at.as_millis())
+            && candidate
+                .supersedes_agreement_ids()
+                .contains(&agreement_claim_id)
+    });
+    let withdrawn = experiences.iter().any(|experience| {
+        experience.agreement_withdrawal().is_some_and(|withdrawal| {
+            withdrawal.agreement_claim_id() == agreement_claim_id
+                && withdrawal.effective_at().as_millis() <= at.as_millis()
+                && experience.claim().status() == ClaimStatus::Current
+        })
+    });
+    !superseded && !withdrawn
+}
+
 fn agreement_scopes_overlap(left: &str, right: &str) -> bool {
     agreement_texts_overlap(
         &left.replace("双方", " ").replace("共同", " "),
@@ -1098,6 +1155,118 @@ pub struct RelationalConstraintDeparture {
     reason: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgreementWithdrawalActor {
+    Person,
+    Counterpart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgreementWithdrawal {
+    id: ClaimId,
+    agreement_claim_id: ClaimId,
+    actor: AgreementWithdrawalActor,
+    effective_at: Timestamp,
+    reason: Option<String>,
+    evidence_refs: Vec<EvidenceCitation>,
+}
+
+impl AgreementWithdrawal {
+    pub(crate) fn recorded(
+        id: ClaimId,
+        agreement_claim_id: ClaimId,
+        actor: AgreementWithdrawalActor,
+        effective_at: Timestamp,
+        reason: Option<String>,
+        evidence_refs: Vec<EvidenceCitation>,
+    ) -> Self {
+        Self {
+            id,
+            agreement_claim_id,
+            actor,
+            effective_at,
+            reason,
+            evidence_refs,
+        }
+    }
+
+    /// Restores a withdrawal from trusted persistence.
+    #[must_use]
+    pub fn restore(
+        id: ClaimId,
+        agreement_claim_id: ClaimId,
+        actor: AgreementWithdrawalActor,
+        effective_at: Timestamp,
+        reason: Option<String>,
+        evidence_refs: Vec<EvidenceCitation>,
+    ) -> Self {
+        Self::recorded(
+            id,
+            agreement_claim_id,
+            actor,
+            effective_at,
+            reason,
+            evidence_refs,
+        )
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> ClaimId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn agreement_claim_id(&self) -> ClaimId {
+        self.agreement_claim_id
+    }
+
+    #[must_use]
+    pub const fn actor(&self) -> AgreementWithdrawalActor {
+        self.actor
+    }
+
+    #[must_use]
+    pub const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    #[must_use]
+    pub fn evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.evidence_refs
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgreementWithdrawalProposal {
+    agreement_claim_id: ClaimId,
+    reason: String,
+}
+
+impl AgreementWithdrawalProposal {
+    #[must_use]
+    pub fn new(agreement_claim_id: ClaimId, reason: impl Into<String>) -> Self {
+        Self {
+            agreement_claim_id,
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn agreement_claim_id(&self) -> ClaimId {
+        self.agreement_claim_id
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 impl RelationalConstraintDeparture {
     #[must_use]
     pub fn new(agreement_claim_id: ClaimId, reason: impl Into<String>) -> Self {
@@ -1154,6 +1323,7 @@ pub struct SharedExperience {
     claim: Claim,
     ceremony_dismissed: bool,
     constraint_departure: Option<RelationalConstraintDeparture>,
+    agreement_withdrawal: Option<AgreementWithdrawal>,
 }
 
 impl SharedExperience {
@@ -1163,6 +1333,7 @@ impl SharedExperience {
             claim,
             ceremony_dismissed: false,
             constraint_departure: None,
+            agreement_withdrawal: None,
         }
     }
 
@@ -1175,6 +1346,20 @@ impl SharedExperience {
             claim,
             ceremony_dismissed: false,
             constraint_departure: Some(departure),
+            agreement_withdrawal: None,
+        }
+    }
+
+    pub(crate) const fn admitted_agreement_withdrawal(
+        claim: Claim,
+        withdrawal: AgreementWithdrawal,
+    ) -> Self {
+        Self {
+            kind: SharedExperienceKind::AgreementWithdrawal,
+            claim,
+            ceremony_dismissed: false,
+            constraint_departure: None,
+            agreement_withdrawal: Some(withdrawal),
         }
     }
 
@@ -1190,6 +1375,7 @@ impl SharedExperience {
             claim,
             ceremony_dismissed,
             constraint_departure: None,
+            agreement_withdrawal: None,
         }
     }
 
@@ -1205,6 +1391,23 @@ impl SharedExperience {
             claim,
             ceremony_dismissed,
             constraint_departure: Some(departure),
+            agreement_withdrawal: None,
+        }
+    }
+
+    /// Restores an agreement withdrawal from trusted persistence.
+    #[must_use]
+    pub const fn restore_agreement_withdrawal(
+        claim: Claim,
+        ceremony_dismissed: bool,
+        withdrawal: AgreementWithdrawal,
+    ) -> Self {
+        Self {
+            kind: SharedExperienceKind::AgreementWithdrawal,
+            claim,
+            ceremony_dismissed,
+            constraint_departure: None,
+            agreement_withdrawal: Some(withdrawal),
         }
     }
 
@@ -1226,6 +1429,11 @@ impl SharedExperience {
     #[must_use]
     pub const fn constraint_departure(&self) -> Option<&RelationalConstraintDeparture> {
         self.constraint_departure.as_ref()
+    }
+
+    #[must_use]
+    pub const fn agreement_withdrawal(&self) -> Option<&AgreementWithdrawal> {
+        self.agreement_withdrawal.as_ref()
     }
 
     pub(crate) fn dismiss_ceremony(&mut self) {
@@ -2005,6 +2213,7 @@ pub struct RuntimeResponse {
     shared_experience_proposals: Vec<SharedExperienceProposal>,
     shared_agreement_assents: Vec<SharedAgreementAssent>,
     relational_constraint_departures: Vec<RelationalConstraintDeparture>,
+    agreement_withdrawals: Vec<AgreementWithdrawalProposal>,
     unsupported_operations: Vec<UnsupportedStructuredOperation>,
 }
 
@@ -2018,6 +2227,7 @@ impl RuntimeResponse {
             shared_experience_proposals: Vec::new(),
             shared_agreement_assents: Vec::new(),
             relational_constraint_departures: Vec::new(),
+            agreement_withdrawals: Vec::new(),
             unsupported_operations: Vec::new(),
         }
     }
@@ -2052,6 +2262,12 @@ impl RuntimeResponse {
         departure: RelationalConstraintDeparture,
     ) -> Self {
         self.relational_constraint_departures.push(departure);
+        self
+    }
+
+    #[must_use]
+    pub fn with_agreement_withdrawal(mut self, withdrawal: AgreementWithdrawalProposal) -> Self {
+        self.agreement_withdrawals.push(withdrawal);
         self
     }
 
@@ -2094,6 +2310,11 @@ impl RuntimeResponse {
     #[must_use]
     pub fn relational_constraint_departures(&self) -> &[RelationalConstraintDeparture] {
         &self.relational_constraint_departures
+    }
+
+    #[must_use]
+    pub fn agreement_withdrawals(&self) -> &[AgreementWithdrawalProposal] {
+        &self.agreement_withdrawals
     }
 
     #[must_use]
@@ -2261,6 +2482,43 @@ pub struct RelationalConstraintDepartureRejection {
     reason: RelationalConstraintDepartureRejectionReason,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgreementWithdrawalRejectionReason {
+    ConstraintNotActive(ClaimId),
+    AgreementNotFound(ClaimId),
+    EmptyReason,
+    ReasonNotInResponse,
+    DuplicateWithdrawal(ClaimId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgreementWithdrawalRejection {
+    proposal_index: usize,
+    reason: AgreementWithdrawalRejectionReason,
+}
+
+impl AgreementWithdrawalRejection {
+    pub(crate) const fn new(
+        proposal_index: usize,
+        reason: AgreementWithdrawalRejectionReason,
+    ) -> Self {
+        Self {
+            proposal_index,
+            reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn proposal_index(&self) -> usize {
+        self.proposal_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &AgreementWithdrawalRejectionReason {
+        &self.reason
+    }
+}
+
 impl RelationalConstraintDepartureRejection {
     pub(crate) const fn new(
         proposal_index: usize,
@@ -2371,6 +2629,8 @@ pub struct TurnOutcome {
     rejected_agreement_assents: Vec<SharedAgreementAssentRejection>,
     recorded_constraint_departure_ids: Vec<ClaimId>,
     rejected_constraint_departures: Vec<RelationalConstraintDepartureRejection>,
+    recorded_agreement_withdrawal_ids: Vec<ClaimId>,
+    rejected_agreement_withdrawals: Vec<AgreementWithdrawalRejection>,
     rejected_operations: Vec<StructuredOperationRejection>,
     validated_citations: Vec<EvidenceCitation>,
 }
@@ -2395,6 +2655,8 @@ impl TurnOutcome {
             rejected_agreement_assents: Vec::new(),
             recorded_constraint_departure_ids: Vec::new(),
             rejected_constraint_departures: Vec::new(),
+            recorded_agreement_withdrawal_ids: Vec::new(),
+            rejected_agreement_withdrawals: Vec::new(),
             rejected_operations: Vec::new(),
             validated_citations,
         }
@@ -2439,6 +2701,16 @@ impl TurnOutcome {
     ) -> Self {
         self.recorded_constraint_departure_ids = recorded;
         self.rejected_constraint_departures = rejected;
+        self
+    }
+
+    pub(crate) fn with_agreement_withdrawals(
+        mut self,
+        recorded: Vec<ClaimId>,
+        rejected: Vec<AgreementWithdrawalRejection>,
+    ) -> Self {
+        self.recorded_agreement_withdrawal_ids = recorded;
+        self.rejected_agreement_withdrawals = rejected;
         self
     }
 
@@ -2508,6 +2780,16 @@ impl TurnOutcome {
     #[must_use]
     pub fn rejected_constraint_departures(&self) -> &[RelationalConstraintDepartureRejection] {
         &self.rejected_constraint_departures
+    }
+
+    #[must_use]
+    pub fn recorded_agreement_withdrawal_ids(&self) -> &[ClaimId] {
+        &self.recorded_agreement_withdrawal_ids
+    }
+
+    #[must_use]
+    pub fn rejected_agreement_withdrawals(&self) -> &[AgreementWithdrawalRejection] {
+        &self.rejected_agreement_withdrawals
     }
 
     #[must_use]

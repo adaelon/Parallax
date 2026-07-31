@@ -13,7 +13,7 @@ use std::{
 use eam_core::{
     ActiveRelationalConstraint, Claim, ClaimId, ClaimStatus, DecisionImpact, DisputeState,
     EvidenceCitation, SharedAgreementCandidate, SharedAgreementCandidateStatus, SharedExperience,
-    SharedExperienceKind, Timestamp,
+    SharedExperienceKind, Timestamp, agreement_is_active_at,
 };
 use eam_ingestion::{EvidenceBlockRef, EvidenceBlockView};
 
@@ -237,25 +237,6 @@ pub fn project_active_relational_constraints(
         return Vec::new();
     }
 
-    let agreement_claim_exists = |claim_id: ClaimId| {
-        experiences.iter().any(|experience| {
-            experience.kind() == SharedExperienceKind::Agreement
-                && experience.claim().id() == claim_id
-                && experience.claim().status() == ClaimStatus::Current
-        })
-    };
-    let superseded_claim_ids = candidates
-        .iter()
-        .filter(|candidate| candidate.status() == SharedAgreementCandidateStatus::Confirmed)
-        .filter(|candidate| candidate.claim_id().is_some_and(&agreement_claim_exists))
-        .filter(|candidate| {
-            candidate
-                .effective_from()
-                .is_some_and(|from| from.as_millis() <= frozen_at.as_millis())
-        })
-        .flat_map(|candidate| candidate.supersedes_agreement_ids().iter().copied())
-        .collect::<BTreeSet<_>>();
-
     let mut projected = Vec::new();
     let mut seen = BTreeSet::new();
     for candidate in candidates {
@@ -265,7 +246,7 @@ pub fn project_active_relational_constraints(
         let Some(claim_id) = candidate.claim_id() else {
             continue;
         };
-        if superseded_claim_ids.contains(&claim_id) {
+        if !agreement_is_active_at(claim_id, candidates, experiences, frozen_at) {
             continue;
         }
         if !seen.insert(claim_id) {

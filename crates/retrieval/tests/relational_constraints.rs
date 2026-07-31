@@ -1,7 +1,7 @@
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, SharedAgreementCandidate,
-    SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedExperience,
-    SharedExperienceKind, Timestamp,
+    AgreementWithdrawal, AgreementWithdrawalActor, ApplicableTime, Claim, ClaimId, ClaimOwner,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
+    SharedExperience, SharedExperienceKind, Timestamp,
 };
 use eam_retrieval::{RetrievalQuery, project_active_relational_constraints};
 
@@ -54,6 +54,31 @@ fn agreement(claim_id: u64, from: i64, until: Option<i64>) -> SharedExperience {
             Timestamp::from_millis(from),
         ),
         true,
+    )
+}
+
+fn withdrawal(claim_id: u64, agreement_claim_id: u64, effective_at: i64) -> SharedExperience {
+    let withdrawal_claim_id = ClaimId::from_raw(claim_id);
+    let withdrawal = AgreementWithdrawal::restore(
+        withdrawal_claim_id,
+        ClaimId::from_raw(agreement_claim_id),
+        AgreementWithdrawalActor::Person,
+        Timestamp::from_millis(effective_at),
+        None,
+        Vec::new(),
+    );
+    SharedExperience::restore_agreement_withdrawal(
+        Claim::restore(
+            withdrawal_claim_id,
+            ClaimOwner::Shared,
+            "本人退出共同约定".to_owned(),
+            Vec::new(),
+            None,
+            ApplicableTime::At(Timestamp::from_millis(effective_at)),
+            Timestamp::from_millis(effective_at),
+        ),
+        false,
+        withdrawal,
     )
 }
 
@@ -258,4 +283,37 @@ fn whole_supersession_changes_only_future_projection_and_keeps_compatible_agreem
         "a superseded agreement must not revive when its replacement ends"
     );
     assert_eq!(experiences.len(), 3, "supersession must not delete history");
+}
+
+#[test]
+fn withdrawal_stops_only_future_projection_and_keeps_agreement_history() {
+    let candidates = vec![confirmed_candidate(
+        1,
+        11,
+        "复盘时直接指出关键逃避",
+        "双方共同项目复盘",
+        1_000,
+        None,
+        vec![],
+    )];
+    let experiences = vec![agreement(11, 1_000, None), withdrawal(21, 11, 5_000)];
+    let query = RetrievalQuery::lexical("共同项目复盘");
+
+    let before = project_active_relational_constraints(
+        &query,
+        &candidates,
+        &experiences,
+        Timestamp::from_millis(4_999),
+    );
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].agreement_claim_id(), ClaimId::from_raw(11));
+
+    let effective = project_active_relational_constraints(
+        &query,
+        &candidates,
+        &experiences,
+        Timestamp::from_millis(5_000),
+    );
+    assert!(effective.is_empty());
+    assert_eq!(experiences.len(), 2, "withdrawal must not delete history");
 }

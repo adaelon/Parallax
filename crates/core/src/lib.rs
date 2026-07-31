@@ -11,8 +11,10 @@ mod ports;
 mod scripted_runtime;
 
 pub use domain::{
-    ActiveRelationalConstraint, ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimId, ClaimOwner,
-    ClaimStatus, ConversationEvidence, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId,
+    ActiveRelationalConstraint, AgreementWithdrawal, AgreementWithdrawalActor,
+    AgreementWithdrawalProposal, AgreementWithdrawalRejection, AgreementWithdrawalRejectionReason,
+    ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimId, ClaimOwner, ClaimStatus,
+    ConversationEvidence, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId,
     ForgetReceipt, ForgetRequest, ForgetTarget, FrozenEvidenceBlock, FrozenLedgerClaim,
     FrozenMemoryDispute, FrozenRetrievalWindow, JudgmentProposal, JudgmentRejection,
     JudgmentRejectionReason, PersonTurnClassification, RelationalConstraintDeparture,
@@ -25,7 +27,7 @@ pub use domain::{
     SharedExperienceProposal, SharedExperienceRejection, SharedExperienceRejectionReason,
     SourceCurrentness, Speaker, StructuredOperationRejection, StructuredOperationRejectionReason,
     Timestamp, TurnOutcome, Uncertainty, UnsupportedStructuredOperation, WorkingContext,
-    WorkingContextError,
+    WorkingContextError, agreement_is_active_at,
 };
 pub use in_memory::InMemoryRepository;
 pub use memory_loop::{CoreError, MemoryCore};

@@ -36,6 +36,10 @@ const SHARED_AGREEMENT_ASSENT_RESPONSE: &str =
     include_str!("fixtures/shared-agreement-assent-response.json");
 const RELATIONAL_CONSTRAINT_DEPARTURE_RESPONSE: &str =
     include_str!("fixtures/relational-constraint-departure-response.json");
+const AGREEMENT_WITHDRAWAL_RESPONSE: &str =
+    include_str!("fixtures/agreement-withdrawal-response.json");
+const AGREEMENT_WITHDRAWAL_MISSING_REASON_RESPONSE: &str =
+    include_str!("fixtures/agreement-withdrawal-missing-reason-response.json");
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -781,6 +785,100 @@ fn active_constraint_and_reasoned_departure_share_the_strict_runtime_contract() 
             claim_id: agreement_claim_id,
         }
     ));
+}
+
+#[test]
+fn counterpart_withdrawal_is_distinct_immediate_and_non_vetoable() {
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(SHARED_AGREEMENT_RESPONSE),
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(AGREEMENT_WITHDRAWAL_RESPONSE),
+    ]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(2_000),
+    );
+    let first_context = core.freeze_working_context(&[]).unwrap();
+    let first = core
+        .run_counterpart_turn(
+            SessionId::new("chat"),
+            "我同意复盘时直接指出关键逃避。",
+            first_context,
+        )
+        .unwrap();
+    let agreement_claim_id = core
+        .resolve_shared_agreement(
+            first.pending_agreement_candidate_ids()[0],
+            SharedAgreementDecision::Confirm,
+        )
+        .unwrap()
+        .claim_id()
+        .unwrap();
+    let constraint = ActiveRelationalConstraint::new(
+        agreement_claim_id,
+        "复盘时直接指出关键逃避",
+        "双方共同项目复盘",
+        Timestamp::from_millis(2_000),
+        None,
+    )
+    .unwrap();
+    let context = WorkingContext::from_selected_evidence(Vec::new(), Timestamp::from_millis(3_000))
+        .with_active_relational_constraints(vec![constraint])
+        .unwrap();
+    let second = core
+        .run_counterpart_turn(SessionId::new("chat"), "你仍愿意遵守吗？", context)
+        .unwrap();
+
+    assert_eq!(second.recorded_agreement_withdrawal_ids().len(), 1);
+    assert!(second.recorded_constraint_departure_ids().is_empty());
+    let experiences = core.repository().all_shared_experiences().unwrap();
+    let withdrawal = experiences
+        .iter()
+        .find_map(eam_core::SharedExperience::agreement_withdrawal)
+        .unwrap();
+    assert_eq!(withdrawal.agreement_claim_id(), agreement_claim_id);
+    assert_eq!(withdrawal.reason(), Some("它已妨碍我诚实表达独立判断"));
+    let response_disclosure = core
+        .runtime()
+        .disclosures()
+        .iter()
+        .filter(|record| record.invocation() == InvocationKind::Response)
+        .nth(1)
+        .unwrap();
+    let request: Value = serde_json::from_str(response_disclosure.request_json()).unwrap();
+    let instructions = request["instructions"].as_str().unwrap();
+    assert!(instructions.contains("withdraw_shared_agreement"));
+    assert!(instructions.contains("person approval is forbidden"));
+    let schema = request["text"]["format"]["schema"].to_string();
+    assert!(schema.contains("withdraw_shared_agreement"));
+    assert!(schema.contains("depart_relational_constraint"));
+}
+
+#[test]
+fn withdrawal_missing_required_reason_fails_the_strict_runtime_contract() {
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(AGREEMENT_WITHDRAWAL_MISSING_REASON_RESPONSE),
+    ]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(4_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+
+    let error = core
+        .run_counterpart_turn(SessionId::new("chat"), "请退出这项约定。", context)
+        .expect_err("withdrawal without a reason must fail closed");
+
+    assert!(matches!(
+        error,
+        CoreError::Runtime(ref runtime_error)
+            if runtime_error.kind() == RuntimeErrorKind::InvalidResponse
+    ));
+    assert!(core.repository().all_claims().unwrap().is_empty());
 }
 
 #[test]

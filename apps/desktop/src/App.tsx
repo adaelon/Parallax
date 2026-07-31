@@ -21,7 +21,10 @@ type SharedExperienceKind =
   | "substantiveDisagreement"
   | "relationshipChange"
   | "sharedAchievement"
-  | "agreementBreach";
+  | "agreementBreach"
+  | "agreementWithdrawal";
+
+type AgreementWithdrawalActor = "person" | "counterpart";
 
 export interface SharedExperienceCeremony {
   targetId: number;
@@ -36,6 +39,7 @@ export interface SharedExperienceCeremony {
   endCondition: string | null;
   agreementClaimId: number | null;
   departureReason: string | null;
+  withdrawalActor: AgreementWithdrawalActor | null;
   supersededAgreements: Array<{
     claimId: number;
     statement: string;
@@ -48,6 +52,19 @@ export interface SharedExperienceCeremony {
     speaker: Speaker;
     quote: string;
   }>;
+}
+
+interface ActiveSharedAgreement {
+  claimId: number;
+  statement: string;
+  scope: string;
+  effectiveFromMillis: number;
+  effectiveUntilMillis: number | null;
+}
+
+interface WithdrawalDraft {
+  agreement: ActiveSharedAgreement;
+  reason: string;
 }
 
 interface AgreementRevisionDraft {
@@ -70,10 +87,16 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [ceremonyAction, setCeremonyAction] = useState<string | null>(null);
+  const [activeAgreements, setActiveAgreements] = useState<ActiveSharedAgreement[]>([]);
+  const [agreementManagerOpen, setAgreementManagerOpen] = useState(false);
+  const [agreementLoading, setAgreementLoading] = useState(false);
+  const [withdrawalDraft, setWithdrawalDraft] = useState<WithdrawalDraft | null>(null);
+  const [withdrawalSubmitting, setWithdrawalSubmitting] = useState(false);
   const [revisionDraft, setRevisionDraft] = useState<AgreementRevisionDraft | null>(null);
   const [revisionNotice, setRevisionNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const conversationEnd = useRef<HTMLDivElement>(null);
+  const messageInput = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     let active = true;
@@ -143,10 +166,10 @@ export function App() {
   async function resolveCeremony(
     ceremony: SharedExperienceCeremony,
     confirm?: boolean,
-  ) {
+  ): Promise<boolean> {
     const key = ceremonyKey(ceremony);
     if (ceremonyAction !== null) {
-      return;
+      return false;
     }
     setCeremonyAction(key);
     setError(null);
@@ -164,10 +187,76 @@ export function App() {
       setCeremonies((current) =>
         current.filter((item) => ceremonyKey(item) !== key),
       );
+      return true;
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+      return false;
+    } finally {
+      setCeremonyAction(null);
+    }
+  }
+
+  async function acknowledgeCounterpartWithdrawal(
+    ceremony: SharedExperienceCeremony,
+    continueResponding: boolean,
+  ) {
+    const dismissed = await resolveCeremony(ceremony);
+    if (dismissed && continueResponding) {
+      messageInput.current?.focus();
+    }
+  }
+
+  async function openAgreementManager() {
+    if (agreementLoading) {
+      return;
+    }
+    setAgreementManagerOpen(true);
+    setAgreementLoading(true);
+    setError(null);
+    try {
+      const agreements = await invoke<ActiveSharedAgreement[]>(
+        "list_active_shared_agreements",
+      );
+      setActiveAgreements(agreements);
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+      setAgreementManagerOpen(false);
+    } finally {
+      setAgreementLoading(false);
+    }
+  }
+
+  async function confirmPersonWithdrawal() {
+    if (withdrawalDraft === null || withdrawalSubmitting) {
+      return;
+    }
+    setWithdrawalSubmitting(true);
+    setError(null);
+    const agreementClaimId = withdrawalDraft.agreement.claimId;
+    const reason = withdrawalDraft.reason.trim() || null;
+    try {
+      await invoke<number | null>("withdraw_shared_agreement_as_person", {
+        agreementClaimId,
+        confirmed: true,
+        reason,
+      });
+      setActiveAgreements((current) =>
+        current.filter((agreement) => agreement.claimId !== agreementClaimId),
+      );
+      setWithdrawalDraft(null);
+      setAgreementManagerOpen(false);
+      try {
+        const notices = await invoke<SharedExperienceCeremony[]>(
+          "list_shared_experience_ceremonies",
+        );
+        setCeremonies((current) => mergeCeremonies(current, notices));
+      } catch {
+        setError("退出已生效，但共同历史通知暂时无法刷新。");
+      }
     } catch (reason: unknown) {
       setError(errorMessage(reason));
     } finally {
-      setCeremonyAction(null);
+      setWithdrawalSubmitting(false);
     }
   }
 
@@ -248,6 +337,13 @@ export function App() {
           <span className="presence-dot" />
           加密本地 Core
         </div>
+        <button
+          className="agreement-manager-trigger"
+          onClick={() => void openAgreementManager()}
+          type="button"
+        >
+          管理共同约定
+        </button>
       </header>
 
       <section className="conversation" aria-label="持续对话">
@@ -286,6 +382,112 @@ export function App() {
         <div ref={conversationEnd} />
       </section>
 
+      {agreementManagerOpen && withdrawalDraft === null ? (
+        <div className="ceremony-layer">
+          <article
+            aria-labelledby="agreement-manager-title"
+            aria-modal="true"
+            className="ceremony-card"
+            role="dialog"
+          >
+            <p className="eyebrow">当前关系约束</p>
+            <h2 id="agreement-manager-title">管理共同约定</h2>
+            {agreementLoading ? (
+              <p className="ceremony-note">正在读取当前有效约定…</p>
+            ) : activeAgreements.length === 0 ? (
+              <p className="ceremony-note">当前没有可退出的共同约定。</p>
+            ) : (
+              <div className="agreement-list">
+                {activeAgreements.map((agreement) => (
+                  <section className="agreement-list-item" key={agreement.claimId}>
+                    <p>{agreement.statement}</p>
+                    <dl className="ceremony-boundaries">
+                      <div>
+                        <dt>Claim</dt>
+                        <dd>#{agreement.claimId}</dd>
+                      </div>
+                      <div>
+                        <dt>适用范围</dt>
+                        <dd>{agreement.scope}</dd>
+                      </div>
+                    </dl>
+                    <button
+                      className="secondary-action"
+                      onClick={() => setWithdrawalDraft({ agreement, reason: "" })}
+                      type="button"
+                    >
+                      退出这项约定
+                    </button>
+                  </section>
+                ))}
+              </div>
+            )}
+            <div className="ceremony-actions">
+              <button
+                className="secondary-action"
+                disabled={agreementLoading}
+                onClick={() => setAgreementManagerOpen(false)}
+                type="button"
+              >
+                关闭
+              </button>
+            </div>
+          </article>
+        </div>
+      ) : null}
+
+      {withdrawalDraft !== null ? (
+        <div className="ceremony-layer">
+          <article
+            aria-labelledby="withdrawal-title"
+            aria-modal="true"
+            className="ceremony-card"
+            role="dialog"
+          >
+            <p className="eyebrow">防误触确认</p>
+            <h2 id="withdrawal-title">确认退出共同约定</h2>
+            <p className="ceremony-statement">{withdrawalDraft.agreement.statement}</p>
+            <dl className="ceremony-boundaries">
+              <div>
+                <dt>共同约定</dt>
+                <dd>Claim #{withdrawalDraft.agreement.claimId}</dd>
+              </div>
+              <div>
+                <dt>影响</dt>
+                <dd>确认后立即停止未来关系约束，原约定及历史不会删除。</dd>
+              </div>
+            </dl>
+            <label className="withdrawal-reason-label" htmlFor="withdrawal-reason">
+              理由（可选）
+            </label>
+            <textarea
+              id="withdrawal-reason"
+              onChange={(event) =>
+                setWithdrawalDraft({ ...withdrawalDraft, reason: event.target.value })
+              }
+              value={withdrawalDraft.reason}
+            />
+            <div className="ceremony-actions">
+              <button
+                className="secondary-action"
+                disabled={withdrawalSubmitting}
+                onClick={() => setWithdrawalDraft(null)}
+                type="button"
+              >
+                取消
+              </button>
+              <button
+                disabled={withdrawalSubmitting}
+                onClick={() => void confirmPersonWithdrawal()}
+                type="button"
+              >
+                确认退出
+              </button>
+            </div>
+          </article>
+        </div>
+      ) : null}
+
       {activeCeremony ? (
         <div className="ceremony-layer">
           <article
@@ -295,7 +497,7 @@ export function App() {
             role="dialog"
           >
             <p className="eyebrow">共同历史仪式</p>
-            <h2 id="ceremony-title">{ceremonyTitle(activeCeremony.experienceKind)}</h2>
+            <h2 id="ceremony-title">{ceremonyTitle(activeCeremony)}</h2>
             {activeCeremony.candidateVersion !== null ? (
               <p className="ceremony-version">候选 v{activeCeremony.candidateVersion}</p>
             ) : null}
@@ -325,6 +527,28 @@ export function App() {
                 <div>
                   <dt>第二自我说明的理由</dt>
                   <dd>{activeCeremony.departureReason}</dd>
+                </div>
+              </dl>
+            ) : null}
+            {activeCeremony.experienceKind === "agreementWithdrawal" ? (
+              <dl className="ceremony-boundaries">
+                <div>
+                  <dt>退出的共同约定</dt>
+                  <dd>Claim #{activeCeremony.agreementClaimId}</dd>
+                </div>
+                <div>
+                  <dt>行为方</dt>
+                  <dd>
+                    {activeCeremony.withdrawalActor === "counterpart" ? "第二自我" : "你"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>生效时间</dt>
+                  <dd>{formatBoundaryTime(activeCeremony.effectiveFromMillis)}</dd>
+                </div>
+                <div>
+                  <dt>理由</dt>
+                  <dd>{activeCeremony.departureReason ?? "未填写"}</dd>
                 </div>
               </dl>
             ) : null}
@@ -368,7 +592,9 @@ export function App() {
               ))}
             </div>
             <p className="ceremony-note">
-              {activeCeremony.admission === "confirmationRequired"
+              {activeCeremony.experienceKind === "agreementWithdrawal"
+                ? "退出已生效并进入共同历史；只停止未来约束，另一方不能否决或撤销已完成的退出。"
+                : activeCeremony.admission === "confirmationRequired"
                 ? "只有你确认后，这项共同约定才会进入共同经历账本。"
                 : "这段共同历史已依据双方证据入账；关闭通知不会撤销记录。"}
             </p>
@@ -397,6 +623,29 @@ export function App() {
                     type="button"
                   >
                     确认入账
+                  </button>
+                </>
+              ) : activeCeremony.experienceKind === "agreementWithdrawal" &&
+                activeCeremony.withdrawalActor === "counterpart" ? (
+                <>
+                  <button
+                    className="secondary-action"
+                    disabled={ceremonyAction !== null}
+                    onClick={() =>
+                      void acknowledgeCounterpartWithdrawal(activeCeremony, false)
+                    }
+                    type="button"
+                  >
+                    已知悉
+                  </button>
+                  <button
+                    disabled={ceremonyAction !== null}
+                    onClick={() =>
+                      void acknowledgeCounterpartWithdrawal(activeCeremony, true)
+                    }
+                    type="button"
+                  >
+                    继续回应
                   </button>
                 </>
               ) : activeCeremony.admission === "nonVetoNotice" ? (
@@ -494,6 +743,7 @@ export function App() {
             maxLength={16_384}
             onChange={(event) => setDraft(event.target.value)}
             placeholder="写下此刻想说的话…"
+            ref={messageInput}
             rows={2}
             value={draft}
           />
@@ -507,8 +757,8 @@ export function App() {
   );
 }
 
-function ceremonyTitle(kind: SharedExperienceKind): string {
-  switch (kind) {
+function ceremonyTitle(ceremony: SharedExperienceCeremony): string {
+  switch (ceremony.experienceKind) {
     case "agreement":
       return "共同约定待确认";
     case "substantiveDisagreement":
@@ -519,6 +769,10 @@ function ceremonyTitle(kind: SharedExperienceKind): string {
       return "共同完成的重要事情已记录";
     case "agreementBreach":
       return "共同约定偏离已记录";
+    case "agreementWithdrawal":
+      return ceremony.withdrawalActor === "counterpart"
+        ? "第二自我已退出共同约定"
+        : "你已退出共同约定";
   }
 }
 

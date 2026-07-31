@@ -1,18 +1,20 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use crate::{
-    ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner,
-    ClaimStatus, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
-    ForgetReceipt, ForgetRepository, ForgetRequest, JudgmentProposal, JudgmentRejection,
-    JudgmentRejectionReason, MemoryRepository, PersonTurnClassification,
-    RelationalConstraintDeparture, RelationalConstraintDepartureRejection,
-    RelationalConstraintDepartureRejectionReason, RepositoryError, RuntimeError, RuntimeRequest,
-    SessionId, SharedAgreementAssentRejection, SharedAgreementAssentRejectionReason,
-    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementResolution, SharedAgreementRevision, SharedExperience,
-    SharedExperienceProposal, SharedExperienceRejection, SharedExperienceRejectionReason,
-    SharedExperienceRepository, Speaker, StructuredOperationRejection,
-    StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
+    AgreementWithdrawal, AgreementWithdrawalActor, AgreementWithdrawalRejection,
+    AgreementWithdrawalRejectionReason, ApplicableTime, Claim, ClaimCorrectionReceipt,
+    ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, Clock, ConversationEvidence,
+    CounterpartRuntime, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository,
+    ForgetRequest, JudgmentProposal, JudgmentRejection, JudgmentRejectionReason, MemoryRepository,
+    PersonTurnClassification, RelationalConstraintDeparture,
+    RelationalConstraintDepartureRejection, RelationalConstraintDepartureRejectionReason,
+    RepositoryError, RuntimeError, RuntimeRequest, SessionId, SharedAgreementAssentRejection,
+    SharedAgreementAssentRejectionReason, SharedAgreementCandidate, SharedAgreementCandidateId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
+    SharedAgreementRevision, SharedExperience, SharedExperienceProposal, SharedExperienceRejection,
+    SharedExperienceRejectionReason, SharedExperienceRepository, Speaker,
+    StructuredOperationRejection, StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
+    agreement_is_active_at,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +30,7 @@ pub enum CoreError {
     ForgetTargetNotFound,
     SharedAgreementCandidateNotFound(SharedAgreementCandidateId),
     SharedAgreementCandidateNotAwaitingPerson(SharedAgreementCandidateId),
+    SharedAgreementNotActive(ClaimId),
     InvalidSharedAgreementRevision,
     UnchangedSharedAgreementRevision,
     MissingEvidence(EvidenceId),
@@ -55,6 +58,11 @@ struct SharedAgreementAssentWriteOutcome {
 struct ConstraintDepartureWriteOutcome {
     recorded: Vec<ClaimId>,
     rejected: Vec<RelationalConstraintDepartureRejection>,
+}
+
+struct AgreementWithdrawalWriteOutcome {
+    recorded: Vec<ClaimId>,
+    rejected: Vec<AgreementWithdrawalRejection>,
 }
 
 fn reject_constraint_departure(
@@ -100,6 +108,9 @@ impl fmt::Display for CoreError {
                 "shared agreement candidate {} is not awaiting person confirmation",
                 id.get()
             ),
+            Self::SharedAgreementNotActive(id) => {
+                write!(formatter, "shared agreement {} is not active", id.get())
+            }
             Self::InvalidSharedAgreementRevision => {
                 formatter.write_str("shared agreement revision has invalid boundaries")
             }
@@ -436,6 +447,11 @@ where
             &validation_context,
             &counterpart_evidence,
         )?;
+        let withdrawals = self.persist_agreement_withdrawals(
+            &response,
+            &validation_context,
+            &counterpart_evidence,
+        )?;
         let shared = self.persist_shared_experience_proposals(
             &response,
             &validation_context,
@@ -461,6 +477,7 @@ where
         .with_judgments(judgments.accepted, judgments.rejected)
         .with_agreement_assents(agreement_assents.assented, agreement_assents.rejected)
         .with_constraint_departures(departures.recorded, departures.rejected)
+        .with_agreement_withdrawals(withdrawals.recorded, withdrawals.rejected)
         .with_shared_experiences(shared.pending_agreements, shared.admitted, shared.rejected)
         .with_rejected_operations(rejected_operations))
     }
@@ -568,6 +585,132 @@ where
             outcome.recorded.push(claim_id);
         }
         Ok(outcome)
+    }
+
+    fn persist_agreement_withdrawals(
+        &mut self,
+        response: &crate::RuntimeResponse,
+        validation_context: &WorkingContext,
+        counterpart_evidence: &ConversationEvidence,
+    ) -> Result<AgreementWithdrawalWriteOutcome, CoreError> {
+        let mut outcome = AgreementWithdrawalWriteOutcome {
+            recorded: Vec::new(),
+            rejected: Vec::new(),
+        };
+        let candidates = self.repository.all_shared_agreement_candidates()?;
+        let mut experiences = self.repository.all_shared_experiences()?;
+        let mut seen = BTreeSet::new();
+        for (proposal_index, proposed) in response.agreement_withdrawals().iter().enumerate() {
+            let agreement_claim_id = proposed.agreement_claim_id();
+            let reject = |outcome: &mut AgreementWithdrawalWriteOutcome, reason| {
+                outcome
+                    .rejected
+                    .push(AgreementWithdrawalRejection::new(proposal_index, reason));
+            };
+            if !seen.insert(agreement_claim_id) {
+                reject(
+                    &mut outcome,
+                    AgreementWithdrawalRejectionReason::DuplicateWithdrawal(agreement_claim_id),
+                );
+                continue;
+            }
+            if !validation_context
+                .active_relational_constraints()
+                .iter()
+                .any(|constraint| constraint.agreement_claim_id() == agreement_claim_id)
+                || !agreement_is_active_at(
+                    agreement_claim_id,
+                    &candidates,
+                    &experiences,
+                    counterpart_evidence.recorded_at(),
+                )
+            {
+                reject(
+                    &mut outcome,
+                    AgreementWithdrawalRejectionReason::ConstraintNotActive(agreement_claim_id),
+                );
+                continue;
+            }
+            let Some(agreement) = experiences.iter().find(|experience| {
+                experience.kind() == crate::SharedExperienceKind::Agreement
+                    && experience.claim().id() == agreement_claim_id
+            }) else {
+                reject(
+                    &mut outcome,
+                    AgreementWithdrawalRejectionReason::AgreementNotFound(agreement_claim_id),
+                );
+                continue;
+            };
+            let reason = proposed.reason().trim();
+            if reason.is_empty() {
+                reject(
+                    &mut outcome,
+                    AgreementWithdrawalRejectionReason::EmptyReason,
+                );
+                continue;
+            }
+            if !response.text().contains(reason) {
+                reject(
+                    &mut outcome,
+                    AgreementWithdrawalRejectionReason::ReasonNotInResponse,
+                );
+                continue;
+            }
+            let (claim_id, experience) = self.record_counterpart_agreement_withdrawal(
+                agreement,
+                agreement_claim_id,
+                reason,
+                counterpart_evidence,
+            )?;
+            experiences.push(experience);
+            outcome.recorded.push(claim_id);
+        }
+        Ok(outcome)
+    }
+
+    fn record_counterpart_agreement_withdrawal(
+        &mut self,
+        agreement: &SharedExperience,
+        agreement_claim_id: ClaimId,
+        reason: &str,
+        counterpart_evidence: &ConversationEvidence,
+    ) -> Result<(ClaimId, SharedExperience), CoreError> {
+        let support = agreement
+            .claim()
+            .support()
+            .iter()
+            .cloned()
+            .chain(std::iter::once(EvidenceCitation::new(
+                counterpart_evidence.id(),
+                reason,
+            )))
+            .collect::<Vec<_>>();
+        let claim_id = self.repository.next_claim_id();
+        let claim = Claim::new(
+            claim_id,
+            ClaimOwner::Shared,
+            format!(
+                "第二自我退出共同约定“{}”：{}",
+                agreement.claim().statement(),
+                reason
+            ),
+            support.clone(),
+            None,
+            ApplicableTime::At(counterpart_evidence.recorded_at()),
+            counterpart_evidence.recorded_at(),
+        );
+        let withdrawal = AgreementWithdrawal::recorded(
+            claim_id,
+            agreement_claim_id,
+            AgreementWithdrawalActor::Counterpart,
+            counterpart_evidence.recorded_at(),
+            Some(reason.to_owned()),
+            support,
+        );
+        let experience = SharedExperience::admitted_agreement_withdrawal(claim, withdrawal);
+        self.repository
+            .commit_agreement_withdrawal(None, experience.clone())?;
+        Ok((claim_id, experience))
     }
 
     fn persist_shared_agreement_assents(
@@ -901,6 +1044,101 @@ where
             .map_err(CoreError::from)
     }
 
+    /// Applies the person-side anti-misclick gate and, only after explicit
+    /// confirmation, records an immediate prospective withdrawal.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a target that is not an active shared agreement and adapter
+    /// failures without leaving confirmation evidence or partial history.
+    pub fn withdraw_shared_agreement_as_person(
+        &mut self,
+        session_id: SessionId,
+        agreement_claim_id: ClaimId,
+        confirmed: bool,
+        reason: Option<String>,
+    ) -> Result<Option<ClaimId>, CoreError> {
+        if !confirmed {
+            return Ok(None);
+        }
+        let effective_at = self.clock.now();
+        let candidates = self.repository.all_shared_agreement_candidates()?;
+        let experiences = self.repository.all_shared_experiences()?;
+        if !agreement_is_active_at(agreement_claim_id, &candidates, &experiences, effective_at) {
+            return Err(CoreError::SharedAgreementNotActive(agreement_claim_id));
+        }
+        let agreement = experiences
+            .iter()
+            .find(|experience| {
+                experience.kind() == crate::SharedExperienceKind::Agreement
+                    && experience.claim().id() == agreement_claim_id
+            })
+            .ok_or(CoreError::SharedAgreementNotActive(agreement_claim_id))?;
+        let reason = reason.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        });
+        let canonical = reason.as_ref().map_or_else(
+            || format!("确认退出共同约定 Claim {}。", agreement_claim_id.get()),
+            |value| {
+                format!(
+                    "确认退出共同约定 Claim {}。\n理由：{}",
+                    agreement_claim_id.get(),
+                    value
+                )
+            },
+        );
+        let person_confirmation = ConversationEvidence::new(
+            self.repository.next_evidence_id(),
+            session_id,
+            Speaker::Person,
+            canonical.clone(),
+            effective_at,
+        );
+        let support = agreement
+            .claim()
+            .support()
+            .iter()
+            .cloned()
+            .chain(std::iter::once(EvidenceCitation::new(
+                person_confirmation.id(),
+                canonical,
+            )))
+            .collect::<Vec<_>>();
+        let claim_id = self.repository.next_claim_id();
+        let claim = Claim::new(
+            claim_id,
+            ClaimOwner::Shared,
+            reason.as_ref().map_or_else(
+                || format!("本人退出共同约定“{}”", agreement.claim().statement()),
+                |value| {
+                    format!(
+                        "本人退出共同约定“{}”：{}",
+                        agreement.claim().statement(),
+                        value
+                    )
+                },
+            ),
+            support.clone(),
+            None,
+            ApplicableTime::At(effective_at),
+            effective_at,
+        );
+        let withdrawal = AgreementWithdrawal::recorded(
+            claim_id,
+            agreement_claim_id,
+            AgreementWithdrawalActor::Person,
+            effective_at,
+            reason,
+            support,
+        );
+        self.repository.commit_agreement_withdrawal(
+            Some(person_confirmation),
+            SharedExperience::admitted_agreement_withdrawal(claim, withdrawal),
+        )?;
+        Ok(Some(claim_id))
+    }
+
     /// Dismisses a ceremony without modifying the admitted shared claim.
     ///
     /// # Errors
@@ -1033,33 +1271,10 @@ fn validate_agreement_supersession(
     experiences: &[SharedExperience],
 ) -> Result<(), SharedExperienceRejectionReason> {
     let effective_from = proposed.effective_from();
-    let agreement_exists = |claim_id: ClaimId| {
-        experiences.iter().any(|experience| {
-            experience.kind() == crate::SharedExperienceKind::Agreement
-                && experience.claim().id() == claim_id
-                && experience.claim().status() == ClaimStatus::Current
-        })
-    };
-    let is_superseded_at = |claim_id: ClaimId| {
-        candidates.iter().any(|candidate| {
-            candidate.status() == SharedAgreementCandidateStatus::Confirmed
-                && candidate.claim_id().is_some_and(&agreement_exists)
-                && candidate
-                    .effective_from()
-                    .is_some_and(|from| from.as_millis() <= effective_from.as_millis())
-                && candidate.supersedes_agreement_ids().contains(&claim_id)
-        })
-    };
     let is_active_at_start = |candidate: &SharedAgreementCandidate| {
-        candidate.status() == SharedAgreementCandidateStatus::Confirmed
-            && candidate.claim_id().is_some_and(&agreement_exists)
-            && candidate
-                .effective_from()
-                .is_some_and(|from| from.as_millis() <= effective_from.as_millis())
-            && candidate
-                .effective_until()
-                .is_none_or(|until| until.as_millis() >= effective_from.as_millis())
-            && candidate.claim_id().is_some_and(|id| !is_superseded_at(id))
+        candidate.claim_id().is_some_and(|claim_id| {
+            agreement_is_active_at(claim_id, candidates, experiences, effective_from)
+        })
     };
 
     for target in proposed.supersedes_agreement_ids() {

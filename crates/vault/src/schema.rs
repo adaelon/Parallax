@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 20;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 21;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1178,6 +1178,64 @@ CREATE INDEX shared_agreement_superseded_claim
     ON shared_agreement_candidate_supersessions(superseded_agreement_claim_id);
 ";
 
+const MIGRATION_21: &str = r"
+ALTER TABLE shared_experiences RENAME TO shared_experiences_v20;
+
+CREATE TABLE shared_experiences (
+    claim_id INTEGER PRIMARY KEY REFERENCES claims(id) ON DELETE RESTRICT,
+    kind INTEGER NOT NULL CHECK (kind IN (0, 1, 2, 3, 4, 5)),
+    candidate_id INTEGER UNIQUE
+        REFERENCES shared_agreement_candidates(id) ON DELETE RESTRICT,
+    ceremony_dismissed INTEGER NOT NULL DEFAULT 0
+        CHECK (ceremony_dismissed IN (0, 1)),
+    departed_agreement_claim_id INTEGER
+        REFERENCES claims(id) ON DELETE RESTRICT,
+    departure_reason TEXT,
+    CHECK (
+        (kind = 0 AND candidate_id IS NOT NULL
+         AND departed_agreement_claim_id IS NULL AND departure_reason IS NULL)
+        OR
+        (kind IN (1, 2, 3, 5) AND candidate_id IS NULL
+         AND departed_agreement_claim_id IS NULL AND departure_reason IS NULL)
+        OR
+        (kind = 4 AND candidate_id IS NULL
+         AND departed_agreement_claim_id IS NOT NULL
+         AND length(trim(departure_reason)) > 0)
+    )
+) STRICT;
+
+INSERT INTO shared_experiences
+    (claim_id, kind, candidate_id, ceremony_dismissed,
+     departed_agreement_claim_id, departure_reason)
+SELECT claim_id, kind, candidate_id, ceremony_dismissed,
+       departed_agreement_claim_id, departure_reason
+FROM shared_experiences_v20;
+
+DROP TABLE shared_experiences_v20;
+
+CREATE INDEX shared_experience_departed_agreement
+    ON shared_experiences(departed_agreement_claim_id)
+    WHERE departed_agreement_claim_id IS NOT NULL;
+
+CREATE TABLE agreement_withdrawals (
+    claim_id INTEGER PRIMARY KEY
+        REFERENCES shared_experiences(claim_id) ON DELETE RESTRICT,
+    agreement_claim_id INTEGER NOT NULL
+        REFERENCES claims(id) ON DELETE RESTRICT,
+    actor INTEGER NOT NULL CHECK (actor IN (0, 1)),
+    effective_at INTEGER NOT NULL,
+    reason TEXT,
+    CHECK (
+        (actor = 0 AND (reason IS NULL OR length(trim(reason)) > 0))
+        OR
+        (actor = 1 AND length(trim(reason)) > 0)
+    )
+) STRICT;
+
+CREATE INDEX agreement_withdrawal_target
+    ON agreement_withdrawals(agreement_claim_id, effective_at);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1215,6 +1273,7 @@ where
             18 => transaction.execute_batch(MIGRATION_18)?,
             19 => transaction.execute_batch(MIGRATION_19)?,
             20 => transaction.execute_batch(MIGRATION_20)?,
+            21 => transaction.execute_batch(MIGRATION_21)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -2295,6 +2354,53 @@ mod tests {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema
                  WHERE name = 'shared_agreement_candidate_supersessions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_exists);
+    }
+
+    #[test]
+    fn interrupted_agreement_withdrawal_migration_keeps_v20_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 21 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(21))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            20
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'agreement_withdrawals')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'agreement_withdrawals')",
                 [],
                 |row| row.get(0),
             )

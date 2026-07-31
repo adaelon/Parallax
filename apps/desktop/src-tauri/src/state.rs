@@ -6,10 +6,11 @@ use std::{
 };
 
 use eam_core::{
-    ClaimId, Clock, ConversationEvidence, CounterpartRuntime, EvidenceCitation, EvidenceId,
-    MemoryCore, MemoryRepository, SessionId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementResolution, SharedAgreementRevision,
-    SharedExperienceKind, SharedExperienceRepository, Speaker, SystemClock, WorkingContext,
+    AgreementWithdrawalActor, ClaimId, Clock, ConversationEvidence, CounterpartRuntime,
+    EvidenceCitation, EvidenceId, MemoryCore, MemoryRepository, SessionId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
+    SharedAgreementRevision, SharedExperienceKind, SharedExperienceRepository, Speaker,
+    SystemClock, WorkingContext, agreement_is_active_at,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_ingestion::{
@@ -106,8 +107,19 @@ pub struct SharedExperienceCeremonyView {
     end_condition: Option<String>,
     agreement_claim_id: Option<u64>,
     departure_reason: Option<String>,
+    withdrawal_actor: Option<&'static str>,
     superseded_agreements: Vec<SupersededAgreementView>,
     evidence: Vec<SharedExperienceCeremonyEvidenceView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSharedAgreementView {
+    claim_id: u64,
+    statement: String,
+    scope: String,
+    effective_from_millis: i64,
+    effective_until_millis: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -258,6 +270,18 @@ impl ManagedHost {
         }
     }
 
+    pub fn list_active_shared_agreements(&self) -> Result<Vec<ActiveSharedAgreementView>, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                let at = host.host_clock.now();
+                list_active_shared_agreements_from_core(&host.core, at)
+            }
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
     pub fn resolve_shared_agreement(
         &self,
         candidate_id: u64,
@@ -267,6 +291,25 @@ impl ManagedHost {
             HostSlot::Ready(host) => {
                 resolve_shared_agreement_from_core(&mut host.core, candidate_id, confirm)
             }
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn withdraw_shared_agreement_as_person(
+        &self,
+        agreement_claim_id: u64,
+        confirmed: bool,
+        reason: Option<String>,
+    ) -> Result<Option<u64>, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => withdraw_shared_agreement_as_person_from_core(
+                &mut host.core,
+                agreement_claim_id,
+                confirmed,
+                reason,
+            ),
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -625,6 +668,7 @@ where
             end_condition: candidate.end_condition().map(str::to_owned),
             agreement_claim_id: None,
             departure_reason: None,
+            withdrawal_actor: None,
             superseded_agreements: superseded_agreement_views(
                 &candidates,
                 &experiences,
@@ -636,6 +680,7 @@ where
     for experience in experiences.into_iter().filter(|experience| {
         experience.kind() != SharedExperienceKind::Agreement && !experience.ceremony_dismissed()
     }) {
+        let withdrawal = experience.agreement_withdrawal();
         ceremonies.push(SharedExperienceCeremonyView {
             target_id: experience.claim().id().get(),
             target_kind: "sharedExperience",
@@ -644,20 +689,87 @@ where
             statement: experience.claim().statement().to_owned(),
             candidate_version: None,
             scope: None,
-            effective_from_millis: None,
+            effective_from_millis: withdrawal
+                .map(|withdrawal| withdrawal.effective_at().as_millis()),
             effective_until_millis: None,
             end_condition: None,
             agreement_claim_id: experience
                 .constraint_departure()
-                .map(|departure| departure.agreement_claim_id().get()),
+                .map(|departure| departure.agreement_claim_id().get())
+                .or_else(|| withdrawal.map(|withdrawal| withdrawal.agreement_claim_id().get())),
             departure_reason: experience
                 .constraint_departure()
-                .map(|departure| departure.reason().to_owned()),
+                .map(|departure| departure.reason().to_owned())
+                .or_else(|| {
+                    withdrawal.and_then(|withdrawal| withdrawal.reason().map(str::to_owned))
+                }),
+            withdrawal_actor: withdrawal
+                .map(|withdrawal| encode_agreement_withdrawal_actor(withdrawal.actor())),
             superseded_agreements: Vec::new(),
             evidence: ceremony_evidence(repository, experience.claim().support())?,
         });
     }
     Ok(ceremonies)
+}
+
+fn list_active_shared_agreements_from_core<R, T, C>(
+    core: &MemoryCore<R, T, C>,
+    at: eam_core::Timestamp,
+) -> Result<Vec<ActiveSharedAgreementView>, String>
+where
+    R: SharedExperienceRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    let candidates = core
+        .repository()
+        .all_shared_agreement_candidates()
+        .map_err(|error| error.to_string())?;
+    let experiences = core
+        .repository()
+        .all_shared_experiences()
+        .map_err(|error| error.to_string())?;
+    Ok(candidates
+        .iter()
+        .filter_map(|candidate| {
+            let claim_id = candidate.claim_id()?;
+            agreement_is_active_at(claim_id, &candidates, &experiences, at).then(|| {
+                ActiveSharedAgreementView {
+                    claim_id: claim_id.get(),
+                    statement: candidate.statement().to_owned(),
+                    scope: candidate.scope().unwrap_or_default().to_owned(),
+                    effective_from_millis: candidate
+                        .effective_from()
+                        .expect("active agreement has an effective time")
+                        .as_millis(),
+                    effective_until_millis: candidate
+                        .effective_until()
+                        .map(eam_core::Timestamp::as_millis),
+                }
+            })
+        })
+        .collect())
+}
+
+fn withdraw_shared_agreement_as_person_from_core<R, T, C>(
+    core: &mut MemoryCore<R, T, C>,
+    agreement_claim_id: u64,
+    confirmed: bool,
+    reason: Option<String>,
+) -> Result<Option<u64>, String>
+where
+    R: SharedExperienceRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    core.withdraw_shared_agreement_as_person(
+        SessionId::new(CONTINUOUS_SESSION_ID),
+        ClaimId::from_raw(agreement_claim_id),
+        confirmed,
+        reason,
+    )
+    .map(|claim_id| claim_id.map(ClaimId::get))
+    .map_err(|error| error.to_string())
 }
 
 fn superseded_agreement_views(
@@ -822,6 +934,14 @@ const fn encode_shared_experience_kind(kind: SharedExperienceKind) -> &'static s
         SharedExperienceKind::RelationshipChange => "relationshipChange",
         SharedExperienceKind::SharedAchievement => "sharedAchievement",
         SharedExperienceKind::AgreementBreach => "agreementBreach",
+        SharedExperienceKind::AgreementWithdrawal => "agreementWithdrawal",
+    }
+}
+
+const fn encode_agreement_withdrawal_actor(actor: AgreementWithdrawalActor) -> &'static str {
+    match actor {
+        AgreementWithdrawalActor::Person => "person",
+        AgreementWithdrawalActor::Counterpart => "counterpart",
     }
 }
 
@@ -1370,6 +1490,81 @@ mod tests {
         assert_eq!(ceremony.admission, "nonVetoNotice");
         assert_eq!(ceremony.agreement_claim_id, Some(1));
         assert_eq!(ceremony.departure_reason.as_deref(), Some(reason));
+    }
+
+    #[test]
+    fn person_withdrawal_requires_confirmation_and_allows_no_reason() {
+        let agreement = RuntimeResponse::new("我也同意复盘时直接指出关键逃避。")
+            .with_shared_experience(
+                SharedExperienceProposal::new(
+                    SharedExperienceKind::Agreement,
+                    "复盘时直接指出关键逃避",
+                    vec![EvidenceCitation::new(
+                        EvidenceId::from_raw(1),
+                        "我同意复盘时直接指出关键逃避",
+                    )],
+                    "我也同意复盘时直接指出关键逃避",
+                    Timestamp::from_millis(90_000),
+                )
+                .with_agreement_terms(
+                    "双方共同项目复盘",
+                    Timestamp::from_millis(90_000),
+                    None,
+                    None,
+                ),
+            );
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            ScriptedRuntime::new([PersonTurnClassification::Question], [agreement]),
+            IncrementingClock::new(90_000),
+        );
+        let first =
+            send_message_with_core(&mut core, "我同意复盘时直接指出关键逃避。".to_owned()).unwrap();
+        let agreement_claim_id =
+            resolve_shared_agreement_from_core(&mut core, first.ceremonies[0].target_id, true)
+                .unwrap()
+                .claim_id
+                .unwrap();
+
+        assert_eq!(
+            withdraw_shared_agreement_as_person_from_core(
+                &mut core,
+                agreement_claim_id,
+                false,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            list_active_shared_agreements_from_core(&core, Timestamp::from_millis(100_000),)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert!(
+            withdraw_shared_agreement_as_person_from_core(
+                &mut core,
+                agreement_claim_id,
+                true,
+                Some("   ".to_owned()),
+            )
+            .unwrap()
+            .is_some()
+        );
+        let ceremonies = list_shared_experience_ceremonies_from_core(&core).unwrap();
+        assert_eq!(ceremonies.len(), 1);
+        assert_eq!(ceremonies[0].experience_kind, "agreementWithdrawal");
+        assert_eq!(ceremonies[0].admission, "nonVetoNotice");
+        assert_eq!(ceremonies[0].agreement_claim_id, Some(agreement_claim_id));
+        assert_eq!(ceremonies[0].departure_reason, None);
+        assert_eq!(ceremonies[0].withdrawal_actor, Some("person"));
+        assert!(
+            list_active_shared_agreements_from_core(&core, Timestamp::from_millis(100_000),)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

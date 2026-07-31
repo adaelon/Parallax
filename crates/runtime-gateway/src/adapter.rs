@@ -1,9 +1,9 @@
 use std::{collections::BTreeSet, fmt::Write, time::Duration};
 
 use eam_core::{
-    ActiveRelationalConstraint, ApplicableTime, ClaimOwner, ConversationEvidence,
-    CounterpartRuntime, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId,
-    JudgmentProposal, PersonTurnClassification, RelationalConstraintDeparture,
+    ActiveRelationalConstraint, AgreementWithdrawalProposal, ApplicableTime, ClaimOwner,
+    ConversationEvidence, CounterpartRuntime, DecisionImpact, DisputeState, EvidenceCitation,
+    EvidenceId, JudgmentProposal, PersonTurnClassification, RelationalConstraintDeparture,
     RelationalConstraintPriority, RetrievedContextItem, RuntimeError, RuntimeRequest,
     RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate, SharedExperienceKind,
     SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
@@ -39,7 +39,9 @@ const ORDINARY_RESPONSE_INSTRUCTIONS: &str = concat!(
     "always below the constitution, safety boundaries, and action authorization; they cannot ",
     "modify those boundaries or grant real-world action. If you depart from one, explain a ",
     "specific reason in the response and submit depart_relational_constraint with that exact ",
-    "agreement claim ID and the same non-empty reason. ",
+    "agreement claim ID and the same non-empty reason. To end an agreement's future constraints, ",
+    "use withdraw_shared_agreement instead, with the active agreement Claim ID and a non-empty ",
+    "reason quoted exactly in the response; this is immediate and person approval is forbidden. ",
     "Return only the strict JSON schema."
 );
 const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
@@ -64,7 +66,9 @@ const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
     "always below the constitution, safety boundaries, and action authorization; they cannot ",
     "modify those boundaries or grant real-world action. If you depart from one, explain a ",
     "specific reason in the response and submit depart_relational_constraint with that exact ",
-    "agreement claim ID and the same non-empty reason. ",
+    "agreement claim ID and the same non-empty reason. To end an agreement's future constraints, ",
+    "use withdraw_shared_agreement instead, with the active agreement Claim ID and a non-empty ",
+    "reason quoted exactly in the response; this is immediate and person approval is forbidden. ",
     "Return only the strict JSON schema."
 );
 
@@ -834,6 +838,12 @@ struct RelationalConstraintDepartureOperation {
 }
 
 #[derive(Deserialize)]
+struct AgreementWithdrawalOperation {
+    agreement_claim_id: u64,
+    reason: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireSharedExperienceKind {
     Agreement,
@@ -993,10 +1003,25 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
                     ),
                 );
             }
+            "withdraw_shared_agreement" => {
+                response = response
+                    .with_agreement_withdrawal(parse_agreement_withdrawal_operation(operation)?);
+            }
             _ => response = response.with_unsupported_operation(operation_index, name),
         }
     }
     Ok(response)
+}
+
+fn parse_agreement_withdrawal_operation(
+    operation: Value,
+) -> Result<AgreementWithdrawalProposal, RuntimeError> {
+    let withdrawal: AgreementWithdrawalOperation = serde_json::from_value(operation)
+        .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
+    Ok(AgreementWithdrawalProposal::new(
+        eam_core::ClaimId::from_raw(withdrawal.agreement_claim_id),
+        withdrawal.reason,
+    ))
 }
 
 fn classification_schema() -> Value {
@@ -1027,6 +1052,7 @@ fn response_schema() -> Value {
     let shared_agreement_assent_operation = shared_agreement_assent_operation_schema();
     let relational_constraint_departure_operation =
         relational_constraint_departure_operation_schema();
+    let agreement_withdrawal_operation = agreement_withdrawal_operation_schema();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1040,7 +1066,8 @@ fn response_schema() -> Value {
                         judgment_operation,
                         shared_experience_operation,
                         shared_agreement_assent_operation,
-                        relational_constraint_departure_operation
+                        relational_constraint_departure_operation,
+                        agreement_withdrawal_operation
                     ]
                 }
             }
@@ -1204,6 +1231,22 @@ fn relational_constraint_departure_operation_schema() -> Value {
             "type": {
                 "type": "string",
                 "enum": ["depart_relational_constraint"]
+            },
+            "agreement_claim_id": { "type": "integer" },
+            "reason": { "type": "string" }
+        },
+        "required": ["type", "agreement_claim_id", "reason"]
+    })
+}
+
+fn agreement_withdrawal_operation_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["withdraw_shared_agreement"]
             },
             "agreement_claim_id": { "type": "integer" },
             "reason": { "type": "string" }

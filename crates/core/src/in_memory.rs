@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus,
-    ConversationEvidence, EvidenceId, ForgetReceipt, ForgetRepository, ForgetTarget,
-    MemoryRepository, RepositoryError, SharedAgreementCandidate, SharedAgreementCandidateId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
-    SharedExperience, SharedExperienceKind, SharedExperienceRepository, Speaker, Timestamp,
+    AgreementWithdrawalActor, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId,
+    ClaimOwner, ClaimStatus, ConversationEvidence, EvidenceId, ForgetReceipt, ForgetRepository,
+    ForgetTarget, MemoryRepository, RepositoryError, SharedAgreementCandidate,
+    SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    SharedAgreementResolution, SharedExperience, SharedExperienceKind, SharedExperienceRepository,
+    Speaker, Timestamp, agreement_is_active_at,
 };
 
 #[derive(Debug)]
@@ -296,10 +297,12 @@ impl SharedExperienceRepository for InMemoryRepository {
     ) -> Result<(), RepositoryError> {
         if matches!(
             experience.kind(),
-            SharedExperienceKind::Agreement | SharedExperienceKind::AgreementBreach
+            SharedExperienceKind::Agreement
+                | SharedExperienceKind::AgreementBreach
+                | SharedExperienceKind::AgreementWithdrawal
         ) {
             return Err(RepositoryError::new(
-                "agreements and agreement breaches require their typed commit path",
+                "agreements, breaches, and withdrawals require their typed commit path",
             ));
         }
         validate_shared_experience_storage(&self.evidence, &experience)?;
@@ -353,6 +356,107 @@ impl SharedExperienceRepository for InMemoryRepository {
         let claim_id = experience.claim().id();
         if self.claims.contains_key(&claim_id) || self.shared_experiences.contains_key(&claim_id) {
             return Err(RepositoryError::new("duplicate shared claim id"));
+        }
+        self.claims.insert(claim_id, experience.claim().clone());
+        self.shared_experiences.insert(claim_id, experience);
+        Ok(())
+    }
+
+    fn commit_agreement_withdrawal(
+        &mut self,
+        person_confirmation: Option<ConversationEvidence>,
+        experience: SharedExperience,
+    ) -> Result<(), RepositoryError> {
+        let withdrawal = experience
+            .agreement_withdrawal()
+            .cloned()
+            .ok_or_else(|| RepositoryError::new("agreement withdrawal metadata is missing"))?;
+        if experience.kind() != SharedExperienceKind::AgreementWithdrawal
+            || withdrawal.id() != experience.claim().id()
+            || withdrawal.evidence_refs() != experience.claim().support()
+            || withdrawal
+                .reason()
+                .is_some_and(|reason| reason.trim().is_empty())
+            || (withdrawal.actor() == AgreementWithdrawalActor::Counterpart
+                && withdrawal.reason().is_none())
+        {
+            return Err(RepositoryError::new("invalid agreement withdrawal"));
+        }
+        let candidates = self
+            .shared_agreement_candidates
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let experiences = self
+            .shared_experiences
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if !agreement_is_active_at(
+            withdrawal.agreement_claim_id(),
+            &candidates,
+            &experiences,
+            withdrawal.effective_at(),
+        ) {
+            return Err(RepositoryError::new(
+                "withdrawn shared agreement is not active",
+            ));
+        }
+        let agreement = self
+            .shared_experiences
+            .get(&withdrawal.agreement_claim_id())
+            .filter(|agreement| agreement.kind() == SharedExperienceKind::Agreement)
+            .ok_or_else(|| RepositoryError::new("withdrawn agreement does not exist"))?;
+        if !agreement
+            .claim()
+            .support()
+            .iter()
+            .all(|citation| experience.claim().support().contains(citation))
+        {
+            return Err(RepositoryError::new(
+                "agreement withdrawal must preserve original agreement support",
+            ));
+        }
+        let mut evidence = self.evidence.clone();
+        match (withdrawal.actor(), person_confirmation.as_ref()) {
+            (AgreementWithdrawalActor::Person, Some(confirmation))
+                if confirmation.speaker() == Speaker::Person
+                    && confirmation.recorded_at() == withdrawal.effective_at()
+                    && !evidence.contains_key(&confirmation.id()) =>
+            {
+                evidence.insert(confirmation.id(), confirmation.clone());
+            }
+            (AgreementWithdrawalActor::Counterpart, None) => {}
+            _ => return Err(RepositoryError::new("withdrawal actor evidence is invalid")),
+        }
+        let actor_evidence_is_exact = experience.claim().support().iter().any(|citation| {
+            evidence.get(&citation.evidence_id()).is_some_and(|source| {
+                source.recorded_at() == withdrawal.effective_at()
+                    && match withdrawal.actor() {
+                        AgreementWithdrawalActor::Person => {
+                            source.speaker() == Speaker::Person
+                                && source.verbatim().contains(citation.quote())
+                                && citation.quote().contains("确认退出共同约定 Claim")
+                        }
+                        AgreementWithdrawalActor::Counterpart => {
+                            source.speaker() == Speaker::Counterpart
+                                && withdrawal.reason() == Some(citation.quote())
+                        }
+                    }
+            })
+        });
+        if !actor_evidence_is_exact {
+            return Err(RepositoryError::new(
+                "agreement withdrawal requires exact actor evidence",
+            ));
+        }
+        validate_shared_experience_storage(&evidence, &experience)?;
+        let claim_id = experience.claim().id();
+        if self.claims.contains_key(&claim_id) || self.shared_experiences.contains_key(&claim_id) {
+            return Err(RepositoryError::new("duplicate shared claim id"));
+        }
+        if let Some(confirmation) = person_confirmation {
+            self.evidence.insert(confirmation.id(), confirmation);
         }
         self.claims.insert(claim_id, experience.claim().clone());
         self.shared_experiences.insert(claim_id, experience);
@@ -431,32 +535,10 @@ fn validate_candidate_supersession_targets(
     let effective_from = candidate
         .effective_from()
         .ok_or_else(|| RepositoryError::new("agreement effective time is missing"))?;
+    let candidates = candidates.values().cloned().collect::<Vec<_>>();
+    let experiences = experiences.values().cloned().collect::<Vec<_>>();
     for target in candidate.supersedes_agreement_ids() {
-        let is_superseded = candidates.values().any(|replacement| {
-            replacement.status() == SharedAgreementCandidateStatus::Confirmed
-                && replacement
-                    .claim_id()
-                    .is_some_and(|claim_id| experiences.contains_key(&claim_id))
-                && replacement
-                    .effective_from()
-                    .is_some_and(|from| from.as_millis() <= effective_from.as_millis())
-                && replacement.supersedes_agreement_ids().contains(target)
-        });
-        let is_active = candidates.values().any(|original| {
-            original.status() == SharedAgreementCandidateStatus::Confirmed
-                && original.claim_id() == Some(*target)
-                && experiences
-                    .get(target)
-                    .is_some_and(|experience| experience.kind() == SharedExperienceKind::Agreement)
-                && original
-                    .effective_from()
-                    .is_some_and(|from| from.as_millis() <= effective_from.as_millis())
-                && original
-                    .effective_until()
-                    .is_none_or(|until| until.as_millis() >= effective_from.as_millis())
-                && !is_superseded
-        });
-        if !is_active {
+        if !agreement_is_active_at(*target, &candidates, &experiences, effective_from) {
             return Err(RepositoryError::new(
                 "superseded shared agreement is no longer active",
             ));

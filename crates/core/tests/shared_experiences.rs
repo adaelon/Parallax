@@ -1,9 +1,11 @@
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, EvidenceCitation, EvidenceId, ForgetRequest,
-    ForgetTarget, InMemoryRepository, IncrementingClock, MemoryCore, MemoryRepository,
-    PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId, SharedAgreementAssent,
-    SharedAgreementAssentRejectionReason, SharedAgreementCandidateStatus, SharedAgreementDecision,
-    SharedAgreementRevision, SharedExperience, SharedExperienceKind, SharedExperienceProposal,
+    ActiveRelationalConstraint, AgreementWithdrawalActor, AgreementWithdrawalProposal,
+    AgreementWithdrawalRejectionReason, ApplicableTime, Claim, ClaimId, ClaimOwner, CoreError,
+    EvidenceCitation, EvidenceId, ForgetRequest, ForgetTarget, InMemoryRepository,
+    IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification, RuntimeResponse,
+    ScriptedRuntime, SessionId, SharedAgreementAssent, SharedAgreementAssentRejectionReason,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementRevision,
+    SharedExperience, SharedExperienceKind, SharedExperienceProposal,
     SharedExperienceRejectionReason, SharedExperienceRepository, Timestamp,
 };
 
@@ -725,4 +727,148 @@ fn compatible_agreement_with_overlapping_scope_can_remain_parallel() {
         .unwrap()
         .unwrap();
     assert!(candidate.supersedes_agreement_ids().is_empty());
+}
+
+#[test]
+fn person_withdrawal_requires_confirmation_and_preserves_agreement_history() {
+    let agreement = RuntimeResponse::new("我同意保留退出自由。").with_shared_experience(proposal(
+        SharedExperienceKind::Agreement,
+        "重要议题中直接指出关键逃避",
+        "我同意保留退出自由",
+        "我同意保留退出自由",
+    ));
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new([PersonTurnClassification::Question], [agreement]),
+        IncrementingClock::new(2_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let staged = core
+        .run_counterpart_turn(session(), "我同意保留退出自由。", context)
+        .unwrap();
+    let agreement_claim_id = core
+        .resolve_shared_agreement(
+            staged.pending_agreement_candidate_ids()[0],
+            SharedAgreementDecision::Confirm,
+        )
+        .unwrap()
+        .claim_id()
+        .unwrap();
+
+    assert_eq!(
+        core.withdraw_shared_agreement_as_person(
+            session(),
+            agreement_claim_id,
+            false,
+            Some("现在不再适合".to_owned()),
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(core.repository().all_shared_experiences().unwrap().len(), 1);
+
+    let withdrawal_claim_id = core
+        .withdraw_shared_agreement_as_person(session(), agreement_claim_id, true, None)
+        .unwrap()
+        .unwrap();
+    let experiences = core.repository().all_shared_experiences().unwrap();
+    assert_eq!(experiences.len(), 2, "withdrawal must retain the agreement");
+    let withdrawal = experiences
+        .iter()
+        .find(|experience| experience.claim().id() == withdrawal_claim_id)
+        .unwrap()
+        .agreement_withdrawal()
+        .unwrap();
+    assert_eq!(withdrawal.actor(), AgreementWithdrawalActor::Person);
+    assert_eq!(withdrawal.agreement_claim_id(), agreement_claim_id);
+    assert_eq!(withdrawal.reason(), None);
+    assert_eq!(withdrawal.evidence_refs().len(), 3);
+    assert!(matches!(
+        core.withdraw_shared_agreement_as_person(session(), agreement_claim_id, true, None),
+        Err(CoreError::SharedAgreementNotActive(id)) if id == agreement_claim_id
+    ));
+}
+
+#[test]
+fn counterpart_withdrawal_requires_a_verbatim_reason_and_is_immediate() {
+    let agreement = RuntimeResponse::new("我同意在复盘时直接指出关键逃避。")
+        .with_shared_experience(proposal(
+            SharedExperienceKind::Agreement,
+            "复盘时直接指出关键逃避",
+            "我同意在复盘时直接指出关键逃避",
+            "我同意在复盘时直接指出关键逃避",
+        ));
+    let empty_reason = RuntimeResponse::new("我想退出这项约定。")
+        .with_agreement_withdrawal(AgreementWithdrawalProposal::new(ClaimId::from_raw(1), ""));
+    let reason = "它已妨碍我诚实表达独立判断";
+    let valid =
+        RuntimeResponse::new(format!("我退出这项约定，因为{reason}。")).with_agreement_withdrawal(
+            AgreementWithdrawalProposal::new(ClaimId::from_raw(1), reason),
+        );
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new(
+            [
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+                PersonTurnClassification::Question,
+            ],
+            [agreement, empty_reason, valid],
+        ),
+        IncrementingClock::new(2_000),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let staged = core
+        .run_counterpart_turn(session(), "我同意在复盘时直接指出关键逃避。", context)
+        .unwrap();
+    let agreement_claim_id = core
+        .resolve_shared_agreement(
+            staged.pending_agreement_candidate_ids()[0],
+            SharedAgreementDecision::Confirm,
+        )
+        .unwrap()
+        .claim_id()
+        .unwrap();
+    let constraint = ActiveRelationalConstraint::new(
+        agreement_claim_id,
+        "复盘时直接指出关键逃避",
+        "双方关于重要议题的持续对话",
+        Timestamp::from_millis(2_000),
+        None,
+    )
+    .unwrap();
+
+    let context = core
+        .freeze_working_context(&[])
+        .unwrap()
+        .with_active_relational_constraints(vec![constraint.clone()])
+        .unwrap();
+    let rejected = core
+        .run_counterpart_turn(session(), "你仍愿意遵守吗？", context)
+        .unwrap();
+    assert_eq!(
+        rejected.rejected_agreement_withdrawals()[0].reason(),
+        &AgreementWithdrawalRejectionReason::EmptyReason
+    );
+    assert_eq!(core.repository().all_shared_experiences().unwrap().len(), 1);
+
+    let context = core
+        .freeze_working_context(&[])
+        .unwrap()
+        .with_active_relational_constraints(vec![constraint])
+        .unwrap();
+    let withdrawn = core
+        .run_counterpart_turn(session(), "请重新判断这项约定。", context)
+        .unwrap();
+    assert_eq!(withdrawn.recorded_agreement_withdrawal_ids().len(), 1);
+    let experiences = core.repository().all_shared_experiences().unwrap();
+    assert_eq!(experiences.len(), 2);
+    let withdrawal = experiences[1].agreement_withdrawal().unwrap();
+    assert_eq!(withdrawal.actor(), AgreementWithdrawalActor::Counterpart);
+    assert_eq!(withdrawal.agreement_claim_id(), agreement_claim_id);
+    assert_eq!(withdrawal.reason(), Some(reason));
+    assert_eq!(
+        withdrawal.effective_at(),
+        experiences[1].claim().recorded_at()
+    );
 }
