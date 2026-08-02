@@ -1,5 +1,48 @@
 # 代码链路
 
+## 2026-08-02 S25-4 全仓门禁与实现级收口
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:parse_shared_experience_operation` — 提取既有共同经历纯解析分支，使新增身份操作后 `parse_turn_response` 继续满足 100 行结构门禁且 contract 不变。
+- `docs/architecture.md:§5.4/§9.4/§9.5/§9.25`、`docs/code-trail.md:S25-1～S25-4` — 对齐领域、Self Bundle、运行时、Vault 与桌面只读链路。
+- `crates/core/tests/identity_evolution.rs`、`crates/runtime-gateway/tests/runtime_contract.rs`、`crates/vault/tests/identity_persistence.rs`、`apps/desktop/src/App.test.tsx` — 汇总当前前驱、使命拒绝、模型切换、原子回滚与只读界面验收。
+
+**入口**：S25-1～S25-3 的完整实现 diff 经全仓行为测试、静态检查、桌面/前端构建、链接与 JSON 夹具审计后进入提交。
+**测试**：Rust 全仓 231/231、fmt、Clippy `-D warnings`、桌面 all-targets、React 10/10、TypeScript 与生产构建通过；`git diff --check`、3 个变更 Markdown 的 104 个本地链接与 1 个 JSON 夹具通过。
+
+## 2026-08-02 S25-3 运行时身份出口与桌面只读版本链
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:IdentityRuntimeInput/parse_identity_revision_operation/identity_revision_operation_schema` — 只发送当前身份与版本指针，严格解析六类可选变化、作者、使命、理由和证据；未知操作继续 fail closed。
+- `crates/runtime-gateway/src/transport.rs:OutboundContextSource::IdentityState` — 把身份版本作为可审计的结构化出口来源，不暴露仓储能力。
+- `apps/desktop/src-tauri/src/state.rs:list_identity_history_from_core/IdentityStateView`、`lib.rs:list_identity_history` — 新增唯一身份 command，固定投影版本、六类身份状态、理由、证据与形成时间。
+- `apps/desktop/src/App.tsx:identityHistory`、`App.test.tsx:S25 immutable identity history` — 展示不可改写版本链，只有查看与关闭，无身份写入 command、输入框或编辑控件。
+
+**入口**：每次真实 runtime 响应可提交一个 `propose_identity_revision`；本人从桌面“身份版本”打开可信只读历史。
+**测试**：Runtime contract 18/18、桌面 Rust 19/19、React 10/10、TypeScript 与生产构建通过。
+
+## 2026-08-02 S25-2 身份与 Self Bundle 原子持久化
+
+**触达**:
+- `crates/identity/src/ports.rs:IdentityRepository::all_identity_states`、`service.rs:identity_history`、`in_memory.rs:append_identity_state` — 把首版身份仓储扩为连续不可改写版本链与完整历史读取。
+- `crates/vault/src/repository.rs:IdentityEvolutionRepository/commit_identity_revision` — 复核当前身份、Self Bundle 与宪法指针，在单个 SQLCipher 事务中追加身份并推进 Self Bundle。
+- `crates/vault/src/repository.rs:load_identity_states/recheck_identity_revision_versions` — 重启时校验连续前驱链，提交前在事务内再次拒绝过期版本。
+- `crates/vault/tests/identity_persistence.rs` — 覆盖身份与 Self Bundle 同链重启、逐字证据恢复及身份证据外键失败时的原子回滚。
+
+**入口**：Core 把已验证 `IdentityRevisionCommit` 交给 Vault；重启和模型切换从 `current_identity_context` 加载同一身份/Self Bundle 指针。
+**测试**：Vault 身份持久化 3/3、Core 模型切换回归通过；schema 保持 v21，不新增迁移。
+
+## 2026-08-02 S25-1 身份修订领域契约与 Core 门禁
+
+**触达**:
+- `crates/core/src/domain.rs:IdentityRevisionProposal/IdentityStateSnapshot/IdentityRevisionRejectionReason` — 建模当前前驱、六类身份变化、宪法/使命状态、不可改写快照与精确拒绝原因。
+- `crates/core/src/ports.rs:IdentityEvolutionRepository`、`in_memory.rs:commit_identity_revision` — 定义当前身份/Self Bundle 读取、原子提交和历史查询边界，并提供确定性内存适配器。
+- `crates/core/src/memory_loop.rs:persist_identity_revisions/validate_identity_revision` — 只接受第二自我针对当前版本的单个真实变化，拒绝本人角色卡、旧前驱、宪法变化、放弃反思使命、冒充本人、空理由及越界证据。
+- `crates/core/tests/identity_evolution.rs` — 固定正向追加、关键拒绝矩阵与运行时切换后继续同一版本链。
+
+**入口**：`MemoryCore::run_counterpart_turn` 冻结当前身份给 runtime，并在保存第二自我逐字回应后独立校验结构化修订。
+**测试**：Core 身份演化 3/3；正例推进身份/Self Bundle，所有关键拒绝均保持原版本链。
+
 ## 2026-07-31 S24-4 全仓门禁、迁移基线与实现级收口
 
 **触达**:

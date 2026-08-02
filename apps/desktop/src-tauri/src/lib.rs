@@ -15,8 +15,8 @@ use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
 use state::{
     ActiveSharedAgreementView, ConversationTurnResult, ConversationTurnView, HostStatusView,
-    ImportContextFileView, ManagedHost, SharedAgreementResolutionView, SharedAgreementRevisionView,
-    SharedExperienceCeremonyView,
+    IdentityStateView, ImportContextFileView, ManagedHost, SharedAgreementResolutionView,
+    SharedAgreementRevisionView, SharedExperienceCeremonyView,
 };
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
@@ -73,6 +73,14 @@ fn list_active_shared_agreements(
     host: tauri::State<'_, ManagedHost>,
 ) -> Result<Vec<ActiveSharedAgreementView>, String> {
     host.list_active_shared_agreements()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn list_identity_history(
+    host: tauri::State<'_, ManagedHost>,
+) -> Result<Vec<IdentityStateView>, String> {
+    host.list_identity_history()
 }
 
 #[tauri::command]
@@ -328,6 +336,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             list_conversation,
             list_shared_experience_ceremonies,
             list_active_shared_agreements,
+            list_identity_history,
             send_message,
             resolve_shared_agreement,
             withdraw_shared_agreement_as_person,

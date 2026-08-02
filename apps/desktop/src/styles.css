@@ -85,6 +85,11 @@ h1 {
   font-size: 0.75rem;
 }
 
+.topbar-actions {
+  display: flex;
+  gap: 0.55rem;
+}
+
 .conversation {
   overflow-y: auto;
   padding: clamp(1.5rem, 4vw, 3.25rem) clamp(1.25rem, 6vw, 6rem) 2rem;
@@ -489,6 +494,30 @@ h1 {
   cursor: pointer;
 }
 
+.identity-history-list {
+  max-height: 52vh;
+  overflow-y: auto;
+}
+
+.identity-version-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.8rem;
+  margin-bottom: 0.8rem;
+}
+
+.identity-version-heading strong {
+  color: #e4e8df;
+  font-family: Georgia, "Noto Serif SC", serif;
+  font-size: 1.05rem;
+}
+
+.identity-version-heading time {
+  color: #858b81;
+  font-size: 0.7rem;
+}
+
 .withdrawal-reason-label {
   display: block;
   margin-bottom: 0.45rem;
@@ -556,6 +585,10 @@ h1 {
 @media (max-width: 640px) {
   .presence {
     font-size: 0;
+  }
+
+  .topbar-actions {
+    flex-direction: column;
   }
 
   .turn {

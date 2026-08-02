@@ -102,8 +102,16 @@ impl IdentityRepository for InMemoryIdentityRepository {
         &mut self,
         identity: IdentityStateVersion,
     ) -> Result<(), RepositoryError> {
-        if !self.identities.is_empty() {
-            return Err(RepositoryError::new("initial identity already exists"));
+        match self.identities.last() {
+            None if identity.version() == 1 && identity.predecessor_version().is_none() => {}
+            Some(current)
+                if identity.version() == current.version().saturating_add(1)
+                    && identity.predecessor_version() == Some(current.version()) => {}
+            _ => {
+                return Err(RepositoryError::new(
+                    "identity version does not continue the current immutable chain",
+                ));
+            }
         }
         self.identities.push(identity);
         Ok(())
@@ -111,6 +119,10 @@ impl IdentityRepository for InMemoryIdentityRepository {
 
     fn current_identity_state(&self) -> Result<Option<IdentityStateVersion>, RepositoryError> {
         Ok(self.identities.last().cloned())
+    }
+
+    fn all_identity_states(&self) -> Result<Vec<IdentityStateVersion>, RepositoryError> {
+        Ok(self.identities.clone())
     }
 }
 

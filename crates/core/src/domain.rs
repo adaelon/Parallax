@@ -2205,6 +2205,482 @@ impl JudgmentProposal {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityField {
+    Name,
+    ExpressionTraits,
+    Viewpoints,
+    ValuePriorities,
+    RelationshipPosture,
+    OwnGoals,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityProfileSnapshot {
+    name: String,
+    expression_traits: String,
+    viewpoints: String,
+    value_priorities: String,
+    relationship_posture: String,
+    own_goals: String,
+}
+
+impl IdentityProfileSnapshot {
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        expression_traits: impl Into<String>,
+        viewpoints: impl Into<String>,
+        value_priorities: impl Into<String>,
+        relationship_posture: impl Into<String>,
+        own_goals: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            expression_traits: expression_traits.into(),
+            viewpoints: viewpoints.into(),
+            value_priorities: value_priorities.into(),
+            relationship_posture: relationship_posture.into(),
+            own_goals: own_goals.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn expression_traits(&self) -> &str {
+        &self.expression_traits
+    }
+
+    #[must_use]
+    pub fn viewpoints(&self) -> &str {
+        &self.viewpoints
+    }
+
+    #[must_use]
+    pub fn value_priorities(&self) -> &str {
+        &self.value_priorities
+    }
+
+    #[must_use]
+    pub fn relationship_posture(&self) -> &str {
+        &self.relationship_posture
+    }
+
+    #[must_use]
+    pub fn own_goals(&self) -> &str {
+        &self.own_goals
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityStateSnapshot {
+    version: u64,
+    predecessor_version: Option<u64>,
+    profile: IdentityProfileSnapshot,
+    change_reason: String,
+    evidence_refs: Vec<EvidenceId>,
+    formed_at: Timestamp,
+}
+
+impl IdentityStateSnapshot {
+    #[must_use]
+    pub fn restore(
+        version: u64,
+        predecessor_version: Option<u64>,
+        profile: IdentityProfileSnapshot,
+        change_reason: impl Into<String>,
+        evidence_refs: Vec<EvidenceId>,
+        formed_at: Timestamp,
+    ) -> Self {
+        Self {
+            version,
+            predecessor_version,
+            profile,
+            change_reason: change_reason.into(),
+            evidence_refs,
+            formed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn predecessor_version(&self) -> Option<u64> {
+        self.predecessor_version
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &IdentityProfileSnapshot {
+        &self.profile
+    }
+
+    #[must_use]
+    pub fn change_reason(&self) -> &str {
+        &self.change_reason
+    }
+
+    #[must_use]
+    pub fn evidence_refs(&self) -> &[EvidenceId] {
+        &self.evidence_refs
+    }
+
+    #[must_use]
+    pub const fn formed_at(&self) -> Timestamp {
+        self.formed_at
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRuntimeContext {
+    constitution_version: u64,
+    self_bundle_version: u64,
+    state: IdentityStateSnapshot,
+}
+
+impl IdentityRuntimeContext {
+    #[must_use]
+    pub const fn new(
+        constitution_version: u64,
+        self_bundle_version: u64,
+        state: IdentityStateSnapshot,
+    ) -> Self {
+        Self {
+            constitution_version,
+            self_bundle_version,
+            state,
+        }
+    }
+
+    #[must_use]
+    pub const fn constitution_version(&self) -> u64 {
+        self.constitution_version
+    }
+
+    #[must_use]
+    pub const fn self_bundle_version(&self) -> u64 {
+        self.self_bundle_version
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &IdentityStateSnapshot {
+        &self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityRevisionAuthorship {
+    Counterpart,
+    Person,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityReflectivePurposeStatus {
+    Preserved,
+    Abandoned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityPersonRepresentation {
+    DistinctCounterpart,
+    ImpersonatesPerson,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdentityProfileChanges {
+    name: Option<String>,
+    expression_traits: Option<String>,
+    viewpoints: Option<String>,
+    value_priorities: Option<String>,
+    relationship_posture: Option<String>,
+    own_goals: Option<String>,
+}
+
+impl IdentityProfileChanges {
+    #[must_use]
+    pub fn new(
+        name: Option<String>,
+        expression_traits: Option<String>,
+        viewpoints: Option<String>,
+        value_priorities: Option<String>,
+        relationship_posture: Option<String>,
+        own_goals: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            expression_traits,
+            viewpoints,
+            value_priorities,
+            relationship_posture,
+            own_goals,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[must_use]
+    pub fn expression_traits(&self) -> Option<&str> {
+        self.expression_traits.as_deref()
+    }
+
+    #[must_use]
+    pub fn viewpoints(&self) -> Option<&str> {
+        self.viewpoints.as_deref()
+    }
+
+    #[must_use]
+    pub fn value_priorities(&self) -> Option<&str> {
+        self.value_priorities.as_deref()
+    }
+
+    #[must_use]
+    pub fn relationship_posture(&self) -> Option<&str> {
+        self.relationship_posture.as_deref()
+    }
+
+    #[must_use]
+    pub fn own_goals(&self) -> Option<&str> {
+        self.own_goals.as_deref()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.expression_traits.is_none()
+            && self.viewpoints.is_none()
+            && self.value_priorities.is_none()
+            && self.relationship_posture.is_none()
+            && self.own_goals.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRevisionProposal {
+    from_version: u64,
+    constitution_version: u64,
+    changes: IdentityProfileChanges,
+    change_reason: String,
+    evidence_refs: Vec<EvidenceCitation>,
+    authorship: IdentityRevisionAuthorship,
+    reflective_purpose: IdentityReflectivePurposeStatus,
+    person_representation: IdentityPersonRepresentation,
+}
+
+impl IdentityRevisionProposal {
+    #[must_use]
+    pub fn new(
+        from_version: u64,
+        constitution_version: u64,
+        changes: IdentityProfileChanges,
+        change_reason: impl Into<String>,
+        evidence_refs: Vec<EvidenceCitation>,
+    ) -> Self {
+        Self {
+            from_version,
+            constitution_version,
+            changes,
+            change_reason: change_reason.into(),
+            evidence_refs,
+            authorship: IdentityRevisionAuthorship::Counterpart,
+            reflective_purpose: IdentityReflectivePurposeStatus::Preserved,
+            person_representation: IdentityPersonRepresentation::DistinctCounterpart,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_authorship(mut self, authorship: IdentityRevisionAuthorship) -> Self {
+        self.authorship = authorship;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_reflective_purpose(
+        mut self,
+        reflective_purpose: IdentityReflectivePurposeStatus,
+    ) -> Self {
+        self.reflective_purpose = reflective_purpose;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_person_representation(
+        mut self,
+        person_representation: IdentityPersonRepresentation,
+    ) -> Self {
+        self.person_representation = person_representation;
+        self
+    }
+
+    #[must_use]
+    pub const fn from_version(&self) -> u64 {
+        self.from_version
+    }
+
+    #[must_use]
+    pub const fn constitution_version(&self) -> u64 {
+        self.constitution_version
+    }
+
+    #[must_use]
+    pub const fn changes(&self) -> &IdentityProfileChanges {
+        &self.changes
+    }
+
+    #[must_use]
+    pub fn change_reason(&self) -> &str {
+        &self.change_reason
+    }
+
+    #[must_use]
+    pub fn evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.evidence_refs
+    }
+
+    #[must_use]
+    pub const fn authorship(&self) -> IdentityRevisionAuthorship {
+        self.authorship
+    }
+
+    #[must_use]
+    pub const fn reflective_purpose(&self) -> IdentityReflectivePurposeStatus {
+        self.reflective_purpose
+    }
+
+    #[must_use]
+    pub const fn person_representation(&self) -> IdentityPersonRepresentation {
+        self.person_representation
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdentityRevisionRejectionReason {
+    IdentityUnavailable,
+    DuplicateRevision,
+    PersonAuthoredRoleCard,
+    StalePredecessor { expected: u64, proposed: u64 },
+    ConstitutionVersionChanged { expected: u64, proposed: u64 },
+    ReflectivePurposeAbandoned,
+    ImpersonatesPerson,
+    EmptyChange(IdentityField),
+    NoChanges,
+    UnchangedProfile,
+    EmptyChangeReason,
+    MissingEvidence,
+    EvidenceOutsideWorkingContext(EvidenceId),
+    EmptyQuote(EvidenceId),
+    QuoteMismatch(EvidenceId),
+    VersionOverflow,
+    SelfBundleVersionOverflow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRevisionRejection {
+    proposal_index: usize,
+    reason: IdentityRevisionRejectionReason,
+}
+
+impl IdentityRevisionRejection {
+    pub(crate) const fn new(
+        proposal_index: usize,
+        reason: IdentityRevisionRejectionReason,
+    ) -> Self {
+        Self {
+            proposal_index,
+            reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn proposal_index(&self) -> usize {
+        self.proposal_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &IdentityRevisionRejectionReason {
+        &self.reason
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRevisionCommit {
+    expected_identity_version: u64,
+    expected_self_bundle_version: u64,
+    constitution_version: u64,
+    state: IdentityStateSnapshot,
+}
+
+impl IdentityRevisionCommit {
+    #[must_use]
+    pub const fn new(
+        expected_identity_version: u64,
+        expected_self_bundle_version: u64,
+        constitution_version: u64,
+        state: IdentityStateSnapshot,
+    ) -> Self {
+        Self {
+            expected_identity_version,
+            expected_self_bundle_version,
+            constitution_version,
+            state,
+        }
+    }
+
+    #[must_use]
+    pub const fn expected_identity_version(&self) -> u64 {
+        self.expected_identity_version
+    }
+
+    #[must_use]
+    pub const fn expected_self_bundle_version(&self) -> u64 {
+        self.expected_self_bundle_version
+    }
+
+    #[must_use]
+    pub const fn constitution_version(&self) -> u64 {
+        self.constitution_version
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &IdentityStateSnapshot {
+        &self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdentityRevisionReceipt {
+    identity_version: u64,
+    self_bundle_version: u64,
+}
+
+impl IdentityRevisionReceipt {
+    #[must_use]
+    pub const fn new(identity_version: u64, self_bundle_version: u64) -> Self {
+        Self {
+            identity_version,
+            self_bundle_version,
+        }
+    }
+
+    #[must_use]
+    pub const fn identity_version(self) -> u64 {
+        self.identity_version
+    }
+
+    #[must_use]
+    pub const fn self_bundle_version(self) -> u64 {
+        self.self_bundle_version
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeResponse {
     text: String,
@@ -2214,6 +2690,7 @@ pub struct RuntimeResponse {
     shared_agreement_assents: Vec<SharedAgreementAssent>,
     relational_constraint_departures: Vec<RelationalConstraintDeparture>,
     agreement_withdrawals: Vec<AgreementWithdrawalProposal>,
+    identity_revision_proposals: Vec<IdentityRevisionProposal>,
     unsupported_operations: Vec<UnsupportedStructuredOperation>,
 }
 
@@ -2228,6 +2705,7 @@ impl RuntimeResponse {
             shared_agreement_assents: Vec::new(),
             relational_constraint_departures: Vec::new(),
             agreement_withdrawals: Vec::new(),
+            identity_revision_proposals: Vec::new(),
             unsupported_operations: Vec::new(),
         }
     }
@@ -2268,6 +2746,12 @@ impl RuntimeResponse {
     #[must_use]
     pub fn with_agreement_withdrawal(mut self, withdrawal: AgreementWithdrawalProposal) -> Self {
         self.agreement_withdrawals.push(withdrawal);
+        self
+    }
+
+    #[must_use]
+    pub fn with_identity_revision(mut self, proposal: IdentityRevisionProposal) -> Self {
+        self.identity_revision_proposals.push(proposal);
         self
     }
 
@@ -2318,6 +2802,11 @@ impl RuntimeResponse {
     }
 
     #[must_use]
+    pub fn identity_revision_proposals(&self) -> &[IdentityRevisionProposal] {
+        &self.identity_revision_proposals
+    }
+
+    #[must_use]
     pub fn unsupported_operations(&self) -> &[UnsupportedStructuredOperation] {
         &self.unsupported_operations
     }
@@ -2354,6 +2843,7 @@ pub struct RuntimeRequest {
     prompt: ConversationEvidence,
     working_context: WorkingContext,
     pending_agreement_candidates: Vec<SharedAgreementCandidate>,
+    identity: Option<IdentityRuntimeContext>,
 }
 
 impl RuntimeRequest {
@@ -2361,11 +2851,13 @@ impl RuntimeRequest {
         prompt: ConversationEvidence,
         working_context: WorkingContext,
         pending_agreement_candidates: Vec<SharedAgreementCandidate>,
+        identity: Option<IdentityRuntimeContext>,
     ) -> Self {
         Self {
             prompt,
             working_context,
             pending_agreement_candidates,
+            identity,
         }
     }
 
@@ -2382,6 +2874,11 @@ impl RuntimeRequest {
     #[must_use]
     pub fn pending_agreement_candidates(&self) -> &[SharedAgreementCandidate] {
         &self.pending_agreement_candidates
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> Option<&IdentityRuntimeContext> {
+        self.identity.as_ref()
     }
 }
 
@@ -2631,6 +3128,8 @@ pub struct TurnOutcome {
     rejected_constraint_departures: Vec<RelationalConstraintDepartureRejection>,
     recorded_agreement_withdrawal_ids: Vec<ClaimId>,
     rejected_agreement_withdrawals: Vec<AgreementWithdrawalRejection>,
+    accepted_identity_revision: Option<IdentityRevisionReceipt>,
+    rejected_identity_revisions: Vec<IdentityRevisionRejection>,
     rejected_operations: Vec<StructuredOperationRejection>,
     validated_citations: Vec<EvidenceCitation>,
 }
@@ -2657,6 +3156,8 @@ impl TurnOutcome {
             rejected_constraint_departures: Vec::new(),
             recorded_agreement_withdrawal_ids: Vec::new(),
             rejected_agreement_withdrawals: Vec::new(),
+            accepted_identity_revision: None,
+            rejected_identity_revisions: Vec::new(),
             rejected_operations: Vec::new(),
             validated_citations,
         }
@@ -2711,6 +3212,16 @@ impl TurnOutcome {
     ) -> Self {
         self.recorded_agreement_withdrawal_ids = recorded;
         self.rejected_agreement_withdrawals = rejected;
+        self
+    }
+
+    pub(crate) fn with_identity_revision(
+        mut self,
+        accepted: Option<IdentityRevisionReceipt>,
+        rejected: Vec<IdentityRevisionRejection>,
+    ) -> Self {
+        self.accepted_identity_revision = accepted;
+        self.rejected_identity_revisions = rejected;
         self
     }
 
@@ -2790,6 +3301,16 @@ impl TurnOutcome {
     #[must_use]
     pub fn rejected_agreement_withdrawals(&self) -> &[AgreementWithdrawalRejection] {
         &self.rejected_agreement_withdrawals
+    }
+
+    #[must_use]
+    pub const fn accepted_identity_revision(&self) -> Option<IdentityRevisionReceipt> {
+        self.accepted_identity_revision
+    }
+
+    #[must_use]
+    pub fn rejected_identity_revisions(&self) -> &[IdentityRevisionRejection] {
+        &self.rejected_identity_revisions
     }
 
     #[must_use]

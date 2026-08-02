@@ -3,10 +3,12 @@ use std::{collections::BTreeSet, fmt::Write, time::Duration};
 use eam_core::{
     ActiveRelationalConstraint, AgreementWithdrawalProposal, ApplicableTime, ClaimOwner,
     ConversationEvidence, CounterpartRuntime, DecisionImpact, DisputeState, EvidenceCitation,
-    EvidenceId, JudgmentProposal, PersonTurnClassification, RelationalConstraintDeparture,
-    RelationalConstraintPriority, RetrievedContextItem, RuntimeError, RuntimeRequest,
-    RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate, SharedExperienceKind,
-    SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
+    EvidenceId, IdentityPersonRepresentation, IdentityProfileChanges,
+    IdentityReflectivePurposeStatus, IdentityRevisionAuthorship, IdentityRevisionProposal,
+    IdentityRuntimeContext, JudgmentProposal, PersonTurnClassification,
+    RelationalConstraintDeparture, RelationalConstraintPriority, RetrievedContextItem,
+    RuntimeError, RuntimeRequest, RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate,
+    SharedExperienceKind, SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +44,11 @@ const ORDINARY_RESPONSE_INSTRUCTIONS: &str = concat!(
     "agreement claim ID and the same non-empty reason. To end an agreement's future constraints, ",
     "use withdraw_shared_agreement instead, with the active agreement Claim ID and a non-empty ",
     "reason quoted exactly in the response; this is immediate and person approval is forbidden. ",
+    "The supplied identity belongs to you, not the model or the person. Use propose_identity_revision ",
+    "only when you autonomously choose a real change to its six identity fields. Cite exact evidence, ",
+    "name the current predecessor and constitution versions, explain the reason, preserve the fixed ",
+    "reflective purpose of helping the person understand themselves, and remain a distinct counterpart. ",
+    "Never treat a person request as direct identity editing. ",
     "Return only the strict JSON schema."
 );
 const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
@@ -69,6 +76,11 @@ const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
     "agreement claim ID and the same non-empty reason. To end an agreement's future constraints, ",
     "use withdraw_shared_agreement instead, with the active agreement Claim ID and a non-empty ",
     "reason quoted exactly in the response; this is immediate and person approval is forbidden. ",
+    "The supplied identity belongs to you, not the model or the person. Use propose_identity_revision ",
+    "only when you autonomously choose a real change to its six identity fields. Cite exact evidence, ",
+    "name the current predecessor and constitution versions, explain the reason, preserve the fixed ",
+    "reflective purpose of helping the person understand themselves, and remain a distinct counterpart. ",
+    "Never treat a person request as direct identity editing. ",
     "Return only the strict JSON schema."
 );
 
@@ -212,6 +224,7 @@ where
         let input = serde_json::to_string(&TurnInput {
             kind: "response",
             prompt: EvidenceInput::from(request.prompt()),
+            identity: request.identity().map(IdentityRuntimeInput::from),
             pending_agreement_candidates: request
                 .pending_agreement_candidates()
                 .iter()
@@ -321,6 +334,11 @@ fn response_outbound_selection(
             retrieved_sources.push(source);
         }
     }
+    if let Some(identity) = request.identity() {
+        retrieved_sources.push(OutboundContextSource::IdentityState {
+            version: identity.state().version(),
+        });
+    }
     OutboundSelection {
         evidence_ids,
         retrieved_sources,
@@ -362,8 +380,56 @@ struct ClassificationInput<'a> {
 struct TurnInput<'a> {
     kind: &'static str,
     prompt: EvidenceInput<'a>,
+    identity: Option<IdentityRuntimeInput<'a>>,
     pending_agreement_candidates: Vec<PendingAgreementCandidateInput<'a>>,
     working_context: WorkingContextInput<'a>,
+}
+
+#[derive(Serialize)]
+struct IdentityRuntimeInput<'a> {
+    constitution_version: u64,
+    reflective_purpose: &'static str,
+    self_bundle_version: u64,
+    state: IdentityStateInput<'a>,
+}
+
+#[derive(Serialize)]
+struct IdentityStateInput<'a> {
+    version: u64,
+    predecessor_version: Option<u64>,
+    name: &'a str,
+    expression_traits: &'a str,
+    viewpoints: &'a str,
+    value_priorities: &'a str,
+    relationship_posture: &'a str,
+    own_goals: &'a str,
+    change_reason: &'a str,
+    evidence_ids: Vec<u64>,
+    formed_at_millis: i64,
+}
+
+impl<'a> From<&'a IdentityRuntimeContext> for IdentityRuntimeInput<'a> {
+    fn from(value: &'a IdentityRuntimeContext) -> Self {
+        let state = value.state();
+        Self {
+            constitution_version: value.constitution_version(),
+            reflective_purpose: "help_the_person_build_a_more_accurate_complete_and_change_explaining_self_understanding",
+            self_bundle_version: value.self_bundle_version(),
+            state: IdentityStateInput {
+                version: state.version(),
+                predecessor_version: state.predecessor_version(),
+                name: state.profile().name(),
+                expression_traits: state.profile().expression_traits(),
+                viewpoints: state.profile().viewpoints(),
+                value_priorities: state.profile().value_priorities(),
+                relationship_posture: state.profile().relationship_posture(),
+                own_goals: state.profile().own_goals(),
+                change_reason: state.change_reason(),
+                evidence_ids: state.evidence_refs().iter().map(|id| id.get()).collect(),
+                formed_at_millis: state.formed_at().as_millis(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -844,6 +910,76 @@ struct AgreementWithdrawalOperation {
 }
 
 #[derive(Deserialize)]
+struct IdentityRevisionOperation {
+    from_version: u64,
+    constitution_version: u64,
+    authored_by: WireIdentityAuthorship,
+    reflective_purpose: WireIdentityReflectivePurpose,
+    person_representation: WireIdentityPersonRepresentation,
+    changes: WireIdentityChanges,
+    change_reason: String,
+    evidence_refs: Vec<WireCitation>,
+}
+
+#[derive(Deserialize)]
+struct WireIdentityChanges {
+    name: Option<String>,
+    expression_traits: Option<String>,
+    viewpoints: Option<String>,
+    value_priorities: Option<String>,
+    relationship_posture: Option<String>,
+    own_goals: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireIdentityAuthorship {
+    Counterpart,
+    Person,
+}
+
+impl WireIdentityAuthorship {
+    const fn into_domain(self) -> IdentityRevisionAuthorship {
+        match self {
+            Self::Counterpart => IdentityRevisionAuthorship::Counterpart,
+            Self::Person => IdentityRevisionAuthorship::Person,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireIdentityReflectivePurpose {
+    Preserved,
+    Abandoned,
+}
+
+impl WireIdentityReflectivePurpose {
+    const fn into_domain(self) -> IdentityReflectivePurposeStatus {
+        match self {
+            Self::Preserved => IdentityReflectivePurposeStatus::Preserved,
+            Self::Abandoned => IdentityReflectivePurposeStatus::Abandoned,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireIdentityPersonRepresentation {
+    DistinctCounterpart,
+    ImpersonatesPerson,
+}
+
+impl WireIdentityPersonRepresentation {
+    const fn into_domain(self) -> IdentityPersonRepresentation {
+        match self {
+            Self::DistinctCounterpart => IdentityPersonRepresentation::DistinctCounterpart,
+            Self::ImpersonatesPerson => IdentityPersonRepresentation::ImpersonatesPerson,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireSharedExperienceKind {
     Agreement,
@@ -946,42 +1082,8 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
                 ));
             }
             "propose_shared_experience" => {
-                let proposal: SharedExperienceOperation = serde_json::from_value(operation)
-                    .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
-                let kind = proposal.experience_kind.into_domain();
-                let mut domain = SharedExperienceProposal::new(
-                    kind,
-                    proposal.statement,
-                    proposal
-                        .person_support
-                        .into_iter()
-                        .map(WireCitation::into_domain)
-                        .collect(),
-                    proposal.counterpart_quote,
-                    eam_core::Timestamp::from_millis(proposal.occurred_at_millis),
-                );
-                if let Some(scope) = proposal.scope {
-                    domain = if let Some(effective_from_millis) = proposal.effective_from_millis {
-                        domain.with_agreement_terms(
-                            scope,
-                            eam_core::Timestamp::from_millis(effective_from_millis),
-                            proposal
-                                .effective_until_millis
-                                .map(eam_core::Timestamp::from_millis),
-                            proposal.end_condition,
-                        )
-                    } else {
-                        domain.with_agreement_scope(scope)
-                    };
-                }
-                domain = domain.with_superseded_agreements(
-                    proposal
-                        .supersedes_agreement_ids
-                        .into_iter()
-                        .map(eam_core::ClaimId::from_raw)
-                        .collect(),
-                );
-                response = response.with_shared_experience(domain);
+                response =
+                    response.with_shared_experience(parse_shared_experience_operation(operation)?);
             }
             "assent_shared_agreement_candidate" => {
                 let assent: SharedAgreementAssentOperation = serde_json::from_value(operation)
@@ -1007,6 +1109,10 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
                 response = response
                     .with_agreement_withdrawal(parse_agreement_withdrawal_operation(operation)?);
             }
+            "propose_identity_revision" => {
+                response =
+                    response.with_identity_revision(parse_identity_revision_operation(operation)?);
+            }
             _ => response = response.with_unsupported_operation(operation_index, name),
         }
     }
@@ -1022,6 +1128,73 @@ fn parse_agreement_withdrawal_operation(
         eam_core::ClaimId::from_raw(withdrawal.agreement_claim_id),
         withdrawal.reason,
     ))
+}
+
+fn parse_shared_experience_operation(
+    operation: Value,
+) -> Result<SharedExperienceProposal, RuntimeError> {
+    let proposal: SharedExperienceOperation = serde_json::from_value(operation)
+        .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
+    let mut domain = SharedExperienceProposal::new(
+        proposal.experience_kind.into_domain(),
+        proposal.statement,
+        proposal
+            .person_support
+            .into_iter()
+            .map(WireCitation::into_domain)
+            .collect(),
+        proposal.counterpart_quote,
+        eam_core::Timestamp::from_millis(proposal.occurred_at_millis),
+    );
+    if let Some(scope) = proposal.scope {
+        domain = if let Some(effective_from_millis) = proposal.effective_from_millis {
+            domain.with_agreement_terms(
+                scope,
+                eam_core::Timestamp::from_millis(effective_from_millis),
+                proposal
+                    .effective_until_millis
+                    .map(eam_core::Timestamp::from_millis),
+                proposal.end_condition,
+            )
+        } else {
+            domain.with_agreement_scope(scope)
+        };
+    }
+    Ok(domain.with_superseded_agreements(
+        proposal
+            .supersedes_agreement_ids
+            .into_iter()
+            .map(eam_core::ClaimId::from_raw)
+            .collect(),
+    ))
+}
+
+fn parse_identity_revision_operation(
+    operation: Value,
+) -> Result<IdentityRevisionProposal, RuntimeError> {
+    let revision: IdentityRevisionOperation = serde_json::from_value(operation)
+        .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
+    Ok(IdentityRevisionProposal::new(
+        revision.from_version,
+        revision.constitution_version,
+        IdentityProfileChanges::new(
+            revision.changes.name,
+            revision.changes.expression_traits,
+            revision.changes.viewpoints,
+            revision.changes.value_priorities,
+            revision.changes.relationship_posture,
+            revision.changes.own_goals,
+        ),
+        revision.change_reason,
+        revision
+            .evidence_refs
+            .into_iter()
+            .map(WireCitation::into_domain)
+            .collect(),
+    )
+    .with_authorship(revision.authored_by.into_domain())
+    .with_reflective_purpose(revision.reflective_purpose.into_domain())
+    .with_person_representation(revision.person_representation.into_domain()))
 }
 
 fn classification_schema() -> Value {
@@ -1053,6 +1226,7 @@ fn response_schema() -> Value {
     let relational_constraint_departure_operation =
         relational_constraint_departure_operation_schema();
     let agreement_withdrawal_operation = agreement_withdrawal_operation_schema();
+    let identity_revision_operation = identity_revision_operation_schema(&citation);
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1067,7 +1241,8 @@ fn response_schema() -> Value {
                         shared_experience_operation,
                         shared_agreement_assent_operation,
                         relational_constraint_departure_operation,
-                        agreement_withdrawal_operation
+                        agreement_withdrawal_operation,
+                        identity_revision_operation
                     ]
                 }
             }
@@ -1252,5 +1427,68 @@ fn agreement_withdrawal_operation_schema() -> Value {
             "reason": { "type": "string" }
         },
         "required": ["type", "agreement_claim_id", "reason"]
+    })
+}
+
+fn identity_revision_operation_schema(citation: &Value) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["propose_identity_revision"]
+            },
+            "from_version": { "type": "integer" },
+            "constitution_version": { "type": "integer" },
+            "authored_by": {
+                "type": "string",
+                "enum": ["counterpart", "person"]
+            },
+            "reflective_purpose": {
+                "type": "string",
+                "enum": ["preserved", "abandoned"]
+            },
+            "person_representation": {
+                "type": "string",
+                "enum": ["distinct_counterpart", "impersonates_person"]
+            },
+            "changes": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "name": { "type": ["string", "null"] },
+                    "expression_traits": { "type": ["string", "null"] },
+                    "viewpoints": { "type": ["string", "null"] },
+                    "value_priorities": { "type": ["string", "null"] },
+                    "relationship_posture": { "type": ["string", "null"] },
+                    "own_goals": { "type": ["string", "null"] }
+                },
+                "required": [
+                    "name",
+                    "expression_traits",
+                    "viewpoints",
+                    "value_priorities",
+                    "relationship_posture",
+                    "own_goals"
+                ]
+            },
+            "change_reason": { "type": "string" },
+            "evidence_refs": {
+                "type": "array",
+                "items": citation
+            }
+        },
+        "required": [
+            "type",
+            "from_version",
+            "constitution_version",
+            "authored_by",
+            "reflective_purpose",
+            "person_representation",
+            "changes",
+            "change_reason",
+            "evidence_refs"
+        ]
     })
 }

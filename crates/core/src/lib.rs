@@ -16,7 +16,11 @@ pub use domain::{
     ApplicableTime, Claim, ClaimCorrectionReceipt, ClaimId, ClaimOwner, ClaimStatus,
     ConversationEvidence, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId,
     ForgetReceipt, ForgetRequest, ForgetTarget, FrozenEvidenceBlock, FrozenLedgerClaim,
-    FrozenMemoryDispute, FrozenRetrievalWindow, JudgmentProposal, JudgmentRejection,
+    FrozenMemoryDispute, FrozenRetrievalWindow, IdentityField, IdentityPersonRepresentation,
+    IdentityProfileChanges, IdentityProfileSnapshot, IdentityReflectivePurposeStatus,
+    IdentityRevisionAuthorship, IdentityRevisionCommit, IdentityRevisionProposal,
+    IdentityRevisionReceipt, IdentityRevisionRejection, IdentityRevisionRejectionReason,
+    IdentityRuntimeContext, IdentityStateSnapshot, JudgmentProposal, JudgmentRejection,
     JudgmentRejectionReason, PersonTurnClassification, RelationalConstraintDeparture,
     RelationalConstraintDepartureRejection, RelationalConstraintDepartureRejectionReason,
     RelationalConstraintError, RelationalConstraintPriority, RetrievalSnapshot,
@@ -32,7 +36,8 @@ pub use domain::{
 pub use in_memory::InMemoryRepository;
 pub use memory_loop::{CoreError, MemoryCore};
 pub use ports::{
-    ClaimCorrectionRepository, Clock, CounterpartRuntime, ForgetRepository, MemoryRepository,
-    RepositoryError, RuntimeError, RuntimeErrorKind, SharedExperienceRepository, SystemClock,
+    ClaimCorrectionRepository, Clock, CounterpartRuntime, ForgetRepository,
+    IdentityEvolutionRepository, MemoryRepository, RepositoryError, RuntimeError, RuntimeErrorKind,
+    SharedExperienceRepository, SystemClock,
 };
 pub use scripted_runtime::{IncrementingClock, ScriptedRuntime};

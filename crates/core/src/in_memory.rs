@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use crate::{
     AgreementWithdrawalActor, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId,
     ClaimOwner, ClaimStatus, ConversationEvidence, EvidenceId, ForgetReceipt, ForgetRepository,
-    ForgetTarget, MemoryRepository, RepositoryError, SharedAgreementCandidate,
-    SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedAgreementDecision,
-    SharedAgreementResolution, SharedExperience, SharedExperienceKind, SharedExperienceRepository,
-    Speaker, Timestamp, agreement_is_active_at,
+    ForgetTarget, IdentityEvolutionRepository, IdentityRevisionCommit, IdentityRevisionReceipt,
+    IdentityRuntimeContext, IdentityStateSnapshot, MemoryRepository, RepositoryError,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
+    SharedExperienceRepository, Speaker, Timestamp, agreement_is_active_at,
 };
 
 #[derive(Debug)]
@@ -18,6 +19,8 @@ pub struct InMemoryRepository {
     next_shared_agreement_candidate_id: u64,
     shared_agreement_candidates: BTreeMap<SharedAgreementCandidateId, SharedAgreementCandidate>,
     shared_experiences: BTreeMap<ClaimId, SharedExperience>,
+    identity_context: Option<IdentityRuntimeContext>,
+    identity_history: Vec<IdentityStateSnapshot>,
     deletion_intents: BTreeMap<ForgetTarget, ForgetReceipt>,
     next_deletion_intent_id: u64,
 }
@@ -39,9 +42,34 @@ impl InMemoryRepository {
             next_shared_agreement_candidate_id: 1,
             shared_agreement_candidates: BTreeMap::new(),
             shared_experiences: BTreeMap::new(),
+            identity_context: None,
+            identity_history: Vec::new(),
             deletion_intents: BTreeMap::new(),
             next_deletion_intent_id: 1,
         }
+    }
+
+    /// Seeds the in-memory adapter with one already-formed identity and Self Bundle.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero version or a Self Bundle that does not point at the
+    /// supplied current identity.
+    pub fn with_identity_context(
+        mut self,
+        context: IdentityRuntimeContext,
+    ) -> Result<Self, RepositoryError> {
+        if context.constitution_version() == 0
+            || context.self_bundle_version() == 0
+            || context.state().version() == 0
+        {
+            return Err(RepositoryError::new(
+                "identity context versions must be greater than zero",
+            ));
+        }
+        self.identity_history.push(context.state().clone());
+        self.identity_context = Some(context);
+        Ok(self)
     }
 
     fn collect_shared_agreement_forget_closure(
@@ -93,6 +121,62 @@ impl InMemoryRepository {
             }
         }
         affected_candidates
+    }
+}
+
+impl IdentityEvolutionRepository for InMemoryRepository {
+    fn current_identity_context(&self) -> Result<Option<IdentityRuntimeContext>, RepositoryError> {
+        Ok(self.identity_context.clone())
+    }
+
+    fn commit_identity_revision(
+        &mut self,
+        revision: IdentityRevisionCommit,
+    ) -> Result<IdentityRevisionReceipt, RepositoryError> {
+        let current = self
+            .identity_context
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new("identity is not initialized"))?;
+        if current.state().version() != revision.expected_identity_version()
+            || current.self_bundle_version() != revision.expected_self_bundle_version()
+            || current.constitution_version() != revision.constitution_version()
+            || revision.state().predecessor_version() != Some(current.state().version())
+            || revision.state().version() != current.state().version().saturating_add(1)
+        {
+            return Err(RepositoryError::new(
+                "identity revision does not continue the current immutable chain",
+            ));
+        }
+        if revision
+            .state()
+            .evidence_refs()
+            .iter()
+            .any(|id| !self.evidence.contains_key(id))
+        {
+            return Err(RepositoryError::new(
+                "identity revision references missing evidence",
+            ));
+        }
+        let self_bundle_version = current
+            .self_bundle_version()
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::new("Self Bundle version space exhausted"))?;
+        let state = revision.state().clone();
+        let identity_version = state.version();
+        self.identity_history.push(state.clone());
+        self.identity_context = Some(IdentityRuntimeContext::new(
+            current.constitution_version(),
+            self_bundle_version,
+            state,
+        ));
+        Ok(IdentityRevisionReceipt::new(
+            identity_version,
+            self_bundle_version,
+        ))
+    }
+
+    fn identity_history(&self) -> Result<Vec<IdentityStateSnapshot>, RepositoryError> {
+        Ok(self.identity_history.clone())
     }
 }
 

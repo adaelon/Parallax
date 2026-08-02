@@ -5,7 +5,12 @@ import { act } from "react";
 import { Root, createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { App, ConversationTurn, SharedExperienceCeremony } from "./App";
+import {
+  App,
+  ConversationTurn,
+  IdentityStateVersion,
+  SharedExperienceCeremony,
+} from "./App";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -433,6 +438,52 @@ describe("S24 asymmetric agreement withdrawal", () => {
   });
 });
 
+describe("S25 immutable identity history", () => {
+  it("shows trusted versions as read-only history without a person edit path", async () => {
+    const identities: IdentityStateVersion[] = [
+      identityVersion(1, null, "岚", "温和、克制", "基于初始自述形成"),
+      identityVersion(
+        2,
+        1,
+        "岚",
+        "直白、审慎、不武断",
+        "这更能保持独立判断，同时让提醒可被质疑。",
+      ),
+    ];
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "list_conversation") {
+        return [] as T;
+      }
+      if (command === "list_shared_experience_ceremonies") {
+        return [] as T;
+      }
+      if (command === "list_identity_history") {
+        return identities as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledWith("list_identity_history"));
+    await clickButton("身份版本");
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("不可改写身份链");
+      expect(document.body.textContent).toContain("v2 · 岚");
+      expect(document.body.textContent).toContain("直白、审慎、不武断");
+      expect(document.body.textContent).toContain(
+        "这更能保持独立判断，同时让提醒可被质疑。",
+      );
+      expect(document.body.textContent).toContain("不能直接编辑这些版本");
+    });
+    const dialog = document.querySelector('[aria-labelledby="identity-history-title"]')!;
+    expect(dialog.querySelector("input, textarea")).toBeNull();
+    expect([...dialog.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+      "关闭",
+    ]);
+  });
+});
+
 async function enterMessage(message: string) {
   const textarea = document.querySelector("textarea")!;
   const setter = Object.getOwnPropertyDescriptor(
@@ -495,4 +546,26 @@ function turn(
   verbatim: string,
 ): ConversationTurn {
   return { id, speaker, verbatim, recordedAtMillis: 1_785_000_000_000 + id };
+}
+
+function identityVersion(
+  version: number,
+  predecessorVersion: number | null,
+  name: string,
+  expressionTraits: string,
+  changeReason: string,
+): IdentityStateVersion {
+  return {
+    version,
+    predecessorVersion,
+    name,
+    expressionTraits,
+    viewpoints: "保留分歧",
+    valuePriorities: "准确高于迎合",
+    relationshipPosture: "同行者",
+    ownGoals: "帮助本人看见长期变化",
+    changeReason,
+    evidenceIds: version === 1 ? [1, 2] : [7, 8],
+    formedAtMillis: 1_785_000_000_000 + version,
+  };
 }

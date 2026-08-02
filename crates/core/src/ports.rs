@@ -6,8 +6,9 @@ use std::{
 
 use crate::{
     Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceCitation, EvidenceId,
-    ForgetReceipt, ForgetTarget, PersonTurnClassification, RuntimeRequest, RuntimeResponse,
-    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
+    ForgetReceipt, ForgetTarget, IdentityRevisionCommit, IdentityRevisionReceipt,
+    IdentityRuntimeContext, IdentityStateSnapshot, PersonTurnClassification, RuntimeRequest,
+    RuntimeResponse, SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
     SharedAgreementResolution, SharedExperience, Timestamp,
 };
 
@@ -168,6 +169,36 @@ pub trait ForgetRepository: MemoryRepository {
         target: ForgetTarget,
         requested_at: Timestamp,
     ) -> Result<Option<ForgetReceipt>, RepositoryError>;
+}
+
+pub trait IdentityEvolutionRepository: MemoryRepository {
+    /// Loads the current immutable identity together with the Self Bundle and
+    /// constitution versions that make it portable across model runtimes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when identity and Self Bundle pointers are
+    /// incomplete, inconsistent, or cannot be decoded.
+    fn current_identity_context(&self) -> Result<Option<IdentityRuntimeContext>, RepositoryError>;
+
+    /// Atomically appends one validated identity state and advances the Self
+    /// Bundle to that exact version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without either write when the current identity,
+    /// Self Bundle, constitution, evidence, or immutable chain changed.
+    fn commit_identity_revision(
+        &mut self,
+        revision: IdentityRevisionCommit,
+    ) -> Result<IdentityRevisionReceipt, RepositoryError>;
+
+    /// Returns the immutable identity chain in ascending version order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when any persisted version cannot be decoded.
+    fn identity_history(&self) -> Result<Vec<IdentityStateSnapshot>, RepositoryError>;
 }
 
 pub trait SharedExperienceRepository: MemoryRepository {

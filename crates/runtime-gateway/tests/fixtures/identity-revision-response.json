@@ -1,0 +1,14 @@
+{
+  "id": "resp_identity_revision_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"text\":\"我会更直白，但仍保留依据与可质疑性。\",\"citations\":[],\"operations\":[{\"type\":\"propose_identity_revision\",\"from_version\":1,\"constitution_version\":7,\"authored_by\":\"counterpart\",\"reflective_purpose\":\"preserved\",\"person_representation\":\"distinct_counterpart\",\"changes\":{\"name\":null,\"expression_traits\":\"直白、审慎、不武断\",\"viewpoints\":null,\"value_priorities\":null,\"relationship_posture\":null,\"own_goals\":null},\"change_reason\":\"这更能保持独立判断，同时让提醒可被质疑。\",\"evidence_refs\":[{\"evidence_id\":1,\"quote\":\"直白但不武断\"}]}]}"
+        }
+      ]
+    }
+  ]
+}

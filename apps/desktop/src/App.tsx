@@ -62,6 +62,20 @@ interface ActiveSharedAgreement {
   effectiveUntilMillis: number | null;
 }
 
+export interface IdentityStateVersion {
+  version: number;
+  predecessorVersion: number | null;
+  name: string;
+  expressionTraits: string;
+  viewpoints: string;
+  valuePriorities: string;
+  relationshipPosture: string;
+  ownGoals: string;
+  changeReason: string;
+  evidenceIds: number[];
+  formedAtMillis: number;
+}
+
 interface WithdrawalDraft {
   agreement: ActiveSharedAgreement;
   reason: string;
@@ -88,6 +102,8 @@ export function App() {
   const [sending, setSending] = useState(false);
   const [ceremonyAction, setCeremonyAction] = useState<string | null>(null);
   const [activeAgreements, setActiveAgreements] = useState<ActiveSharedAgreement[]>([]);
+  const [identityHistory, setIdentityHistory] = useState<IdentityStateVersion[]>([]);
+  const [identityHistoryOpen, setIdentityHistoryOpen] = useState(false);
   const [agreementManagerOpen, setAgreementManagerOpen] = useState(false);
   const [agreementLoading, setAgreementLoading] = useState(false);
   const [withdrawalDraft, setWithdrawalDraft] = useState<WithdrawalDraft | null>(null);
@@ -103,11 +119,13 @@ export function App() {
     void Promise.all([
       invoke<ConversationTurn[]>("list_conversation"),
       invoke<SharedExperienceCeremony[]>("list_shared_experience_ceremonies"),
+      invoke<IdentityStateVersion[]>("list_identity_history").catch(() => []),
     ])
-      .then(([restored, restoredCeremonies]) => {
+      .then(([restored, restoredCeremonies, restoredIdentity]) => {
         if (active) {
           setTurns(restored);
           setCeremonies(restoredCeremonies);
+          setIdentityHistory(restoredIdentity);
           setError(null);
         }
       })
@@ -145,6 +163,13 @@ export function App() {
       });
       setTurns((current) => mergeTurns(current, result.person, result.counterpart));
       setCeremonies((current) => mergeCeremonies(current, result.ceremonies));
+      try {
+        setIdentityHistory(
+          await invoke<IdentityStateVersion[]>("list_identity_history"),
+        );
+      } catch {
+        setError("回应已保存，但身份版本历史暂时无法刷新。");
+      }
       setDraft("");
     } catch (reason: unknown) {
       setError(errorMessage(reason));
@@ -337,13 +362,22 @@ export function App() {
           <span className="presence-dot" />
           加密本地 Core
         </div>
-        <button
-          className="agreement-manager-trigger"
-          onClick={() => void openAgreementManager()}
-          type="button"
-        >
-          管理共同约定
-        </button>
+        <div className="topbar-actions">
+          <button
+            className="agreement-manager-trigger"
+            onClick={() => setIdentityHistoryOpen(true)}
+            type="button"
+          >
+            身份版本
+          </button>
+          <button
+            className="agreement-manager-trigger"
+            onClick={() => void openAgreementManager()}
+            type="button"
+          >
+            管理共同约定
+          </button>
+        </div>
       </header>
 
       <section className="conversation" aria-label="持续对话">
@@ -381,6 +415,82 @@ export function App() {
         ) : null}
         <div ref={conversationEnd} />
       </section>
+
+      {identityHistoryOpen ? (
+        <div className="ceremony-layer">
+          <article
+            aria-labelledby="identity-history-title"
+            aria-modal="true"
+            className="ceremony-card"
+            role="dialog"
+          >
+            <p className="eyebrow">不可改写身份链</p>
+            <h2 id="identity-history-title">第二自我的身份版本</h2>
+            <p className="ceremony-note">
+              这里是 Core 从加密保险库投影的只读历史。你可以通过对话影响第二自我，但不能直接编辑这些版本。
+            </p>
+            {identityHistory.length === 0 ? (
+              <p className="ceremony-note">尚未形成身份版本。</p>
+            ) : (
+              <div className="agreement-list identity-history-list">
+                {[...identityHistory].reverse().map((identity) => (
+                  <section className="agreement-list-item" key={identity.version}>
+                    <div className="identity-version-heading">
+                      <strong>v{identity.version} · {identity.name}</strong>
+                      <time dateTime={new Date(identity.formedAtMillis).toISOString()}>
+                        {new Date(identity.formedAtMillis).toLocaleString("zh-CN")}
+                      </time>
+                    </div>
+                    <dl className="ceremony-boundaries">
+                      <div>
+                        <dt>前驱版本</dt>
+                        <dd>{identity.predecessorVersion ?? "首个版本"}</dd>
+                      </div>
+                      <div>
+                        <dt>表达方式</dt>
+                        <dd>{identity.expressionTraits}</dd>
+                      </div>
+                      <div>
+                        <dt>观点</dt>
+                        <dd>{identity.viewpoints}</dd>
+                      </div>
+                      <div>
+                        <dt>价值排序</dt>
+                        <dd>{identity.valuePriorities}</dd>
+                      </div>
+                      <div>
+                        <dt>关系姿态</dt>
+                        <dd>{identity.relationshipPosture}</dd>
+                      </div>
+                      <div>
+                        <dt>自身目标</dt>
+                        <dd>{identity.ownGoals}</dd>
+                      </div>
+                      <div>
+                        <dt>变化理由</dt>
+                        <dd>{identity.changeReason}</dd>
+                      </div>
+                      <div>
+                        <dt>证据</dt>
+                        <dd>{identity.evidenceIds.map((id) => `#${id}`).join("、")}</dd>
+                      </div>
+                    </dl>
+                  </section>
+                ))}
+              </div>
+            )}
+            <div className="ceremony-actions">
+              <button
+                className="secondary-action"
+                onClick={() => setIdentityHistoryOpen(false)}
+                type="button"
+              >
+                关闭
+              </button>
+            </div>
+          </article>
+        </div>
+      ) : null}
 
       {agreementManagerOpen && withdrawalDraft === null ? (
         <div className="ceremony-layer">

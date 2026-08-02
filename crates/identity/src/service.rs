@@ -138,6 +138,17 @@ where
             .map_err(IdentityError::from)
     }
 
+    /// Loads the complete immutable identity history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError`] when the repository cannot decode the chain.
+    pub fn identity_history(&self) -> Result<Vec<IdentityStateVersion>, IdentityError> {
+        self.repository
+            .all_identity_states()
+            .map_err(IdentityError::from)
+    }
+
     #[must_use]
     pub const fn repository(&self) -> &R {
         &self.repository

@@ -5,8 +5,12 @@ use crate::{
     AgreementWithdrawalRejectionReason, ApplicableTime, Claim, ClaimCorrectionReceipt,
     ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, Clock, ConversationEvidence,
     CounterpartRuntime, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository,
-    ForgetRequest, JudgmentProposal, JudgmentRejection, JudgmentRejectionReason, MemoryRepository,
-    PersonTurnClassification, RelationalConstraintDeparture,
+    ForgetRequest, IdentityEvolutionRepository, IdentityField, IdentityPersonRepresentation,
+    IdentityProfileChanges, IdentityProfileSnapshot, IdentityReflectivePurposeStatus,
+    IdentityRevisionAuthorship, IdentityRevisionCommit, IdentityRevisionReceipt,
+    IdentityRevisionRejection, IdentityRevisionRejectionReason, IdentityRuntimeContext,
+    IdentityStateSnapshot, JudgmentProposal, JudgmentRejection, JudgmentRejectionReason,
+    MemoryRepository, PersonTurnClassification, RelationalConstraintDeparture,
     RelationalConstraintDepartureRejection, RelationalConstraintDepartureRejectionReason,
     RepositoryError, RuntimeError, RuntimeRequest, SessionId, SharedAgreementAssentRejection,
     SharedAgreementAssentRejectionReason, SharedAgreementCandidate, SharedAgreementCandidateId,
@@ -63,6 +67,11 @@ struct ConstraintDepartureWriteOutcome {
 struct AgreementWithdrawalWriteOutcome {
     recorded: Vec<ClaimId>,
     rejected: Vec<AgreementWithdrawalRejection>,
+}
+
+struct IdentityRevisionWriteOutcome {
+    accepted: Option<IdentityRevisionReceipt>,
+    rejected: Vec<IdentityRevisionRejection>,
 }
 
 fn reject_constraint_departure(
@@ -380,7 +389,7 @@ where
 
 impl<R, T, C> MemoryCore<R, T, C>
 where
-    R: SharedExperienceRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -415,10 +424,12 @@ where
                 candidate.status() == SharedAgreementCandidateStatus::AwaitingCounterpart
             })
             .collect();
+        let identity = self.repository.current_identity_context()?;
         let request = RuntimeRequest::new(
             prompt.clone(),
             working_context,
             pending_agreement_candidates,
+            identity.clone(),
         );
         let validation_context = request.working_context().clone();
         let response = self.runtime.respond(request)?;
@@ -452,6 +463,13 @@ where
             &validation_context,
             &counterpart_evidence,
         )?;
+        let identity_revision = self.persist_identity_revisions(
+            &response,
+            identity.as_ref(),
+            &validation_context,
+            &prompt,
+            &counterpart_evidence,
+        )?;
         let shared = self.persist_shared_experience_proposals(
             &response,
             &validation_context,
@@ -478,8 +496,50 @@ where
         .with_agreement_assents(agreement_assents.assented, agreement_assents.rejected)
         .with_constraint_departures(departures.recorded, departures.rejected)
         .with_agreement_withdrawals(withdrawals.recorded, withdrawals.rejected)
+        .with_identity_revision(identity_revision.accepted, identity_revision.rejected)
         .with_shared_experiences(shared.pending_agreements, shared.admitted, shared.rejected)
         .with_rejected_operations(rejected_operations))
+    }
+
+    fn persist_identity_revisions(
+        &mut self,
+        response: &crate::RuntimeResponse,
+        identity: Option<&IdentityRuntimeContext>,
+        validation_context: &WorkingContext,
+        prompt: &ConversationEvidence,
+        counterpart_evidence: &ConversationEvidence,
+    ) -> Result<IdentityRevisionWriteOutcome, CoreError> {
+        let mut outcome = IdentityRevisionWriteOutcome {
+            accepted: None,
+            rejected: Vec::new(),
+        };
+        let mut seen_revision = false;
+        for (proposal_index, proposal) in response.identity_revision_proposals().iter().enumerate()
+        {
+            if seen_revision {
+                outcome.rejected.push(IdentityRevisionRejection::new(
+                    proposal_index,
+                    IdentityRevisionRejectionReason::DuplicateRevision,
+                ));
+                continue;
+            }
+            seen_revision = true;
+            match validate_identity_revision(
+                proposal,
+                identity,
+                validation_context,
+                prompt,
+                counterpart_evidence,
+            ) {
+                Ok(commit) => {
+                    outcome.accepted = Some(self.repository.commit_identity_revision(commit)?);
+                }
+                Err(reason) => outcome
+                    .rejected
+                    .push(IdentityRevisionRejection::new(proposal_index, reason)),
+            }
+        }
+        Ok(outcome)
     }
 
     fn persist_relational_constraint_departures(
@@ -1304,6 +1364,160 @@ fn validate_agreement_supersession(
             ),
         )
     }
+}
+
+fn validate_identity_revision(
+    proposal: &crate::IdentityRevisionProposal,
+    identity: Option<&IdentityRuntimeContext>,
+    working_context: &WorkingContext,
+    prompt: &ConversationEvidence,
+    counterpart_evidence: &ConversationEvidence,
+) -> Result<IdentityRevisionCommit, IdentityRevisionRejectionReason> {
+    let identity = identity.ok_or(IdentityRevisionRejectionReason::IdentityUnavailable)?;
+    if proposal.authorship() != IdentityRevisionAuthorship::Counterpart {
+        return Err(IdentityRevisionRejectionReason::PersonAuthoredRoleCard);
+    }
+    if proposal.from_version() != identity.state().version() {
+        return Err(IdentityRevisionRejectionReason::StalePredecessor {
+            expected: identity.state().version(),
+            proposed: proposal.from_version(),
+        });
+    }
+    if proposal.constitution_version() != identity.constitution_version() {
+        return Err(
+            IdentityRevisionRejectionReason::ConstitutionVersionChanged {
+                expected: identity.constitution_version(),
+                proposed: proposal.constitution_version(),
+            },
+        );
+    }
+    if proposal.reflective_purpose() != IdentityReflectivePurposeStatus::Preserved {
+        return Err(IdentityRevisionRejectionReason::ReflectivePurposeAbandoned);
+    }
+    if proposal.person_representation() != IdentityPersonRepresentation::DistinctCounterpart {
+        return Err(IdentityRevisionRejectionReason::ImpersonatesPerson);
+    }
+    if proposal.change_reason().trim().is_empty() {
+        return Err(IdentityRevisionRejectionReason::EmptyChangeReason);
+    }
+    validate_identity_changes(proposal.changes())?;
+    if proposal.evidence_refs().is_empty() {
+        return Err(IdentityRevisionRejectionReason::MissingEvidence);
+    }
+    for citation in proposal.evidence_refs() {
+        validate_identity_citation(citation, working_context, prompt)?;
+    }
+
+    let profile = apply_identity_changes(identity.state().profile(), proposal.changes());
+    if &profile == identity.state().profile() {
+        return Err(IdentityRevisionRejectionReason::UnchangedProfile);
+    }
+    let version = identity
+        .state()
+        .version()
+        .checked_add(1)
+        .ok_or(IdentityRevisionRejectionReason::VersionOverflow)?;
+    identity
+        .self_bundle_version()
+        .checked_add(1)
+        .ok_or(IdentityRevisionRejectionReason::SelfBundleVersionOverflow)?;
+    let mut evidence_refs = proposal
+        .evidence_refs()
+        .iter()
+        .map(EvidenceCitation::evidence_id)
+        .collect::<Vec<_>>();
+    if !evidence_refs.contains(&counterpart_evidence.id()) {
+        evidence_refs.push(counterpart_evidence.id());
+    }
+    let state = IdentityStateSnapshot::restore(
+        version,
+        Some(identity.state().version()),
+        profile,
+        proposal.change_reason(),
+        evidence_refs,
+        counterpart_evidence.recorded_at(),
+    );
+    Ok(IdentityRevisionCommit::new(
+        identity.state().version(),
+        identity.self_bundle_version(),
+        identity.constitution_version(),
+        state,
+    ))
+}
+
+fn validate_identity_changes(
+    changes: &IdentityProfileChanges,
+) -> Result<(), IdentityRevisionRejectionReason> {
+    if changes.is_empty() {
+        return Err(IdentityRevisionRejectionReason::NoChanges);
+    }
+    for (field, value) in [
+        (IdentityField::Name, changes.name()),
+        (IdentityField::ExpressionTraits, changes.expression_traits()),
+        (IdentityField::Viewpoints, changes.viewpoints()),
+        (IdentityField::ValuePriorities, changes.value_priorities()),
+        (
+            IdentityField::RelationshipPosture,
+            changes.relationship_posture(),
+        ),
+        (IdentityField::OwnGoals, changes.own_goals()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(IdentityRevisionRejectionReason::EmptyChange(field));
+        }
+    }
+    Ok(())
+}
+
+fn apply_identity_changes(
+    current: &IdentityProfileSnapshot,
+    changes: &IdentityProfileChanges,
+) -> IdentityProfileSnapshot {
+    IdentityProfileSnapshot::new(
+        changes.name().unwrap_or_else(|| current.name()),
+        changes
+            .expression_traits()
+            .unwrap_or_else(|| current.expression_traits()),
+        changes.viewpoints().unwrap_or_else(|| current.viewpoints()),
+        changes
+            .value_priorities()
+            .unwrap_or_else(|| current.value_priorities()),
+        changes
+            .relationship_posture()
+            .unwrap_or_else(|| current.relationship_posture()),
+        changes.own_goals().unwrap_or_else(|| current.own_goals()),
+    )
+}
+
+fn validate_identity_citation(
+    citation: &EvidenceCitation,
+    working_context: &WorkingContext,
+    prompt: &ConversationEvidence,
+) -> Result<(), IdentityRevisionRejectionReason> {
+    let evidence = if prompt.id() == citation.evidence_id() {
+        prompt
+    } else {
+        working_context
+            .evidence()
+            .iter()
+            .find(|evidence| evidence.id() == citation.evidence_id())
+            .ok_or(
+                IdentityRevisionRejectionReason::EvidenceOutsideWorkingContext(
+                    citation.evidence_id(),
+                ),
+            )?
+    };
+    if citation.quote().is_empty() {
+        return Err(IdentityRevisionRejectionReason::EmptyQuote(
+            citation.evidence_id(),
+        ));
+    }
+    if !evidence.verbatim().contains(citation.quote()) {
+        return Err(IdentityRevisionRejectionReason::QuoteMismatch(
+            citation.evidence_id(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_citation(

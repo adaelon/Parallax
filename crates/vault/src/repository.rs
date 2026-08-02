@@ -8,10 +8,12 @@ use eam_core::{
     AgreementWithdrawal, AgreementWithdrawalActor, ApplicableTime, Claim, ClaimCorrectionReceipt,
     ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, ConversationEvidence,
     DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository, ForgetTarget,
-    MemoryRepository, RelationalConstraintDeparture, RepositoryError, SessionId,
-    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
-    SharedExperienceRepository, Speaker, Timestamp, Uncertainty,
+    IdentityEvolutionRepository, IdentityProfileSnapshot, IdentityRevisionCommit,
+    IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot, MemoryRepository,
+    RelationalConstraintDeparture, RepositoryError, SessionId, SharedAgreementCandidate,
+    SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    SharedAgreementResolution, SharedExperience, SharedExperienceKind, SharedExperienceRepository,
+    Speaker, Timestamp, Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -4618,147 +4620,126 @@ impl IdentityRepository for VaultRepository {
         &mut self,
         identity: IdentityStateVersion,
     ) -> Result<(), RepositoryError> {
-        let version = to_sql_id(identity.version())?;
-        let predecessor_version = identity.predecessor_version().map(to_sql_id).transpose()?;
-        let profile = identity.profile();
+        validate_identity_chain(self.connection(), &identity)?;
         let transaction = self
             .connection
             .as_mut()
             .expect("an open vault always owns a database connection")
             .transaction()
             .map_err(repository_error)?;
-        transaction
-            .execute(
-                "INSERT INTO identity_state_versions
-                 (version, predecessor_version, name, expression_traits, viewpoints,
-                  value_priorities, relationship_posture, own_goals, change_reason, formed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    version,
-                    predecessor_version,
-                    profile.name(),
-                    profile.expression_traits(),
-                    profile.viewpoints(),
-                    profile.value_priorities(),
-                    profile.relationship_posture(),
-                    profile.own_goals(),
-                    identity.change_reason(),
-                    identity.formed_at().as_millis(),
-                ],
-            )
-            .map_err(repository_error)?;
-        for (ordinal, evidence_id) in identity.evidence_refs().iter().enumerate() {
-            transaction
-                .execute(
-                    "INSERT INTO identity_state_evidence
-                     (identity_version, ordinal, evidence_id) VALUES (?1, ?2, ?3)",
-                    params![
-                        version,
-                        i64::try_from(ordinal).map_err(repository_error)?,
-                        to_sql_id(evidence_id.get())?,
-                    ],
-                )
-                .map_err(repository_error)?;
-        }
+        insert_identity_state(&transaction, &identity)?;
         transaction.commit().map_err(repository_error)?;
         Ok(())
     }
 
     fn current_identity_state(&self) -> Result<Option<IdentityStateVersion>, RepositoryError> {
-        let stored = self
-            .connection()
-            .query_row(
-                "SELECT version, predecessor_version, name, expression_traits, viewpoints,
-                        value_priorities, relationship_posture, own_goals, change_reason, formed_at
-                 FROM identity_state_versions ORDER BY version DESC LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, i64>(9)?,
-                    ))
-                },
-            )
-            .optional()
+        Ok(load_identity_states(self.connection())?.pop())
+    }
+
+    fn all_identity_states(&self) -> Result<Vec<IdentityStateVersion>, RepositoryError> {
+        load_identity_states(self.connection())
+    }
+}
+
+impl IdentityEvolutionRepository for VaultRepository {
+    fn current_identity_context(&self) -> Result<Option<IdentityRuntimeContext>, RepositoryError> {
+        let identity = self.current_identity_state()?;
+        let bundle = self.current_self_bundle()?;
+        match (identity, bundle) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(RepositoryError::new(
+                "identity exists without an initialized Self Bundle",
+            )),
+            (None, Some(_)) => Err(RepositoryError::new(
+                "Self Bundle exists without an identity state",
+            )),
+            (Some(identity), Some(bundle)) => {
+                if bundle.state().identity_state_version() != identity.version() {
+                    return Err(RepositoryError::new(
+                        "current Self Bundle does not reference the current identity",
+                    ));
+                }
+                Ok(Some(identity_runtime_context(&identity, &bundle)))
+            }
+        }
+    }
+
+    fn commit_identity_revision(
+        &mut self,
+        revision: IdentityRevisionCommit,
+    ) -> Result<IdentityRevisionReceipt, RepositoryError> {
+        let current_identity = self
+            .current_identity_state()?
+            .ok_or_else(|| RepositoryError::new("identity is not initialized"))?;
+        let current_bundle = self
+            .current_self_bundle()?
+            .ok_or_else(|| RepositoryError::new("Self Bundle is not initialized"))?;
+        validate_identity_revision_commit(&revision, &current_identity, &current_bundle)?;
+
+        let identity = identity_version_from_commit(&revision);
+        let bundle_version = current_bundle
+            .version()
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::new("Self Bundle version space exhausted"))?;
+        let next_bundle_state = SelfBundleState::new(
+            current_bundle.state().constitution_version(),
+            identity.version(),
+            current_bundle
+                .state()
+                .counterpart_experience_refs()
+                .to_vec(),
+            current_bundle.state().belief_refs().to_vec(),
+            current_bundle.state().relationship_state(),
+            current_bundle.state().pending_intentions().to_vec(),
+        )
+        .map_err(repository_error)?;
+        let next_bundle = SelfBundleVersion::restore(
+            bundle_version,
+            Some(current_bundle.version()),
+            next_bundle_state,
+            Some(WakeCommit::new(
+                WakeTrigger::ConversationStarted,
+                WakeExit::Completed,
+            )),
+            identity.formed_at(),
+        );
+
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
             .map_err(repository_error)?;
-        let Some((
-            version,
-            predecessor_version,
-            name,
-            expression_traits,
-            viewpoints,
-            value_priorities,
-            relationship_posture,
-            own_goals,
-            change_reason,
-            formed_at,
-        )) = stored
-        else {
-            return Ok(None);
-        };
-        let version = u64::try_from(version).map_err(repository_error)?;
-        let predecessor_version = predecessor_version
-            .map(u64::try_from)
-            .transpose()
-            .map_err(repository_error)?;
-        let evidence_refs = load_identity_evidence(self.connection(), version)?;
-        Ok(Some(IdentityStateVersion::restore(
-            version,
-            predecessor_version,
-            IdentityProfile::new(
-                name,
-                expression_traits,
-                viewpoints,
-                value_priorities,
-                relationship_posture,
-                own_goals,
-            ),
-            change_reason,
-            evidence_refs,
-            Timestamp::from_millis(formed_at),
-        )))
+        recheck_identity_revision_versions(&transaction, &revision)?;
+        insert_identity_state(&transaction, &identity)?;
+        insert_self_bundle(&transaction, &next_bundle)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(IdentityRevisionReceipt::new(
+            identity.version(),
+            bundle_version,
+        ))
+    }
+
+    fn identity_history(&self) -> Result<Vec<IdentityStateSnapshot>, RepositoryError> {
+        self.all_identity_states().map(|states| {
+            states
+                .iter()
+                .map(identity_state_snapshot)
+                .collect::<Vec<_>>()
+        })
     }
 }
 
 impl SelfBundleRepository for VaultRepository {
     fn append_self_bundle(&mut self, bundle: SelfBundleVersion) -> Result<(), RepositoryError> {
         validate_self_bundle_chain(self.connection(), &bundle)?;
-        let (wake_trigger, wake_exit) = encode_wake_commit(bundle.wake_commit())?;
-        let version = to_sql_id(bundle.version())?;
-        let state = bundle.state();
         let transaction = self
             .connection
             .as_mut()
             .expect("an open vault always owns a database connection")
             .transaction()
             .map_err(repository_error)?;
-        transaction
-            .execute(
-                "INSERT INTO self_bundle_versions
-                 (version, predecessor_version, constitution_version, identity_state_version,
-                  relationship_state, wake_trigger, wake_exit, committed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    version,
-                    bundle.predecessor_version().map(to_sql_id).transpose()?,
-                    to_sql_id(state.constitution_version())?,
-                    to_sql_id(state.identity_state_version())?,
-                    state.relationship_state(),
-                    wake_trigger,
-                    wake_exit,
-                    bundle.committed_at().as_millis(),
-                ],
-            )
-            .map_err(repository_error)?;
-        insert_self_bundle_children(&transaction, version, state)?;
+        insert_self_bundle(&transaction, &bundle)?;
         transaction.commit().map_err(repository_error)?;
         Ok(())
     }
@@ -4824,6 +4805,304 @@ impl SelfBundleRepository for VaultRepository {
             Timestamp::from_millis(committed_at),
         )))
     }
+}
+
+fn validate_identity_chain(
+    connection: &Connection,
+    identity: &IdentityStateVersion,
+) -> Result<(), RepositoryError> {
+    let current = connection
+        .query_row(
+            "SELECT MAX(version) FROM identity_state_versions",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(repository_error)?
+        .map(u64::try_from)
+        .transpose()
+        .map_err(repository_error)?;
+    match current {
+        None if identity.version() == 1 && identity.predecessor_version().is_none() => Ok(()),
+        Some(version)
+            if identity.version() == version.saturating_add(1)
+                && identity.predecessor_version() == Some(version) =>
+        {
+            Ok(())
+        }
+        _ => Err(RepositoryError::new(
+            "identity version does not continue the current immutable chain",
+        )),
+    }
+}
+
+fn insert_identity_state(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &IdentityStateVersion,
+) -> Result<(), RepositoryError> {
+    let version = to_sql_id(identity.version())?;
+    let profile = identity.profile();
+    transaction
+        .execute(
+            "INSERT INTO identity_state_versions
+             (version, predecessor_version, name, expression_traits, viewpoints,
+              value_priorities, relationship_posture, own_goals, change_reason, formed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                version,
+                identity.predecessor_version().map(to_sql_id).transpose()?,
+                profile.name(),
+                profile.expression_traits(),
+                profile.viewpoints(),
+                profile.value_priorities(),
+                profile.relationship_posture(),
+                profile.own_goals(),
+                identity.change_reason(),
+                identity.formed_at().as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    for (ordinal, evidence_id) in identity.evidence_refs().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO identity_state_evidence
+                 (identity_version, ordinal, evidence_id) VALUES (?1, ?2, ?3)",
+                params![
+                    version,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(evidence_id.get())?,
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
+fn load_identity_states(
+    connection: &Connection,
+) -> Result<Vec<IdentityStateVersion>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT version, predecessor_version, name, expression_traits, viewpoints,
+                    value_priorities, relationship_posture, own_goals, change_reason, formed_at
+             FROM identity_state_versions ORDER BY version",
+        )
+        .map_err(repository_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)?;
+    let mut identities = Vec::with_capacity(rows.len());
+    for (
+        version,
+        predecessor_version,
+        name,
+        expression_traits,
+        viewpoints,
+        value_priorities,
+        relationship_posture,
+        own_goals,
+        change_reason,
+        formed_at,
+    ) in rows
+    {
+        let version = u64::try_from(version).map_err(repository_error)?;
+        identities.push(IdentityStateVersion::restore(
+            version,
+            predecessor_version
+                .map(u64::try_from)
+                .transpose()
+                .map_err(repository_error)?,
+            IdentityProfile::new(
+                name,
+                expression_traits,
+                viewpoints,
+                value_priorities,
+                relationship_posture,
+                own_goals,
+            ),
+            change_reason,
+            load_identity_evidence(connection, version)?,
+            Timestamp::from_millis(formed_at),
+        ));
+    }
+    for (index, identity) in identities.iter().enumerate() {
+        let expected_version = u64::try_from(index)
+            .map_err(repository_error)?
+            .saturating_add(1);
+        let expected_predecessor = (index > 0).then_some(expected_version.saturating_sub(1));
+        if identity.version() != expected_version
+            || identity.predecessor_version() != expected_predecessor
+        {
+            return Err(RepositoryError::new(
+                "persisted identity chain is not contiguous and immutable",
+            ));
+        }
+    }
+    Ok(identities)
+}
+
+fn identity_state_snapshot(identity: &IdentityStateVersion) -> IdentityStateSnapshot {
+    IdentityStateSnapshot::restore(
+        identity.version(),
+        identity.predecessor_version(),
+        IdentityProfileSnapshot::new(
+            identity.profile().name(),
+            identity.profile().expression_traits(),
+            identity.profile().viewpoints(),
+            identity.profile().value_priorities(),
+            identity.profile().relationship_posture(),
+            identity.profile().own_goals(),
+        ),
+        identity.change_reason(),
+        identity.evidence_refs().to_vec(),
+        identity.formed_at(),
+    )
+}
+
+fn identity_runtime_context(
+    identity: &IdentityStateVersion,
+    bundle: &SelfBundleVersion,
+) -> IdentityRuntimeContext {
+    IdentityRuntimeContext::new(
+        bundle.state().constitution_version(),
+        bundle.version(),
+        identity_state_snapshot(identity),
+    )
+}
+
+fn validate_identity_revision_commit(
+    revision: &IdentityRevisionCommit,
+    identity: &IdentityStateVersion,
+    bundle: &SelfBundleVersion,
+) -> Result<(), RepositoryError> {
+    let expected_next = identity
+        .version()
+        .checked_add(1)
+        .ok_or_else(|| RepositoryError::new("identity version space exhausted"))?;
+    if revision.expected_identity_version() != identity.version()
+        || revision.expected_self_bundle_version() != bundle.version()
+        || revision.constitution_version() != bundle.state().constitution_version()
+        || bundle.state().identity_state_version() != identity.version()
+        || revision.state().version() != expected_next
+        || revision.state().predecessor_version() != Some(identity.version())
+    {
+        return Err(RepositoryError::new(
+            "identity revision does not continue the current identity and Self Bundle",
+        ));
+    }
+    Ok(())
+}
+
+fn identity_version_from_commit(revision: &IdentityRevisionCommit) -> IdentityStateVersion {
+    let state = revision.state();
+    IdentityStateVersion::restore(
+        state.version(),
+        state.predecessor_version(),
+        IdentityProfile::new(
+            state.profile().name(),
+            state.profile().expression_traits(),
+            state.profile().viewpoints(),
+            state.profile().value_priorities(),
+            state.profile().relationship_posture(),
+            state.profile().own_goals(),
+        ),
+        state.change_reason(),
+        state.evidence_refs().to_vec(),
+        state.formed_at(),
+    )
+}
+
+fn recheck_identity_revision_versions(
+    transaction: &rusqlite::Transaction<'_>,
+    revision: &IdentityRevisionCommit,
+) -> Result<(), RepositoryError> {
+    let current_identity = transaction
+        .query_row(
+            "SELECT MAX(version) FROM identity_state_versions",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(repository_error)?
+        .and_then(|value| u64::try_from(value).ok());
+    let current_bundle = transaction
+        .query_row(
+            "SELECT version, constitution_version, identity_state_version
+             FROM self_bundle_versions ORDER BY version DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(repository_error)?;
+    let expected_bundle = current_bundle
+        .map(|(bundle, constitution, identity)| {
+            Ok((
+                u64::try_from(bundle).map_err(repository_error)?,
+                u64::try_from(constitution).map_err(repository_error)?,
+                u64::try_from(identity).map_err(repository_error)?,
+            ))
+        })
+        .transpose()?;
+    if current_identity != Some(revision.expected_identity_version())
+        || expected_bundle
+            != Some((
+                revision.expected_self_bundle_version(),
+                revision.constitution_version(),
+                revision.expected_identity_version(),
+            ))
+    {
+        return Err(RepositoryError::new(
+            "identity or Self Bundle changed before revision commit",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_self_bundle(
+    transaction: &rusqlite::Transaction<'_>,
+    bundle: &SelfBundleVersion,
+) -> Result<(), RepositoryError> {
+    let (wake_trigger, wake_exit) = encode_wake_commit(bundle.wake_commit())?;
+    let version = to_sql_id(bundle.version())?;
+    let state = bundle.state();
+    transaction
+        .execute(
+            "INSERT INTO self_bundle_versions
+             (version, predecessor_version, constitution_version, identity_state_version,
+              relationship_state, wake_trigger, wake_exit, committed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                version,
+                bundle.predecessor_version().map(to_sql_id).transpose()?,
+                to_sql_id(state.constitution_version())?,
+                to_sql_id(state.identity_state_version())?,
+                state.relationship_state(),
+                wake_trigger,
+                wake_exit,
+                bundle.committed_at().as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    insert_self_bundle_children(transaction, version, state)
 }
 
 fn validate_self_bundle_chain(

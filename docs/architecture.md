@@ -720,6 +720,8 @@ ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
 
 S05 已实现上述目标流的有界持久化外壳：成功路径依次经过 `SLEEPING -> LOAD_SELF -> OBSERVE -> THINK -> RESPOND -> WRITE_AGENT_MEMORY -> SLEEPING`；`OBSERVE`、`THINK` 或 `RESPOND` 失败时停止后续工作，但仍以对应 `WakeExit` 追加最后一个已验证的完整状态，再进入休眠。工作步骤返回的是完整候选状态而非数据库操作；Core 拒绝候选自行改变宪法版本或跳到非当前身份版本。只有 Self Bundle 事务提交成功才记录最终 `SLEEPING`；加载或提交失败保持旧版本并向调用方报错。
 
+S25 已实现结构化身份修订：每轮对话从 Vault 同时加载当前身份、宪法版本和 Self Bundle 版本交给运行时；Core 只接受第二自我针对当前前驱提交的单个修订，并校验使命、身份隔离、非空变化、理由和逐字证据。通过后 Vault 在同一事务中追加身份版本并推进 Self Bundle；任一步失败都保留旧的两条版本链。模型切换继续从该本地链加载，桌面仅通过 `list_identity_history` 查看固定只读投影。
+
 S06 已把会话推理入口接入统一模型运行时边界：
 
 ```text
@@ -1179,7 +1181,7 @@ IdentityFormation::form_initial_identity()
   -> append IdentityStateVersion(version=1, predecessor=None)
 ```
 
-本人只能提交自述，不能调用身份写入路径把自述变成角色卡；放弃反思使命、冒充本人或引用自述范围外证据的结构化提议均被 Core 拒绝。身份与来源随 SQLCipher schema v2 重启后恢复，首版一旦存在便拒绝再次形成。后续身份修订留给 S25；S05 从该首版身份建立 Self Bundle。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) 和 [ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)。
+本人只能提交自述，不能调用身份写入路径把自述变成角色卡；放弃反思使命、冒充本人或引用自述范围外证据的结构化提议均被 Core 拒绝。身份与来源随 SQLCipher schema v2 重启后恢复，首版一旦存在便拒绝再次形成。S25 从该首版身份继续追加不可改写版本；S05 从首版身份建立 Self Bundle。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) 和 [ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)。
 
 ### 9.5 S05 当前实现边界
 
@@ -1207,7 +1209,7 @@ PresenceCoordinator::wake(trigger)
   -> only after commit: SLEEPING
 ```
 
-Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用、信念引用、关系状态和未完成意图；每次唤醒提交同时保存触发类型与完成/中断阶段。`WakeWork` 不获得 repository，不能越过 Core 直接写入；真实模型网关、触发调度与身份修订分别留给 S06、S26 和 S25。SQLCipher 故障注入在父行和部分子项已执行后触发外键失败，证明整个 v3 事务回滚且重启只恢复旧版本。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)。
+Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用、信念引用、关系状态和未完成意图；每次唤醒提交同时保存触发类型与完成/中断阶段。`WakeWork` 不获得 repository，不能越过 Core 直接写入；真实模型网关由 S06 接入，S25 已把身份修订与 Self Bundle 原子推进接入同一本地版本链，触发调度留给 S26。SQLCipher 故障注入在父行和部分子项已执行后触发外键失败，证明整个 v3 事务回滚且重启只恢复旧版本。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)。
 
 ### 9.6 S06 当前实现边界
 
@@ -1802,3 +1804,35 @@ person path:
 ```
 
 S24 不复用约定取代、关系约束偏离或遗忘语义。退出只从 `effective_at` 起停止原约定未来投影；原签署、履行、违约与退出历史继续可追溯。本人理由为空时保存为无理由退出，第二自我理由为空、缺字段、不在响应中逐字出现或目标不活动时均不得退出。
+
+### 9.25 S25 身份自主演化与不可改写版本当前实现边界
+
+```text
+crates/core/src/
+  domain.rs / ports.rs / memory_loop.rs   # 修订提议、拒绝原因、当前前驱与使命门禁
+  in_memory.rs                            # 确定性身份链与模型切换测试适配器
+crates/identity/src/
+  ports.rs / service.rs / in_memory.rs    # 完整不可改写身份历史读取
+crates/vault/src/repository.rs            # 身份与 Self Bundle 单事务追加及重启恢复
+crates/runtime-gateway/src/
+  adapter.rs / transport.rs               # 当前身份最小出口与严格修订白名单
+apps/desktop/src-tauri/src/
+  lib.rs / state.rs                       # `list_identity_history` 固定只读投影
+apps/desktop/src/App.tsx                  # 仅查看/关闭的身份版本历史
+```
+
+```text
+Vault current IdentityStateVersion + SelfBundleVersion
+  -> RuntimeRequest carries current identity, constitution and bundle versions
+  -> propose_identity_revision(current predecessor, partial six-field changes,
+                               reason, exact evidence)
+  -> Core requires counterpart authorship + current predecessor
+                  + unchanged constitution + preserved ReflectivePurpose
+                  + distinct counterpart + real non-empty change
+  -> Vault transaction appends IdentityStateVersion(N+1)
+                       + SelfBundleVersion(M+1 -> identity N+1)
+  -> restart or model switch loads the same local immutable chains
+  -> desktop list_identity_history exposes versions and evidence IDs read-only
+```
+
+S25 复用 schema v2 的身份版本表和 schema v3 的 Self Bundle 版本表，不引入新迁移；已有外键用于故障注入时证明两条链原子回滚。本人没有身份写入 command 或编辑控件，只能通过进入冻结工作上下文的对话证据影响第二自我。一次响应最多接受一个修订；旧前驱、宪法版本变化、放弃反思使命、冒充本人、空变化、无理由或无可信证据均保持零身份写入。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0002](adr/0002-portable-local-self-bundle.md) 与 [ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)。

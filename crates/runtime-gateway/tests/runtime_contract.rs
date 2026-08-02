@@ -9,11 +9,13 @@ use std::{
 use eam_core::{
     ActiveRelationalConstraint, ApplicableTime, Claim, ClaimId, ClaimOwner, CoreError,
     DecisionImpact, DisputeState, EvidenceCitation, EvidenceId, FrozenEvidenceBlock,
-    FrozenMemoryDispute, FrozenRetrievalWindow, InMemoryRepository, IncrementingClock, MemoryCore,
-    MemoryRepository, PersonTurnClassification, RetrievalSnapshot, RetrievedContextItem,
-    RuntimeErrorKind, SessionId, SharedAgreementCandidateStatus, SharedAgreementDecision,
-    SharedAgreementRevision, SharedExperienceKind, SharedExperienceRepository, SourceCurrentness,
-    StructuredOperationRejectionReason, Timestamp, Uncertainty, WorkingContext,
+    FrozenMemoryDispute, FrozenRetrievalWindow, IdentityEvolutionRepository,
+    IdentityProfileSnapshot, IdentityRuntimeContext, IdentityStateSnapshot, InMemoryRepository,
+    IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification, RetrievalSnapshot,
+    RetrievedContextItem, RuntimeErrorKind, SessionId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementRevision, SharedExperienceKind,
+    SharedExperienceRepository, SourceCurrentness, StructuredOperationRejectionReason, Timestamp,
+    Uncertainty, WorkingContext,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL,
@@ -40,6 +42,7 @@ const AGREEMENT_WITHDRAWAL_RESPONSE: &str =
     include_str!("fixtures/agreement-withdrawal-response.json");
 const AGREEMENT_WITHDRAWAL_MISSING_REASON_RESPONSE: &str =
     include_str!("fixtures/agreement-withdrawal-missing-reason-response.json");
+const IDENTITY_REVISION_RESPONSE: &str = include_str!("fixtures/identity-revision-response.json");
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -333,6 +336,64 @@ fn response_payload_contains_only_prompt_and_core_selected_evidence() {
             .map(|id| id.get())
             .collect::<Vec<_>>(),
         [3, 1]
+    );
+}
+
+#[test]
+fn runtime_receives_the_current_self_bundle_identity_and_emits_a_strict_revision() {
+    let identity = IdentityStateSnapshot::restore(
+        1,
+        None,
+        IdentityProfileSnapshot::new(
+            "岚",
+            "温和、克制",
+            "保留分歧",
+            "准确高于迎合",
+            "同行者",
+            "帮助本人看见长期变化",
+        ),
+        "基于初始自我介绍形成",
+        Vec::new(),
+        Timestamp::from_millis(10),
+    );
+    let repository = InMemoryRepository::new()
+        .with_identity_context(IdentityRuntimeContext::new(7, 1, identity))
+        .unwrap();
+    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(IDENTITY_REVISION_RESPONSE)]);
+    let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(2_500));
+    let context = core.freeze_working_context(&[]).unwrap();
+    let outcome = core
+        .run_counterpart_turn(
+            SessionId::new("identity-runtime"),
+            "最近我更需要直白但不武断的提醒。",
+            context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome
+            .accepted_identity_revision()
+            .unwrap()
+            .identity_version(),
+        2
+    );
+    assert_eq!(core.repository().identity_history().unwrap().len(), 2);
+    let disclosure = core.runtime().disclosures().last().unwrap();
+    assert!(
+        disclosure
+            .retrieved_sources()
+            .contains(&OutboundContextSource::IdentityState { version: 1 })
+    );
+    let request: Value = serde_json::from_str(disclosure.request_json()).unwrap();
+    let input: Value = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
+    assert_eq!(input["identity"]["constitution_version"], 7);
+    assert_eq!(input["identity"]["self_bundle_version"], 1);
+    assert_eq!(input["identity"]["state"]["version"], 1);
+    assert_eq!(input["identity"]["state"]["name"], "岚");
+    assert!(
+        request["text"]["format"]["schema"]
+            .to_string()
+            .contains("propose_identity_revision")
     );
 }
 

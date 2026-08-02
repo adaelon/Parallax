@@ -46,6 +46,13 @@ pub trait IdentityRepository {
     /// Returns an adapter error when identity state or its evidence references
     /// cannot be decoded.
     fn current_identity_state(&self) -> Result<Option<IdentityStateVersion>, RepositoryError>;
+
+    /// Loads the complete immutable identity chain in ascending version order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when any persisted version or evidence link is invalid.
+    fn all_identity_states(&self) -> Result<Vec<IdentityStateVersion>, RepositoryError>;
 }
 
 pub trait IdentityRuntime {

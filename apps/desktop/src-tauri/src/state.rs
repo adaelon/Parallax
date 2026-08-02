@@ -7,10 +7,10 @@ use std::{
 
 use eam_core::{
     AgreementWithdrawalActor, ClaimId, Clock, ConversationEvidence, CounterpartRuntime,
-    EvidenceCitation, EvidenceId, MemoryCore, MemoryRepository, SessionId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
-    SharedAgreementRevision, SharedExperienceKind, SharedExperienceRepository, Speaker,
-    SystemClock, WorkingContext, agreement_is_active_at,
+    EvidenceCitation, EvidenceId, IdentityEvolutionRepository, IdentityStateSnapshot, MemoryCore,
+    MemoryRepository, SessionId, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    SharedAgreementResolution, SharedAgreementRevision, SharedExperienceKind,
+    SharedExperienceRepository, Speaker, SystemClock, WorkingContext, agreement_is_active_at,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_ingestion::{
@@ -120,6 +120,22 @@ pub struct ActiveSharedAgreementView {
     scope: String,
     effective_from_millis: i64,
     effective_until_millis: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityStateView {
+    version: u64,
+    predecessor_version: Option<u64>,
+    name: String,
+    expression_traits: String,
+    viewpoints: String,
+    value_priorities: String,
+    relationship_posture: String,
+    own_goals: String,
+    change_reason: String,
+    evidence_ids: Vec<u64>,
+    formed_at_millis: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -276,6 +292,15 @@ impl ManagedHost {
                 let at = host.host_clock.now();
                 list_active_shared_agreements_from_core(&host.core, at)
             }
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn list_identity_history(&self) -> Result<Vec<IdentityStateView>, String> {
+        match &*self.lock() {
+            HostSlot::Ready(host) => list_identity_history_from_core(&host.core),
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -508,13 +533,45 @@ where
         })
 }
 
+fn list_identity_history_from_core<R, T, C>(
+    core: &MemoryCore<R, T, C>,
+) -> Result<Vec<IdentityStateView>, String>
+where
+    R: IdentityEvolutionRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    core.repository()
+        .identity_history()
+        .map_err(|error| error.to_string())
+        .map(|history| history.iter().map(IdentityStateView::from).collect())
+}
+
+impl From<&IdentityStateSnapshot> for IdentityStateView {
+    fn from(value: &IdentityStateSnapshot) -> Self {
+        Self {
+            version: value.version(),
+            predecessor_version: value.predecessor_version(),
+            name: value.profile().name().to_owned(),
+            expression_traits: value.profile().expression_traits().to_owned(),
+            viewpoints: value.profile().viewpoints().to_owned(),
+            value_priorities: value.profile().value_priorities().to_owned(),
+            relationship_posture: value.profile().relationship_posture().to_owned(),
+            own_goals: value.profile().own_goals().to_owned(),
+            change_reason: value.change_reason().to_owned(),
+            evidence_ids: value.evidence_refs().iter().map(|id| id.get()).collect(),
+            formed_at_millis: value.formed_at().as_millis(),
+        }
+    }
+}
+
 #[cfg(test)]
 fn send_message_with_core<R, T, C>(
     core: &mut MemoryCore<R, T, C>,
     verbatim: String,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: SharedExperienceRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -547,7 +604,7 @@ fn send_message_with_retrieval<R, T, C>(
     verbatim: String,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: SharedExperienceRepository + RetrievalRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository + RetrievalRepository,
     <R as RetrievalRepository>::Error: std::fmt::Display,
     T: CounterpartRuntime,
     C: Clock,
@@ -610,7 +667,7 @@ fn run_message_with_context<R, T, C>(
     working_context: WorkingContext,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: SharedExperienceRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -758,7 +815,7 @@ fn withdraw_shared_agreement_as_person_from_core<R, T, C>(
     reason: Option<String>,
 ) -> Result<Option<u64>, String>
 where
-    R: SharedExperienceRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -848,7 +905,7 @@ fn resolve_shared_agreement_from_core<R, T, C>(
     confirm: bool,
 ) -> Result<SharedAgreementResolutionView, String>
 where
-    R: SharedExperienceRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -877,7 +934,7 @@ fn revise_shared_agreement_from_core<R, T, C>(
     supersedes_agreement_ids: Vec<u64>,
 ) -> Result<SharedAgreementRevisionView, String>
 where
-    R: SharedExperienceRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -917,7 +974,7 @@ fn dismiss_shared_experience_ceremony_from_core<R, T, C>(
     claim_id: u64,
 ) -> Result<(), String>
 where
-    R: SharedExperienceRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -1143,7 +1200,8 @@ mod tests {
     };
 
     use eam_core::{
-        ClaimOwner, InMemoryRepository, IncrementingClock, PersonTurnClassification,
+        ClaimOwner, IdentityProfileSnapshot, IdentityRuntimeContext, IdentityStateSnapshot,
+        InMemoryRepository, IncrementingClock, PersonTurnClassification,
         RelationalConstraintDeparture, RuntimeResponse, ScriptedRuntime, SharedAgreementAssent,
         SharedExperienceProposal, Timestamp,
     };
@@ -1182,6 +1240,41 @@ mod tests {
     #[test]
     fn shutdown_success_requires_all_stages() {
         assert_eq!(collect_shutdown_errors(Ok(()), Ok(()), Ok(())), Ok(()));
+    }
+
+    #[test]
+    fn identity_history_is_a_fixed_trusted_read_only_projection() {
+        let state = IdentityStateSnapshot::restore(
+            1,
+            None,
+            IdentityProfileSnapshot::new(
+                "岚",
+                "温和、直接",
+                "保留分歧",
+                "准确高于迎合",
+                "同行者",
+                "帮助本人看见长期变化",
+            ),
+            "基于初始自述形成",
+            vec![EvidenceId::from_raw(7)],
+            Timestamp::from_millis(9_000),
+        );
+        let repository = InMemoryRepository::new()
+            .with_identity_context(IdentityRuntimeContext::new(1, 1, state))
+            .unwrap();
+        let core = MemoryCore::new(
+            repository,
+            ScriptedRuntime::default(),
+            IncrementingClock::new(10_000),
+        );
+
+        let history = list_identity_history_from_core(&core).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, 1);
+        assert_eq!(history[0].predecessor_version, None);
+        assert_eq!(history[0].name, "岚");
+        assert_eq!(history[0].change_reason, "基于初始自述形成");
+        assert_eq!(history[0].evidence_ids, [7]);
     }
 
     #[test]
