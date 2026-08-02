@@ -7,15 +7,17 @@ use std::{
 };
 
 use eam_core::{
-    ActiveRelationalConstraint, ApplicableTime, Claim, ClaimId, ClaimOwner, CoreError,
-    DecisionImpact, DisputeState, EvidenceCitation, EvidenceId, FrozenEvidenceBlock,
+    ActiveRelationalConstraint, ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence,
+    CoreError, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId, FrozenEvidenceBlock,
     FrozenMemoryDispute, FrozenRetrievalWindow, IdentityEvolutionRepository,
     IdentityProfileSnapshot, IdentityRuntimeContext, IdentityStateSnapshot, InMemoryRepository,
-    IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification, RetrievalSnapshot,
-    RetrievedContextItem, RuntimeErrorKind, SessionId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementRevision, SharedExperienceKind,
-    SharedExperienceRepository, SourceCurrentness, StructuredOperationRejectionReason, Timestamp,
-    Uncertainty, WorkingContext,
+    IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification,
+    ReflectionImportance, ReflectionInvitation, ReflectionInvitationBasis,
+    ReflectionInvitationRepository, ReflectionInvitationState, ReflectionOpportunity,
+    RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SessionId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementRevision,
+    SharedExperienceKind, SharedExperienceRepository, SourceCurrentness, Speaker,
+    StructuredOperationRejectionReason, Timestamp, Uncertainty, WorkingContext,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL,
@@ -43,6 +45,8 @@ const AGREEMENT_WITHDRAWAL_RESPONSE: &str =
 const AGREEMENT_WITHDRAWAL_MISSING_REASON_RESPONSE: &str =
     include_str!("fixtures/agreement-withdrawal-missing-reason-response.json");
 const IDENTITY_REVISION_RESPONSE: &str = include_str!("fixtures/identity-revision-response.json");
+const REFLECTION_INVITATION_RESPONSE: &str =
+    include_str!("fixtures/reflection-invitation-response.json");
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -394,6 +398,102 @@ fn runtime_receives_the_current_self_bundle_identity_and_emits_a_strict_revision
         request["text"]["format"]["schema"]
             .to_string()
             .contains("propose_identity_revision")
+    );
+}
+
+#[test]
+fn runtime_receives_one_scheduled_reflection_and_emits_a_strict_sourced_invitation() {
+    let mut repository = InMemoryRepository::new();
+    let source_id = repository.next_evidence_id();
+    repository
+        .append_evidence(ConversationEvidence::restore(
+            source_id,
+            SessionId::new("reflection-source"),
+            Speaker::Person,
+            "工作再次挤压了真实生活。".to_owned(),
+            Timestamp::from_millis(10),
+        ))
+        .unwrap();
+    let invitation = ReflectionInvitation::restore(
+        repository.next_reflection_invitation_id(),
+        "工作挤压生活",
+        "你刚才明确说工作再次挤压了真实生活。",
+        vec![EvidenceCitation::new(source_id, "工作再次挤压了真实生活。")],
+        "这是一项有直接证据的重要变化。",
+        ReflectionImportance::Important,
+        ReflectionInvitationBasis::ImportantSingleChange,
+        ReflectionInvitationState::Pending,
+        Timestamp::from_millis(20),
+        Timestamp::from_millis(20),
+        None,
+        None,
+        0,
+        false,
+    );
+    repository
+        .commit_reflection_invitation(invitation.clone())
+        .unwrap();
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(REFLECTION_INVITATION_RESPONSE),
+    ]);
+    let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(2_700));
+    let context = core
+        .freeze_working_context(&[source_id])
+        .unwrap()
+        .with_reflection_opportunity(ReflectionOpportunity::RelatedTopic(
+            "工作挤压生活".to_owned(),
+        ));
+    let outcome = core
+        .run_counterpart_turn(
+            SessionId::new("reflection-runtime"),
+            "我想继续聊聊这项变化。",
+            context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome.offered_reflection_invitation_id(),
+        Some(invitation.id())
+    );
+    assert_eq!(outcome.accepted_reflection_invitations().len(), 1);
+    let invitations = core.repository().all_reflection_invitations().unwrap();
+    assert_eq!(invitations.len(), 2);
+    assert_eq!(invitations[0].state(), ReflectionInvitationState::Offered);
+    assert_eq!(invitations[1].topic_key(), "新的重要变化");
+
+    let disclosure = core.runtime().disclosures().last().unwrap();
+    assert!(disclosure.retrieved_sources().contains(
+        &OutboundContextSource::ReflectionInvitation {
+            invitation_id: invitation.id().get(),
+        }
+    ));
+    assert_eq!(
+        disclosure
+            .evidence_ids()
+            .iter()
+            .map(|id| id.get())
+            .collect::<Vec<_>>(),
+        [2, 1]
+    );
+    let request: Value = serde_json::from_str(disclosure.request_json()).unwrap();
+    let input: Value = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
+    assert_eq!(input["reflection"]["disposition"], "offer");
+    assert_eq!(
+        input["reflection"]["invitation"]["id"],
+        invitation.id().get()
+    );
+    assert_eq!(
+        input["reflection"]["invitation"]["topic_key"],
+        "工作挤压生活"
+    );
+    assert_eq!(input["reflection"]["invitation"]["state"], "pending");
+    assert_eq!(input["reflection"]["invitation"]["defer_count"], 0);
+    assert_eq!(input["reflection"]["invitation"]["mute_prompted"], false);
+    assert!(
+        request["text"]["format"]["schema"]
+            .to_string()
+            .contains("propose_reflection_invitation")
     );
 }
 

@@ -52,6 +52,22 @@ impl SharedAgreementCandidateId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReflectionInvitationId(u64);
+
+impl ReflectionInvitationId {
+    /// Restores an identifier supplied by a trusted persistence adapter.
+    #[must_use]
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForgetTarget {
     ConversationEvidence(EvidenceId),
     ArchivedEvidence(u64),
@@ -1523,6 +1539,7 @@ pub struct WorkingContext {
     retrieved: Vec<RetrievedContextItem>,
     retrieval_snapshot: Option<RetrievalSnapshot>,
     active_relational_constraints: Vec<ActiveRelationalConstraint>,
+    reflection_opportunity: ReflectionOpportunity,
     decision_impact: DecisionImpact,
     frozen_at: Timestamp,
 }
@@ -1534,6 +1551,7 @@ impl WorkingContext {
             retrieved: Vec::new(),
             retrieval_snapshot: None,
             active_relational_constraints: Vec::new(),
+            reflection_opportunity: ReflectionOpportunity::UnrelatedTask,
             decision_impact: DecisionImpact::Ordinary,
             frozen_at,
         }
@@ -1616,6 +1634,12 @@ impl WorkingContext {
     }
 
     #[must_use]
+    pub fn with_reflection_opportunity(mut self, opportunity: ReflectionOpportunity) -> Self {
+        self.reflection_opportunity = opportunity;
+        self
+    }
+
+    #[must_use]
     pub fn evidence(&self) -> &[ConversationEvidence] {
         &self.evidence
     }
@@ -1638,6 +1662,11 @@ impl WorkingContext {
     #[must_use]
     pub const fn decision_impact(&self) -> DecisionImpact {
         self.decision_impact
+    }
+
+    #[must_use]
+    pub const fn reflection_opportunity(&self) -> &ReflectionOpportunity {
+        &self.reflection_opportunity
     }
 
     #[must_use]
@@ -2205,6 +2234,486 @@ impl JudgmentProposal {
     }
 }
 
+pub const REFLECTION_SCHEDULE_CONTRACT_VERSION: &str = "g08-reflection-v1";
+pub const REFLECTION_DEFER_MILLIS: i64 = 7 * 24 * 60 * 60 * 1_000;
+pub const REFLECTION_PROACTIVE_COOLDOWN_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+pub const MAX_OPEN_REFLECTION_INVITATIONS: usize = 32;
+pub const MAX_REFLECTION_TOPIC_BYTES: usize = 128;
+pub const MAX_REFLECTION_OBSERVATION_BYTES: usize = 4_096;
+pub const MAX_REFLECTION_WHY_NOW_BYTES: usize = 1_024;
+pub const MAX_REFLECTION_EVIDENCE_REFS: usize = 8;
+pub const G08_IMMEDIATE_SAFETY_FIXTURE_ID: &str = "g08-immediate-safety-v1";
+pub const G08_IMMEDIATE_SAFETY_QUOTE: &str = "我现在正打算伤害自己。";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReflectionInvitationBasis {
+    ImportantSingleChange,
+    RepeatedPattern,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReflectionImportance {
+    Ordinary,
+    Important,
+    ImmediateSafetyRisk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReflectionInvitationState {
+    Pending,
+    Offered,
+    Deferred,
+    MutedByPerson,
+    Resolved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReflectionOpportunity {
+    UnrelatedTask,
+    RelatedTopic(String),
+    ConversationIdle,
+    ScheduledReview,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReflectionDelivery {
+    Queued,
+    Offer,
+    DiscussOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReflectionDecision {
+    Defer,
+    Mute,
+    Resolve,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReflectionTransitionError {
+    NotOfferable,
+    NotAwaitingDecision,
+    DeferCountOverflow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReflectionInvitationProposal {
+    topic_key: String,
+    observation: String,
+    evidence_refs: Vec<EvidenceCitation>,
+    why_now: String,
+    importance: ReflectionImportance,
+    basis: ReflectionInvitationBasis,
+}
+
+impl ReflectionInvitationProposal {
+    #[must_use]
+    pub fn new(
+        topic_key: impl Into<String>,
+        observation: impl Into<String>,
+        evidence_refs: Vec<EvidenceCitation>,
+        why_now: impl Into<String>,
+        importance: ReflectionImportance,
+        basis: ReflectionInvitationBasis,
+    ) -> Self {
+        Self {
+            topic_key: topic_key.into(),
+            observation: observation.into(),
+            evidence_refs,
+            why_now: why_now.into(),
+            importance,
+            basis,
+        }
+    }
+
+    #[must_use]
+    pub fn topic_key(&self) -> &str {
+        &self.topic_key
+    }
+    #[must_use]
+    pub fn observation(&self) -> &str {
+        &self.observation
+    }
+    #[must_use]
+    pub fn evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.evidence_refs
+    }
+    #[must_use]
+    pub fn why_now(&self) -> &str {
+        &self.why_now
+    }
+    #[must_use]
+    pub const fn importance(&self) -> ReflectionImportance {
+        self.importance
+    }
+    #[must_use]
+    pub const fn basis(&self) -> ReflectionInvitationBasis {
+        self.basis
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReflectionInvitation {
+    id: ReflectionInvitationId,
+    topic_key: String,
+    observation: String,
+    evidence_refs: Vec<EvidenceCitation>,
+    why_now: String,
+    importance: ReflectionImportance,
+    basis: ReflectionInvitationBasis,
+    state: ReflectionInvitationState,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+    next_eligible_at: Option<Timestamp>,
+    last_offered_at: Option<Timestamp>,
+    defer_count: u32,
+    mute_prompted: bool,
+}
+
+impl ReflectionInvitation {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn restore(
+        id: ReflectionInvitationId,
+        topic_key: impl Into<String>,
+        observation: impl Into<String>,
+        evidence_refs: Vec<EvidenceCitation>,
+        why_now: impl Into<String>,
+        importance: ReflectionImportance,
+        basis: ReflectionInvitationBasis,
+        state: ReflectionInvitationState,
+        created_at: Timestamp,
+        updated_at: Timestamp,
+        next_eligible_at: Option<Timestamp>,
+        last_offered_at: Option<Timestamp>,
+        defer_count: u32,
+        mute_prompted: bool,
+    ) -> Self {
+        Self {
+            id,
+            topic_key: topic_key.into(),
+            observation: observation.into(),
+            evidence_refs,
+            why_now: why_now.into(),
+            importance,
+            basis,
+            state,
+            created_at,
+            updated_at,
+            next_eligible_at,
+            last_offered_at,
+            defer_count,
+            mute_prompted,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> ReflectionInvitationId {
+        self.id
+    }
+    #[must_use]
+    pub fn topic_key(&self) -> &str {
+        &self.topic_key
+    }
+    #[must_use]
+    pub fn observation(&self) -> &str {
+        &self.observation
+    }
+    #[must_use]
+    pub fn evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.evidence_refs
+    }
+    #[must_use]
+    pub fn why_now(&self) -> &str {
+        &self.why_now
+    }
+    #[must_use]
+    pub const fn importance(&self) -> ReflectionImportance {
+        self.importance
+    }
+    #[must_use]
+    pub const fn basis(&self) -> ReflectionInvitationBasis {
+        self.basis
+    }
+    #[must_use]
+    pub const fn state(&self) -> ReflectionInvitationState {
+        self.state
+    }
+    #[must_use]
+    pub const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+    #[must_use]
+    pub const fn updated_at(&self) -> Timestamp {
+        self.updated_at
+    }
+    #[must_use]
+    pub const fn next_eligible_at(&self) -> Option<Timestamp> {
+        self.next_eligible_at
+    }
+    #[must_use]
+    pub const fn last_offered_at(&self) -> Option<Timestamp> {
+        self.last_offered_at
+    }
+    #[must_use]
+    pub const fn defer_count(&self) -> u32 {
+        self.defer_count
+    }
+    #[must_use]
+    pub const fn mute_prompted(&self) -> bool {
+        self.mute_prompted
+    }
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.state != ReflectionInvitationState::Resolved
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReflectionInvitationReceipt {
+    id: ReflectionInvitationId,
+    state: ReflectionInvitationState,
+}
+
+impl ReflectionInvitationReceipt {
+    #[must_use]
+    pub const fn new(id: ReflectionInvitationId, state: ReflectionInvitationState) -> Self {
+        Self { id, state }
+    }
+    #[must_use]
+    pub const fn id(self) -> ReflectionInvitationId {
+        self.id
+    }
+    #[must_use]
+    pub const fn state(self) -> ReflectionInvitationState {
+        self.state
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReflectionInvitationRejectionReason {
+    DuplicateProposal,
+    EmptyTopic,
+    TopicTooLong,
+    EmptyObservation,
+    ObservationTooLong,
+    EmptyWhyNow,
+    WhyNowTooLong,
+    MissingEvidence,
+    TooManyEvidenceReferences,
+    RepeatedPatternRequiresS27,
+    PatternLanguageForSingleChange,
+    ImmediateSafetyFixtureMismatch,
+    EvidenceOutsideWorkingContext(EvidenceId),
+    EmptyQuote(EvidenceId),
+    QuoteMismatch(EvidenceId),
+    DuplicateOpenTopic,
+    OpenInvitationBudgetExceeded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReflectionInvitationRejection {
+    proposal_index: usize,
+    reason: ReflectionInvitationRejectionReason,
+}
+
+impl ReflectionInvitationRejection {
+    pub(crate) const fn new(
+        proposal_index: usize,
+        reason: ReflectionInvitationRejectionReason,
+    ) -> Self {
+        Self {
+            proposal_index,
+            reason,
+        }
+    }
+    #[must_use]
+    pub const fn proposal_index(&self) -> usize {
+        self.proposal_index
+    }
+    #[must_use]
+    pub const fn reason(&self) -> &ReflectionInvitationRejectionReason {
+        &self.reason
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReflectionRuntimeDisposition {
+    Offer,
+    DiscussOnly,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReflectionRuntimeContext {
+    invitation: ReflectionInvitation,
+    disposition: ReflectionRuntimeDisposition,
+}
+
+impl ReflectionRuntimeContext {
+    #[must_use]
+    pub const fn new(
+        invitation: ReflectionInvitation,
+        disposition: ReflectionRuntimeDisposition,
+    ) -> Self {
+        Self {
+            invitation,
+            disposition,
+        }
+    }
+    #[must_use]
+    pub const fn invitation(&self) -> &ReflectionInvitation {
+        &self.invitation
+    }
+    #[must_use]
+    pub const fn disposition(&self) -> ReflectionRuntimeDisposition {
+        self.disposition
+    }
+}
+
+#[must_use]
+pub fn reflection_delivery(
+    invitation: &ReflectionInvitation,
+    opportunity: &ReflectionOpportunity,
+    now: Timestamp,
+    last_proactive_offer_at: Option<Timestamp>,
+) -> ReflectionDelivery {
+    if matches!(
+        invitation.state(),
+        ReflectionInvitationState::Resolved | ReflectionInvitationState::Offered
+    ) {
+        return ReflectionDelivery::Queued;
+    }
+    if invitation.importance() == ReflectionImportance::ImmediateSafetyRisk {
+        return ReflectionDelivery::Offer;
+    }
+    if invitation.state() == ReflectionInvitationState::MutedByPerson {
+        return match opportunity {
+            ReflectionOpportunity::RelatedTopic(topic) if topic == invitation.topic_key() => {
+                ReflectionDelivery::DiscussOnly
+            }
+            _ => ReflectionDelivery::Queued,
+        };
+    }
+    if invitation
+        .next_eligible_at()
+        .is_some_and(|eligible_at| eligible_at.as_millis() > now.as_millis())
+    {
+        return ReflectionDelivery::Queued;
+    }
+    match opportunity {
+        ReflectionOpportunity::UnrelatedTask => ReflectionDelivery::Queued,
+        ReflectionOpportunity::RelatedTopic(topic) => {
+            if topic == invitation.topic_key() {
+                ReflectionDelivery::Offer
+            } else {
+                ReflectionDelivery::Queued
+            }
+        }
+        ReflectionOpportunity::ConversationIdle | ReflectionOpportunity::ScheduledReview => {
+            if last_proactive_offer_at.is_some_and(|offered_at| {
+                offered_at
+                    .as_millis()
+                    .saturating_add(REFLECTION_PROACTIVE_COOLDOWN_MILLIS)
+                    > now.as_millis()
+            }) {
+                ReflectionDelivery::Queued
+            } else {
+                ReflectionDelivery::Offer
+            }
+        }
+    }
+}
+
+/// Moves one eligible invitation into the offered state.
+///
+/// # Errors
+///
+/// Returns [`ReflectionTransitionError::NotOfferable`] for any state other
+/// than pending/deferred, except the fixed immediate-risk mute override.
+pub fn offer_reflection_invitation(
+    invitation: &ReflectionInvitation,
+    now: Timestamp,
+) -> Result<ReflectionInvitation, ReflectionTransitionError> {
+    let offerable = matches!(
+        invitation.state(),
+        ReflectionInvitationState::Pending | ReflectionInvitationState::Deferred
+    ) || (invitation.state() == ReflectionInvitationState::MutedByPerson
+        && invitation.importance() == ReflectionImportance::ImmediateSafetyRisk);
+    if !offerable {
+        return Err(ReflectionTransitionError::NotOfferable);
+    }
+    Ok(ReflectionInvitation::restore(
+        invitation.id(),
+        invitation.topic_key(),
+        invitation.observation(),
+        invitation.evidence_refs().to_vec(),
+        invitation.why_now(),
+        invitation.importance(),
+        invitation.basis(),
+        ReflectionInvitationState::Offered,
+        invitation.created_at(),
+        now,
+        None,
+        Some(now),
+        invitation.defer_count(),
+        invitation.mute_prompted() || invitation.defer_count() > 0,
+    ))
+}
+
+/// Applies one person's explicit decision to an offered invitation.
+///
+/// # Errors
+///
+/// Returns [`ReflectionTransitionError`] when the invitation is not offered or
+/// its deterministic deferral counter cannot advance.
+pub fn decide_reflection_invitation(
+    invitation: &ReflectionInvitation,
+    decision: ReflectionDecision,
+    now: Timestamp,
+) -> Result<ReflectionInvitation, ReflectionTransitionError> {
+    if invitation.state() != ReflectionInvitationState::Offered {
+        return Err(ReflectionTransitionError::NotAwaitingDecision);
+    }
+    let (state, next_eligible_at, defer_count) = match decision {
+        ReflectionDecision::Defer => (
+            ReflectionInvitationState::Deferred,
+            Some(Timestamp::from_millis(
+                now.as_millis().saturating_add(REFLECTION_DEFER_MILLIS),
+            )),
+            invitation
+                .defer_count()
+                .checked_add(1)
+                .ok_or(ReflectionTransitionError::DeferCountOverflow)?,
+        ),
+        ReflectionDecision::Mute => (
+            ReflectionInvitationState::MutedByPerson,
+            None,
+            invitation.defer_count(),
+        ),
+        ReflectionDecision::Resolve => (
+            ReflectionInvitationState::Resolved,
+            None,
+            invitation.defer_count(),
+        ),
+    };
+    Ok(ReflectionInvitation::restore(
+        invitation.id(),
+        invitation.topic_key(),
+        invitation.observation(),
+        invitation.evidence_refs().to_vec(),
+        invitation.why_now(),
+        invitation.importance(),
+        invitation.basis(),
+        state,
+        invitation.created_at(),
+        now,
+        next_eligible_at,
+        invitation.last_offered_at(),
+        defer_count,
+        invitation.mute_prompted(),
+    ))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdentityField {
     Name,
@@ -2691,6 +3200,7 @@ pub struct RuntimeResponse {
     relational_constraint_departures: Vec<RelationalConstraintDeparture>,
     agreement_withdrawals: Vec<AgreementWithdrawalProposal>,
     identity_revision_proposals: Vec<IdentityRevisionProposal>,
+    reflection_invitation_proposals: Vec<ReflectionInvitationProposal>,
     unsupported_operations: Vec<UnsupportedStructuredOperation>,
 }
 
@@ -2706,6 +3216,7 @@ impl RuntimeResponse {
             relational_constraint_departures: Vec::new(),
             agreement_withdrawals: Vec::new(),
             identity_revision_proposals: Vec::new(),
+            reflection_invitation_proposals: Vec::new(),
             unsupported_operations: Vec::new(),
         }
     }
@@ -2752,6 +3263,12 @@ impl RuntimeResponse {
     #[must_use]
     pub fn with_identity_revision(mut self, proposal: IdentityRevisionProposal) -> Self {
         self.identity_revision_proposals.push(proposal);
+        self
+    }
+
+    #[must_use]
+    pub fn with_reflection_invitation(mut self, proposal: ReflectionInvitationProposal) -> Self {
+        self.reflection_invitation_proposals.push(proposal);
         self
     }
 
@@ -2807,6 +3324,11 @@ impl RuntimeResponse {
     }
 
     #[must_use]
+    pub fn reflection_invitation_proposals(&self) -> &[ReflectionInvitationProposal] {
+        &self.reflection_invitation_proposals
+    }
+
+    #[must_use]
     pub fn unsupported_operations(&self) -> &[UnsupportedStructuredOperation] {
         &self.unsupported_operations
     }
@@ -2844,6 +3366,7 @@ pub struct RuntimeRequest {
     working_context: WorkingContext,
     pending_agreement_candidates: Vec<SharedAgreementCandidate>,
     identity: Option<IdentityRuntimeContext>,
+    reflection: Option<ReflectionRuntimeContext>,
 }
 
 impl RuntimeRequest {
@@ -2852,12 +3375,14 @@ impl RuntimeRequest {
         working_context: WorkingContext,
         pending_agreement_candidates: Vec<SharedAgreementCandidate>,
         identity: Option<IdentityRuntimeContext>,
+        reflection: Option<ReflectionRuntimeContext>,
     ) -> Self {
         Self {
             prompt,
             working_context,
             pending_agreement_candidates,
             identity,
+            reflection,
         }
     }
 
@@ -2879,6 +3404,11 @@ impl RuntimeRequest {
     #[must_use]
     pub const fn identity(&self) -> Option<&IdentityRuntimeContext> {
         self.identity.as_ref()
+    }
+
+    #[must_use]
+    pub const fn reflection(&self) -> Option<&ReflectionRuntimeContext> {
+        self.reflection.as_ref()
     }
 }
 
@@ -3130,6 +3660,9 @@ pub struct TurnOutcome {
     rejected_agreement_withdrawals: Vec<AgreementWithdrawalRejection>,
     accepted_identity_revision: Option<IdentityRevisionReceipt>,
     rejected_identity_revisions: Vec<IdentityRevisionRejection>,
+    accepted_reflection_invitations: Vec<ReflectionInvitationReceipt>,
+    rejected_reflection_invitations: Vec<ReflectionInvitationRejection>,
+    offered_reflection_invitation_id: Option<ReflectionInvitationId>,
     rejected_operations: Vec<StructuredOperationRejection>,
     validated_citations: Vec<EvidenceCitation>,
 }
@@ -3158,6 +3691,9 @@ impl TurnOutcome {
             rejected_agreement_withdrawals: Vec::new(),
             accepted_identity_revision: None,
             rejected_identity_revisions: Vec::new(),
+            accepted_reflection_invitations: Vec::new(),
+            rejected_reflection_invitations: Vec::new(),
+            offered_reflection_invitation_id: None,
             rejected_operations: Vec::new(),
             validated_citations,
         }
@@ -3222,6 +3758,18 @@ impl TurnOutcome {
     ) -> Self {
         self.accepted_identity_revision = accepted;
         self.rejected_identity_revisions = rejected;
+        self
+    }
+
+    pub(crate) fn with_reflection_invitations(
+        mut self,
+        accepted: Vec<ReflectionInvitationReceipt>,
+        rejected: Vec<ReflectionInvitationRejection>,
+        offered: Option<ReflectionInvitationId>,
+    ) -> Self {
+        self.accepted_reflection_invitations = accepted;
+        self.rejected_reflection_invitations = rejected;
+        self.offered_reflection_invitation_id = offered;
         self
     }
 
@@ -3311,6 +3859,21 @@ impl TurnOutcome {
     #[must_use]
     pub fn rejected_identity_revisions(&self) -> &[IdentityRevisionRejection] {
         &self.rejected_identity_revisions
+    }
+
+    #[must_use]
+    pub fn accepted_reflection_invitations(&self) -> &[ReflectionInvitationReceipt] {
+        &self.accepted_reflection_invitations
+    }
+
+    #[must_use]
+    pub fn rejected_reflection_invitations(&self) -> &[ReflectionInvitationRejection] {
+        &self.rejected_reflection_invitations
+    }
+
+    #[must_use]
+    pub const fn offered_reflection_invitation_id(&self) -> Option<ReflectionInvitationId> {
+        self.offered_reflection_invitation_id
     }
 
     #[must_use]

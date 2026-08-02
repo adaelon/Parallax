@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 21;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 22;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1236,6 +1236,47 @@ CREATE INDEX agreement_withdrawal_target
     ON agreement_withdrawals(agreement_claim_id, effective_at);
 ";
 
+const MIGRATION_22: &str = r"
+CREATE TABLE reflection_invitations (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    topic_key TEXT NOT NULL CHECK (length(trim(topic_key)) > 0),
+    observation TEXT NOT NULL CHECK (length(trim(observation)) > 0),
+    why_now TEXT NOT NULL CHECK (length(trim(why_now)) > 0),
+    importance INTEGER NOT NULL CHECK (importance IN (0, 1, 2)),
+    basis INTEGER NOT NULL CHECK (basis IN (0, 1)),
+    state INTEGER NOT NULL CHECK (state IN (0, 1, 2, 3, 4)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+    next_eligible_at INTEGER,
+    last_offered_at INTEGER,
+    defer_count INTEGER NOT NULL DEFAULT 0 CHECK (defer_count >= 0),
+    mute_prompted INTEGER NOT NULL DEFAULT 0 CHECK (mute_prompted IN (0, 1)),
+    CHECK (
+        (state = 0 AND next_eligible_at IS NULL AND last_offered_at IS NULL)
+        OR (state = 1 AND next_eligible_at IS NULL AND last_offered_at IS NOT NULL)
+        OR (state = 2 AND next_eligible_at IS NOT NULL AND last_offered_at IS NOT NULL)
+        OR (state IN (3, 4) AND next_eligible_at IS NULL AND last_offered_at IS NOT NULL)
+    )
+) STRICT;
+
+CREATE TABLE reflection_invitation_evidence (
+    invitation_id INTEGER NOT NULL
+        REFERENCES reflection_invitations(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    evidence_id INTEGER NOT NULL
+        REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    quote TEXT NOT NULL CHECK (length(quote) > 0),
+    PRIMARY KEY (invitation_id, ordinal)
+) STRICT;
+
+CREATE INDEX reflection_invitation_state_due
+    ON reflection_invitations(state, next_eligible_at, created_at);
+CREATE INDEX reflection_invitation_evidence_source
+    ON reflection_invitation_evidence(evidence_id);
+CREATE UNIQUE INDEX one_open_reflection_per_topic
+    ON reflection_invitations(topic_key) WHERE state != 4;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1274,6 +1315,7 @@ where
             19 => transaction.execute_batch(MIGRATION_19)?,
             20 => transaction.execute_batch(MIGRATION_20)?,
             21 => transaction.execute_batch(MIGRATION_21)?,
+            22 => transaction.execute_batch(MIGRATION_22)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;

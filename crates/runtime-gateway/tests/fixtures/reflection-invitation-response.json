@@ -1,0 +1,14 @@
+{
+  "id": "resp_reflection_invitation_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"text\":\"我会先回应你重提的话题，也记下这项新的重要变化。\",\"citations\":[],\"operations\":[{\"type\":\"propose_reflection_invitation\",\"topic_key\":\"新的重要变化\",\"observation\":\"你刚才明确重提了想继续讨论的变化。\",\"evidence_refs\":[{\"evidence_id\":2,\"quote\":\"我想继续聊聊这项变化。\"}],\"why_now\":\"这是本人此刻直接重提并有逐字证据的重要变化。\",\"importance\":\"important\",\"basis\":\"important_single_change\"}]}"
+        }
+      ]
+    }
+  ]
+}

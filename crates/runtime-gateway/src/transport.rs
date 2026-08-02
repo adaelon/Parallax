@@ -136,6 +136,7 @@ pub enum OutboundContextSource {
     LedgerClaim { claim_id: ClaimId },
     MemoryDispute { memory_id: u64, dispute_id: u64 },
     IdentityState { version: u64 },
+    ReflectionInvitation { invitation_id: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

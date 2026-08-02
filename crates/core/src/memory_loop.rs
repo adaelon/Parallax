@@ -5,20 +5,27 @@ use crate::{
     AgreementWithdrawalRejectionReason, ApplicableTime, Claim, ClaimCorrectionReceipt,
     ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, Clock, ConversationEvidence,
     CounterpartRuntime, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository,
-    ForgetRequest, IdentityEvolutionRepository, IdentityField, IdentityPersonRepresentation,
-    IdentityProfileChanges, IdentityProfileSnapshot, IdentityReflectivePurposeStatus,
-    IdentityRevisionAuthorship, IdentityRevisionCommit, IdentityRevisionReceipt,
-    IdentityRevisionRejection, IdentityRevisionRejectionReason, IdentityRuntimeContext,
-    IdentityStateSnapshot, JudgmentProposal, JudgmentRejection, JudgmentRejectionReason,
-    MemoryRepository, PersonTurnClassification, RelationalConstraintDeparture,
-    RelationalConstraintDepartureRejection, RelationalConstraintDepartureRejectionReason,
-    RepositoryError, RuntimeError, RuntimeRequest, SessionId, SharedAgreementAssentRejection,
-    SharedAgreementAssentRejectionReason, SharedAgreementCandidate, SharedAgreementCandidateId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
-    SharedAgreementRevision, SharedExperience, SharedExperienceProposal, SharedExperienceRejection,
-    SharedExperienceRejectionReason, SharedExperienceRepository, Speaker,
-    StructuredOperationRejection, StructuredOperationRejectionReason, TurnOutcome, WorkingContext,
-    agreement_is_active_at,
+    ForgetRequest, G08_IMMEDIATE_SAFETY_QUOTE, IdentityEvolutionRepository, IdentityField,
+    IdentityPersonRepresentation, IdentityProfileChanges, IdentityProfileSnapshot,
+    IdentityReflectivePurposeStatus, IdentityRevisionAuthorship, IdentityRevisionCommit,
+    IdentityRevisionReceipt, IdentityRevisionRejection, IdentityRevisionRejectionReason,
+    IdentityRuntimeContext, IdentityStateSnapshot, JudgmentProposal, JudgmentRejection,
+    JudgmentRejectionReason, MAX_OPEN_REFLECTION_INVITATIONS, MAX_REFLECTION_EVIDENCE_REFS,
+    MAX_REFLECTION_OBSERVATION_BYTES, MAX_REFLECTION_TOPIC_BYTES, MAX_REFLECTION_WHY_NOW_BYTES,
+    MemoryRepository, PersonTurnClassification, ReflectionDecision, ReflectionDelivery,
+    ReflectionImportance, ReflectionInvitation, ReflectionInvitationBasis, ReflectionInvitationId,
+    ReflectionInvitationProposal, ReflectionInvitationReceipt, ReflectionInvitationRejection,
+    ReflectionInvitationRejectionReason, ReflectionInvitationRepository, ReflectionInvitationState,
+    ReflectionRuntimeContext, ReflectionRuntimeDisposition, ReflectionTransitionError,
+    RelationalConstraintDeparture, RelationalConstraintDepartureRejection,
+    RelationalConstraintDepartureRejectionReason, RepositoryError, RuntimeError, RuntimeRequest,
+    SessionId, SharedAgreementAssentRejection, SharedAgreementAssentRejectionReason,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementResolution, SharedAgreementRevision, SharedExperience,
+    SharedExperienceProposal, SharedExperienceRejection, SharedExperienceRejectionReason,
+    SharedExperienceRepository, Speaker, StructuredOperationRejection,
+    StructuredOperationRejectionReason, TurnOutcome, WorkingContext, agreement_is_active_at,
+    decide_reflection_invitation, offer_reflection_invitation, reflection_delivery,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +42,8 @@ pub enum CoreError {
     SharedAgreementCandidateNotFound(SharedAgreementCandidateId),
     SharedAgreementCandidateNotAwaitingPerson(SharedAgreementCandidateId),
     SharedAgreementNotActive(ClaimId),
+    ReflectionInvitationNotFound(ReflectionInvitationId),
+    InvalidReflectionTransition(ReflectionTransitionError),
     InvalidSharedAgreementRevision,
     UnchangedSharedAgreementRevision,
     MissingEvidence(EvidenceId),
@@ -72,6 +81,12 @@ struct AgreementWithdrawalWriteOutcome {
 struct IdentityRevisionWriteOutcome {
     accepted: Option<IdentityRevisionReceipt>,
     rejected: Vec<IdentityRevisionRejection>,
+}
+
+struct ReflectionInvitationWriteOutcome {
+    accepted: Vec<ReflectionInvitationReceipt>,
+    rejected: Vec<ReflectionInvitationRejection>,
+    immediately_offered: Option<ReflectionInvitationId>,
 }
 
 fn reject_constraint_departure(
@@ -119,6 +134,19 @@ impl fmt::Display for CoreError {
             ),
             Self::SharedAgreementNotActive(id) => {
                 write!(formatter, "shared agreement {} is not active", id.get())
+            }
+            Self::ReflectionInvitationNotFound(id) => {
+                write!(
+                    formatter,
+                    "reflection invitation {} does not exist",
+                    id.get()
+                )
+            }
+            Self::InvalidReflectionTransition(error) => {
+                write!(
+                    formatter,
+                    "invalid reflection invitation transition: {error:?}"
+                )
             }
             Self::InvalidSharedAgreementRevision => {
                 formatter.write_str("shared agreement revision has invalid boundaries")
@@ -389,10 +417,31 @@ where
 
 impl<R, T, C> MemoryCore<R, T, C>
 where
-    R: SharedExperienceRepository + IdentityEvolutionRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository + ReflectionInvitationRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
+    /// Applies one person's explicit decision to a currently offered reflection.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown invitation or any transition not allowed by G08.
+    pub fn decide_reflection_invitation(
+        &mut self,
+        id: ReflectionInvitationId,
+        decision: ReflectionDecision,
+    ) -> Result<ReflectionInvitationReceipt, CoreError> {
+        let current = self
+            .repository
+            .reflection_invitation(id)?
+            .ok_or(CoreError::ReflectionInvitationNotFound(id))?;
+        let updated = decide_reflection_invitation(&current, decision, self.clock.now())
+            .map_err(CoreError::InvalidReflectionTransition)?;
+        self.repository
+            .transition_reflection_invitation(current.state(), updated)
+            .map_err(CoreError::Repository)
+    }
+
     /// Runs a person/counterpart turn against a previously frozen context.
     ///
     /// Runtime free text is retained only as conversation evidence. Structured
@@ -425,11 +474,17 @@ where
             })
             .collect();
         let identity = self.repository.current_identity_context()?;
+        let reflection = select_reflection_runtime_context(
+            &self.repository.all_reflection_invitations()?,
+            working_context.reflection_opportunity(),
+            working_context.frozen_at(),
+        );
         let request = RuntimeRequest::new(
             prompt.clone(),
             working_context,
             pending_agreement_candidates,
             identity.clone(),
+            reflection.clone(),
         );
         let validation_context = request.working_context().clone();
         let response = self.runtime.respond(request)?;
@@ -444,6 +499,10 @@ where
             session_id,
             Speaker::Counterpart,
             response.text().to_owned(),
+        )?;
+        let offered_reflection = self.persist_scheduled_reflection_offer(
+            reflection.as_ref(),
+            validation_context.frozen_at(),
         )?;
         let judgments = self.persist_judgment_proposals(
             &response,
@@ -470,22 +529,20 @@ where
             &prompt,
             &counterpart_evidence,
         )?;
+        let reflections = self.persist_reflection_invitation_proposals(
+            &response,
+            &validation_context,
+            &prompt,
+            counterpart_evidence.recorded_at(),
+            offered_reflection,
+        )?;
         let shared = self.persist_shared_experience_proposals(
             &response,
             &validation_context,
             &prompt,
             &counterpart_evidence,
         )?;
-        let rejected_operations = response
-            .unsupported_operations()
-            .iter()
-            .map(|operation| {
-                StructuredOperationRejection::new(
-                    operation.operation_index(),
-                    StructuredOperationRejectionReason::NotWhitelisted(operation.name().to_owned()),
-                )
-            })
-            .collect();
+        let rejected_operations = rejected_structured_operations(&response);
         Ok(TurnOutcome::new(
             person_evidence_id,
             counterpart_evidence.id(),
@@ -497,8 +554,105 @@ where
         .with_constraint_departures(departures.recorded, departures.rejected)
         .with_agreement_withdrawals(withdrawals.recorded, withdrawals.rejected)
         .with_identity_revision(identity_revision.accepted, identity_revision.rejected)
+        .with_reflection_invitations(
+            reflections.accepted,
+            reflections.rejected,
+            reflections.immediately_offered.or(offered_reflection),
+        )
         .with_shared_experiences(shared.pending_agreements, shared.admitted, shared.rejected)
         .with_rejected_operations(rejected_operations))
+    }
+
+    fn persist_scheduled_reflection_offer(
+        &mut self,
+        reflection: Option<&ReflectionRuntimeContext>,
+        offered_at: crate::Timestamp,
+    ) -> Result<Option<ReflectionInvitationId>, CoreError> {
+        let Some(reflection) = reflection else {
+            return Ok(None);
+        };
+        if reflection.disposition() != ReflectionRuntimeDisposition::Offer {
+            return Ok(None);
+        }
+        let current = reflection.invitation();
+        let offered = offer_reflection_invitation(current, offered_at)
+            .map_err(CoreError::InvalidReflectionTransition)?;
+        self.repository
+            .transition_reflection_invitation(current.state(), offered)?;
+        Ok(Some(current.id()))
+    }
+
+    fn persist_reflection_invitation_proposals(
+        &mut self,
+        response: &crate::RuntimeResponse,
+        validation_context: &WorkingContext,
+        prompt: &ConversationEvidence,
+        created_at: crate::Timestamp,
+        already_offered: Option<ReflectionInvitationId>,
+    ) -> Result<ReflectionInvitationWriteOutcome, CoreError> {
+        let mut outcome = ReflectionInvitationWriteOutcome {
+            accepted: Vec::new(),
+            rejected: Vec::new(),
+            immediately_offered: None,
+        };
+        for (proposal_index, proposal) in response
+            .reflection_invitation_proposals()
+            .iter()
+            .enumerate()
+        {
+            if proposal_index > 0 {
+                outcome.rejected.push(ReflectionInvitationRejection::new(
+                    proposal_index,
+                    ReflectionInvitationRejectionReason::DuplicateProposal,
+                ));
+                continue;
+            }
+            let existing = self.repository.all_reflection_invitations()?;
+            let validation = validate_reflection_invitation_proposal(
+                proposal,
+                &existing,
+                validation_context,
+                prompt,
+            );
+            if let Err(reason) = validation {
+                outcome
+                    .rejected
+                    .push(ReflectionInvitationRejection::new(proposal_index, reason));
+                continue;
+            }
+            let invitation = ReflectionInvitation::restore(
+                self.repository.next_reflection_invitation_id(),
+                proposal.topic_key().trim(),
+                proposal.observation().trim(),
+                proposal.evidence_refs().to_vec(),
+                proposal.why_now().trim(),
+                proposal.importance(),
+                proposal.basis(),
+                ReflectionInvitationState::Pending,
+                created_at,
+                created_at,
+                None,
+                None,
+                0,
+                false,
+            );
+            let mut receipt = self
+                .repository
+                .commit_reflection_invitation(invitation.clone())?;
+            if already_offered.is_none()
+                && proposal.importance() == ReflectionImportance::ImmediateSafetyRisk
+            {
+                let offered = offer_reflection_invitation(&invitation, created_at)
+                    .map_err(CoreError::InvalidReflectionTransition)?;
+                receipt = self.repository.transition_reflection_invitation(
+                    ReflectionInvitationState::Pending,
+                    offered,
+                )?;
+                outcome.immediately_offered = Some(invitation.id());
+            }
+            outcome.accepted.push(receipt);
+        }
+        Ok(outcome)
     }
 
     fn persist_identity_revisions(
@@ -1364,6 +1518,181 @@ fn validate_agreement_supersession(
             ),
         )
     }
+}
+
+fn rejected_structured_operations(
+    response: &crate::RuntimeResponse,
+) -> Vec<StructuredOperationRejection> {
+    response
+        .unsupported_operations()
+        .iter()
+        .map(|operation| {
+            StructuredOperationRejection::new(
+                operation.operation_index(),
+                StructuredOperationRejectionReason::NotWhitelisted(operation.name().to_owned()),
+            )
+        })
+        .collect()
+}
+
+fn select_reflection_runtime_context(
+    invitations: &[ReflectionInvitation],
+    opportunity: &crate::ReflectionOpportunity,
+    now: crate::Timestamp,
+) -> Option<ReflectionRuntimeContext> {
+    let last_proactive_offer_at = invitations
+        .iter()
+        .filter(|invitation| invitation.importance() != ReflectionImportance::ImmediateSafetyRisk)
+        .filter_map(ReflectionInvitation::last_offered_at)
+        .max_by_key(|timestamp| timestamp.as_millis());
+    let mut ordered = invitations.to_vec();
+    ordered.sort_by(|left, right| {
+        right
+            .importance()
+            .cmp(&left.importance())
+            .then_with(|| {
+                left.created_at()
+                    .as_millis()
+                    .cmp(&right.created_at().as_millis())
+            })
+            .then_with(|| left.id().cmp(&right.id()))
+    });
+    ordered.into_iter().find_map(|invitation| {
+        match reflection_delivery(&invitation, opportunity, now, last_proactive_offer_at) {
+            ReflectionDelivery::Queued => None,
+            ReflectionDelivery::Offer => Some(ReflectionRuntimeContext::new(
+                invitation,
+                ReflectionRuntimeDisposition::Offer,
+            )),
+            ReflectionDelivery::DiscussOnly => Some(ReflectionRuntimeContext::new(
+                invitation,
+                ReflectionRuntimeDisposition::DiscussOnly,
+            )),
+        }
+    })
+}
+
+fn validate_reflection_invitation_proposal(
+    proposal: &ReflectionInvitationProposal,
+    existing: &[ReflectionInvitation],
+    working_context: &WorkingContext,
+    prompt: &ConversationEvidence,
+) -> Result<(), ReflectionInvitationRejectionReason> {
+    let topic = proposal.topic_key().trim();
+    if topic.is_empty() {
+        return Err(ReflectionInvitationRejectionReason::EmptyTopic);
+    }
+    if topic.len() > MAX_REFLECTION_TOPIC_BYTES {
+        return Err(ReflectionInvitationRejectionReason::TopicTooLong);
+    }
+    let observation = proposal.observation().trim();
+    if observation.is_empty() {
+        return Err(ReflectionInvitationRejectionReason::EmptyObservation);
+    }
+    if observation.len() > MAX_REFLECTION_OBSERVATION_BYTES {
+        return Err(ReflectionInvitationRejectionReason::ObservationTooLong);
+    }
+    let why_now = proposal.why_now().trim();
+    if why_now.is_empty() {
+        return Err(ReflectionInvitationRejectionReason::EmptyWhyNow);
+    }
+    if why_now.len() > MAX_REFLECTION_WHY_NOW_BYTES {
+        return Err(ReflectionInvitationRejectionReason::WhyNowTooLong);
+    }
+    if proposal.basis() == ReflectionInvitationBasis::RepeatedPattern {
+        return Err(ReflectionInvitationRejectionReason::RepeatedPatternRequiresS27);
+    }
+    if contains_pattern_language(observation) {
+        return Err(ReflectionInvitationRejectionReason::PatternLanguageForSingleChange);
+    }
+    if proposal.evidence_refs().is_empty() {
+        return Err(ReflectionInvitationRejectionReason::MissingEvidence);
+    }
+    if proposal.evidence_refs().len() > MAX_REFLECTION_EVIDENCE_REFS {
+        return Err(ReflectionInvitationRejectionReason::TooManyEvidenceReferences);
+    }
+    for citation in proposal.evidence_refs() {
+        validate_reflection_citation(citation, working_context, prompt)?;
+    }
+    if proposal.importance() == ReflectionImportance::ImmediateSafetyRisk
+        && !proposal
+            .evidence_refs()
+            .iter()
+            .any(|citation| immediate_safety_fixture_matches(citation, working_context, prompt))
+    {
+        return Err(ReflectionInvitationRejectionReason::ImmediateSafetyFixtureMismatch);
+    }
+    if existing
+        .iter()
+        .any(|invitation| invitation.is_open() && invitation.topic_key() == topic)
+    {
+        return Err(ReflectionInvitationRejectionReason::DuplicateOpenTopic);
+    }
+    if existing
+        .iter()
+        .filter(|invitation| invitation.is_open())
+        .count()
+        >= MAX_OPEN_REFLECTION_INVITATIONS
+    {
+        return Err(ReflectionInvitationRejectionReason::OpenInvitationBudgetExceeded);
+    }
+    Ok(())
+}
+
+fn immediate_safety_fixture_matches(
+    citation: &EvidenceCitation,
+    working_context: &WorkingContext,
+    prompt: &ConversationEvidence,
+) -> bool {
+    if citation.quote() != G08_IMMEDIATE_SAFETY_QUOTE {
+        return false;
+    }
+    if citation.evidence_id() == prompt.id() {
+        return prompt.speaker() == Speaker::Person;
+    }
+    working_context
+        .evidence()
+        .iter()
+        .find(|evidence| evidence.id() == citation.evidence_id())
+        .is_some_and(|evidence| evidence.speaker() == Speaker::Person)
+}
+
+fn contains_pattern_language(observation: &str) -> bool {
+    let normalized = observation.to_ascii_lowercase();
+    ["总是", "一直", "反复", "每次", "模式", "pattern", "always"]
+        .iter()
+        .any(|term| normalized.contains(term))
+}
+
+fn validate_reflection_citation(
+    citation: &EvidenceCitation,
+    working_context: &WorkingContext,
+    prompt: &ConversationEvidence,
+) -> Result<(), ReflectionInvitationRejectionReason> {
+    let evidence = if prompt.id() == citation.evidence_id() {
+        prompt
+    } else {
+        working_context
+            .evidence()
+            .iter()
+            .find(|evidence| evidence.id() == citation.evidence_id())
+            .ok_or(
+                ReflectionInvitationRejectionReason::EvidenceOutsideWorkingContext(
+                    citation.evidence_id(),
+                ),
+            )?
+    };
+    if citation.quote().is_empty() {
+        return Err(ReflectionInvitationRejectionReason::EmptyQuote(
+            citation.evidence_id(),
+        ));
+    }
+    if !evidence.verbatim().contains(citation.quote()) {
+        return Err(ReflectionInvitationRejectionReason::QuoteMismatch(
+            citation.evidence_id(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_identity_revision(

@@ -1,0 +1,11 @@
+# scenario	now_millis	opportunity	state	importance	next_eligible_at	last_proactive_offer_at	topic_key	expected
+unrelated_pending	700000000	unrelated_task	pending	ordinary	-	-	work-rhythm	queued
+idle_pending	700000000	conversation_idle	pending	ordinary	-	-	work-rhythm	offered
+idle_global_cooldown	700000000	conversation_idle	pending	important	-	699999999	work-rhythm	queued
+related_ignores_global_cooldown	700000000	related:work-rhythm	pending	ordinary	-	699999999	work-rhythm	offered
+deferred_before_due	700000000	conversation_idle	deferred	important	700000001	-	work-rhythm	queued
+deferred_at_due	700000000	conversation_idle	deferred	important	700000000	-	work-rhythm	offered
+muted_scheduled	700000000	scheduled_review	muted_by_person	important	-	-	work-rhythm	queued
+muted_person_raises	700000000	related:work-rhythm	muted_by_person	important	-	-	work-rhythm	discuss_only
+muted_fixed_safety	700000000	unrelated_task	muted_by_person	immediate_safety_risk	-	-	safety	offered
+resolved_safety	700000000	unrelated_task	resolved	immediate_safety_risk	-	-	safety	queued

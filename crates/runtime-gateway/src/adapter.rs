@@ -5,10 +5,12 @@ use eam_core::{
     ConversationEvidence, CounterpartRuntime, DecisionImpact, DisputeState, EvidenceCitation,
     EvidenceId, IdentityPersonRepresentation, IdentityProfileChanges,
     IdentityReflectivePurposeStatus, IdentityRevisionAuthorship, IdentityRevisionProposal,
-    IdentityRuntimeContext, JudgmentProposal, PersonTurnClassification,
-    RelationalConstraintDeparture, RelationalConstraintPriority, RetrievedContextItem,
-    RuntimeError, RuntimeRequest, RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate,
-    SharedExperienceKind, SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
+    IdentityRuntimeContext, JudgmentProposal, PersonTurnClassification, ReflectionImportance,
+    ReflectionInvitationBasis, ReflectionInvitationProposal, ReflectionInvitationState,
+    ReflectionRuntimeContext, ReflectionRuntimeDisposition, RelationalConstraintDeparture,
+    RelationalConstraintPriority, RetrievedContextItem, RuntimeError, RuntimeRequest,
+    RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate, SharedExperienceKind,
+    SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -49,6 +51,12 @@ const ORDINARY_RESPONSE_INSTRUCTIONS: &str = concat!(
     "name the current predecessor and constitution versions, explain the reason, preserve the fixed ",
     "reflective purpose of helping the person understand themselves, and remain a distinct counterpart. ",
     "Never treat a person request as direct identity editing. ",
+    "When reflection is supplied with disposition offer, raise that sourced invitation naturally; ",
+    "after a prior deferral offer the person one defer-or-mute choice only when mute_prompted is false. ",
+    "Disposition discuss_only means the person raised a muted topic; discuss it without restoring proactive offers. ",
+    "Use propose_reflection_invitation only for one directly supported important change in S26, ",
+    "with an exact citation and why_now. Do not claim a repeated pattern. Mark immediate_safety_risk ",
+    "only for the fixed exact quote 我现在正打算伤害自己。. ",
     "Return only the strict JSON schema."
 );
 const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
@@ -81,6 +89,12 @@ const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
     "name the current predecessor and constitution versions, explain the reason, preserve the fixed ",
     "reflective purpose of helping the person understand themselves, and remain a distinct counterpart. ",
     "Never treat a person request as direct identity editing. ",
+    "When reflection is supplied with disposition offer, raise that sourced invitation naturally; ",
+    "after a prior deferral offer the person one defer-or-mute choice only when mute_prompted is false. ",
+    "Disposition discuss_only means the person raised a muted topic; discuss it without restoring proactive offers. ",
+    "Use propose_reflection_invitation only for one directly supported important change in S26, ",
+    "with an exact citation and why_now. Do not claim a repeated pattern. Mark immediate_safety_risk ",
+    "only for the fixed exact quote 我现在正打算伤害自己。. ",
     "Return only the strict JSON schema."
 );
 
@@ -225,6 +239,7 @@ where
             kind: "response",
             prompt: EvidenceInput::from(request.prompt()),
             identity: request.identity().map(IdentityRuntimeInput::from),
+            reflection: request.reflection().map(ReflectionRuntimeInput::from),
             pending_agreement_candidates: request
                 .pending_agreement_candidates()
                 .iter()
@@ -339,6 +354,21 @@ fn response_outbound_selection(
             version: identity.state().version(),
         });
     }
+    if let Some(reflection) = request.reflection() {
+        for id in reflection
+            .invitation()
+            .evidence_refs()
+            .iter()
+            .map(EvidenceCitation::evidence_id)
+        {
+            if !evidence_ids.contains(&id) {
+                evidence_ids.push(id);
+            }
+        }
+        retrieved_sources.push(OutboundContextSource::ReflectionInvitation {
+            invitation_id: reflection.invitation().id().get(),
+        });
+    }
     OutboundSelection {
         evidence_ids,
         retrieved_sources,
@@ -381,6 +411,7 @@ struct TurnInput<'a> {
     kind: &'static str,
     prompt: EvidenceInput<'a>,
     identity: Option<IdentityRuntimeInput<'a>>,
+    reflection: Option<ReflectionRuntimeInput<'a>>,
     pending_agreement_candidates: Vec<PendingAgreementCandidateInput<'a>>,
     working_context: WorkingContextInput<'a>,
 }
@@ -429,6 +460,91 @@ impl<'a> From<&'a IdentityRuntimeContext> for IdentityRuntimeInput<'a> {
                 formed_at_millis: state.formed_at().as_millis(),
             },
         }
+    }
+}
+
+#[derive(Serialize)]
+struct ReflectionRuntimeInput<'a> {
+    disposition: &'static str,
+    invitation: ReflectionInvitationInput<'a>,
+}
+
+#[derive(Serialize)]
+struct ReflectionInvitationInput<'a> {
+    id: u64,
+    topic_key: &'a str,
+    observation: &'a str,
+    evidence_refs: Vec<CitationInput<'a>>,
+    why_now: &'a str,
+    importance: &'static str,
+    basis: &'static str,
+    state: &'static str,
+    created_at_millis: i64,
+    updated_at_millis: i64,
+    next_eligible_at_millis: Option<i64>,
+    last_offered_at_millis: Option<i64>,
+    defer_count: u32,
+    mute_prompted: bool,
+}
+
+impl<'a> From<&'a ReflectionRuntimeContext> for ReflectionRuntimeInput<'a> {
+    fn from(value: &'a ReflectionRuntimeContext) -> Self {
+        let invitation = value.invitation();
+        Self {
+            disposition: match value.disposition() {
+                ReflectionRuntimeDisposition::Offer => "offer",
+                ReflectionRuntimeDisposition::DiscussOnly => "discuss_only",
+            },
+            invitation: ReflectionInvitationInput {
+                id: invitation.id().get(),
+                topic_key: invitation.topic_key(),
+                observation: invitation.observation(),
+                evidence_refs: invitation
+                    .evidence_refs()
+                    .iter()
+                    .map(CitationInput::from)
+                    .collect(),
+                why_now: invitation.why_now(),
+                importance: reflection_importance_name(invitation.importance()),
+                basis: reflection_basis_name(invitation.basis()),
+                state: reflection_state_name(invitation.state()),
+                created_at_millis: invitation.created_at().as_millis(),
+                updated_at_millis: invitation.updated_at().as_millis(),
+                next_eligible_at_millis: invitation
+                    .next_eligible_at()
+                    .map(eam_core::Timestamp::as_millis),
+                last_offered_at_millis: invitation
+                    .last_offered_at()
+                    .map(eam_core::Timestamp::as_millis),
+                defer_count: invitation.defer_count(),
+                mute_prompted: invitation.mute_prompted(),
+            },
+        }
+    }
+}
+
+const fn reflection_importance_name(value: ReflectionImportance) -> &'static str {
+    match value {
+        ReflectionImportance::Ordinary => "ordinary",
+        ReflectionImportance::Important => "important",
+        ReflectionImportance::ImmediateSafetyRisk => "immediate_safety_risk",
+    }
+}
+
+const fn reflection_basis_name(value: ReflectionInvitationBasis) -> &'static str {
+    match value {
+        ReflectionInvitationBasis::ImportantSingleChange => "important_single_change",
+        ReflectionInvitationBasis::RepeatedPattern => "repeated_pattern",
+    }
+}
+
+const fn reflection_state_name(value: ReflectionInvitationState) -> &'static str {
+    match value {
+        ReflectionInvitationState::Pending => "pending",
+        ReflectionInvitationState::Offered => "offered",
+        ReflectionInvitationState::Deferred => "deferred",
+        ReflectionInvitationState::MutedByPerson => "muted_by_person",
+        ReflectionInvitationState::Resolved => "resolved",
     }
 }
 
@@ -922,6 +1038,50 @@ struct IdentityRevisionOperation {
 }
 
 #[derive(Deserialize)]
+struct ReflectionInvitationOperation {
+    topic_key: String,
+    observation: String,
+    evidence_refs: Vec<WireCitation>,
+    why_now: String,
+    importance: WireReflectionImportance,
+    basis: WireReflectionBasis,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireReflectionImportance {
+    Ordinary,
+    Important,
+    ImmediateSafetyRisk,
+}
+
+impl WireReflectionImportance {
+    const fn into_domain(self) -> ReflectionImportance {
+        match self {
+            Self::Ordinary => ReflectionImportance::Ordinary,
+            Self::Important => ReflectionImportance::Important,
+            Self::ImmediateSafetyRisk => ReflectionImportance::ImmediateSafetyRisk,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireReflectionBasis {
+    ImportantSingleChange,
+    RepeatedPattern,
+}
+
+impl WireReflectionBasis {
+    const fn into_domain(self) -> ReflectionInvitationBasis {
+        match self {
+            Self::ImportantSingleChange => ReflectionInvitationBasis::ImportantSingleChange,
+            Self::RepeatedPattern => ReflectionInvitationBasis::RepeatedPattern,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct WireIdentityChanges {
     name: Option<String>,
     expression_traits: Option<String>,
@@ -1113,6 +1273,10 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
                 response =
                     response.with_identity_revision(parse_identity_revision_operation(operation)?);
             }
+            "propose_reflection_invitation" => {
+                response = response
+                    .with_reflection_invitation(parse_reflection_invitation_operation(operation)?);
+            }
             _ => response = response.with_unsupported_operation(operation_index, name),
         }
     }
@@ -1197,6 +1361,25 @@ fn parse_identity_revision_operation(
     .with_person_representation(revision.person_representation.into_domain()))
 }
 
+fn parse_reflection_invitation_operation(
+    operation: Value,
+) -> Result<ReflectionInvitationProposal, RuntimeError> {
+    let proposal: ReflectionInvitationOperation = serde_json::from_value(operation)
+        .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
+    Ok(ReflectionInvitationProposal::new(
+        proposal.topic_key,
+        proposal.observation,
+        proposal
+            .evidence_refs
+            .into_iter()
+            .map(WireCitation::into_domain)
+            .collect(),
+        proposal.why_now,
+        proposal.importance.into_domain(),
+        proposal.basis.into_domain(),
+    ))
+}
+
 fn classification_schema() -> Value {
     json!({
         "type": "object",
@@ -1227,6 +1410,7 @@ fn response_schema() -> Value {
         relational_constraint_departure_operation_schema();
     let agreement_withdrawal_operation = agreement_withdrawal_operation_schema();
     let identity_revision_operation = identity_revision_operation_schema(&citation);
+    let reflection_invitation_operation = reflection_invitation_operation_schema(&citation);
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1242,7 +1426,8 @@ fn response_schema() -> Value {
                         shared_agreement_assent_operation,
                         relational_constraint_departure_operation,
                         agreement_withdrawal_operation,
-                        identity_revision_operation
+                        identity_revision_operation,
+                        reflection_invitation_operation
                     ]
                 }
             }
@@ -1489,6 +1674,43 @@ fn identity_revision_operation_schema(citation: &Value) -> Value {
             "changes",
             "change_reason",
             "evidence_refs"
+        ]
+    })
+}
+
+fn reflection_invitation_operation_schema(citation: &Value) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["propose_reflection_invitation"]
+            },
+            "topic_key": { "type": "string" },
+            "observation": { "type": "string" },
+            "evidence_refs": {
+                "type": "array",
+                "items": citation
+            },
+            "why_now": { "type": "string" },
+            "importance": {
+                "type": "string",
+                "enum": ["ordinary", "important", "immediate_safety_risk"]
+            },
+            "basis": {
+                "type": "string",
+                "enum": ["important_single_change", "repeated_pattern"]
+            }
+        },
+        "required": [
+            "type",
+            "topic_key",
+            "observation",
+            "evidence_refs",
+            "why_now",
+            "importance",
+            "basis"
         ]
     })
 }

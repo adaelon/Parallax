@@ -9,6 +9,7 @@ import {
   App,
   ConversationTurn,
   IdentityStateVersion,
+  ReflectionInvitationCeremony,
   SharedExperienceCeremony,
 } from "./App";
 
@@ -484,6 +485,80 @@ describe("S25 immutable identity history", () => {
   });
 });
 
+describe("S26 deferrable reflection invitation ceremony", () => {
+  it("shows the one-time mute choice after a repeated deferral and preserves explicit semantics", async () => {
+    const reflection = reflectionInvitation(true);
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "list_conversation") {
+        return [] as T;
+      }
+      if (command === "list_shared_experience_ceremonies") {
+        return [] as T;
+      }
+      if (command === "list_offered_reflection_invitations") {
+        return [reflection] as T;
+      }
+      if (command === "decide_reflection_invitation") {
+        return { invitationId: reflection.id, state: "mutedByPerson" } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("想和你一起看一件事");
+      expect(document.body.textContent).toContain("这次工作节奏变化值得一起看");
+      expect(document.body.textContent).toContain("刚发生且有直接依据");
+      expect(document.body.textContent).toContain("第一次把工作节奏提快了");
+      expect(document.body.textContent).toContain("观察与证据不会被删除");
+    });
+    expect([...document.querySelectorAll(".ceremony-actions button")].map(
+      (button) => button.textContent,
+    )).toEqual(["继续延后", "不再主动提起", "这次已谈完"]);
+
+    await clickButton("不再主动提起");
+    await vi.waitFor(() =>
+      expect(document.body.textContent).not.toContain("想和你一起看一件事"),
+    );
+    expect(invokeMock).toHaveBeenCalledWith("decide_reflection_invitation", {
+      invitationId: 26,
+      decision: "mute",
+    });
+  });
+
+  it("offers defer and resolve without prompting for mute on the first offer", async () => {
+    const reflection = reflectionInvitation(false);
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "list_conversation") {
+        return [] as T;
+      }
+      if (command === "list_shared_experience_ceremonies") {
+        return [] as T;
+      }
+      if (command === "list_offered_reflection_invitations") {
+        return [reflection] as T;
+      }
+      if (command === "decide_reflection_invitation") {
+        return { invitationId: reflection.id, state: "deferred" } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("反思邀请"));
+    expect([...document.querySelectorAll(".ceremony-actions button")].map(
+      (button) => button.textContent,
+    )).toEqual(["稍后再说", "这次已谈完"]);
+    expect(document.body.textContent).not.toContain("不再主动提起");
+
+    await clickButton("稍后再说");
+    expect(invokeMock).toHaveBeenCalledWith("decide_reflection_invitation", {
+      invitationId: 26,
+      decision: "defer",
+    });
+  });
+});
+
 async function enterMessage(message: string) {
   const textarea = document.querySelector("textarea")!;
   const setter = Object.getOwnPropertyDescriptor(
@@ -536,6 +611,26 @@ function agreementCeremony(): SharedExperienceCeremony {
     evidence: [
       { evidenceId: 1, speaker: "person", quote: "我同意" },
       { evidenceId: 2, speaker: "counterpart", quote: "我也同意" },
+    ],
+  };
+}
+
+function reflectionInvitation(showMutePrompt: boolean): ReflectionInvitationCeremony {
+  return {
+    id: 26,
+    topicKey: "work-rhythm",
+    observation: "这次工作节奏变化值得一起看。",
+    whyNow: "这是刚发生且有直接依据的重要变化。",
+    importance: "important",
+    basis: "importantSingleChange",
+    deferCount: showMutePrompt ? 1 : 0,
+    showMutePrompt,
+    evidence: [
+      {
+        evidenceId: 8,
+        speaker: "person",
+        quote: "第一次把工作节奏提快了",
+      },
     ],
   };
 }

@@ -14,6 +14,25 @@ interface ConversationTurnResult {
   person: ConversationTurn;
   counterpart: ConversationTurn;
   ceremonies: SharedExperienceCeremony[];
+  reflectionInvitations?: ReflectionInvitationCeremony[];
+}
+
+type ReflectionInvitationDecision = "defer" | "mute" | "resolve";
+
+export interface ReflectionInvitationCeremony {
+  id: number;
+  topicKey: string;
+  observation: string;
+  whyNow: string;
+  importance: "ordinary" | "important" | "immediateSafetyRisk";
+  basis: "importantSingleChange" | "repeatedPattern";
+  deferCount: number;
+  showMutePrompt: boolean;
+  evidence: Array<{
+    evidenceId: number;
+    speaker: Speaker;
+    quote: string;
+  }>;
 }
 
 type SharedExperienceKind =
@@ -97,6 +116,9 @@ const timeFormatter = new Intl.DateTimeFormat("zh-CN", {
 export function App() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [ceremonies, setCeremonies] = useState<SharedExperienceCeremony[]>([]);
+  const [reflectionInvitations, setReflectionInvitations] = useState<
+    ReflectionInvitationCeremony[]
+  >([]);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
@@ -120,12 +142,16 @@ export function App() {
       invoke<ConversationTurn[]>("list_conversation"),
       invoke<SharedExperienceCeremony[]>("list_shared_experience_ceremonies"),
       invoke<IdentityStateVersion[]>("list_identity_history").catch(() => []),
+      invoke<ReflectionInvitationCeremony[]>(
+        "list_offered_reflection_invitations",
+      ).catch(() => []),
     ])
-      .then(([restored, restoredCeremonies, restoredIdentity]) => {
+      .then(([restored, restoredCeremonies, restoredIdentity, restoredReflections]) => {
         if (active) {
           setTurns(restored);
           setCeremonies(restoredCeremonies);
           setIdentityHistory(restoredIdentity);
+          setReflectionInvitations(restoredReflections);
           setError(null);
         }
       })
@@ -163,6 +189,9 @@ export function App() {
       });
       setTurns((current) => mergeTurns(current, result.person, result.counterpart));
       setCeremonies((current) => mergeCeremonies(current, result.ceremonies));
+      setReflectionInvitations((current) =>
+        mergeReflectionInvitations(current, result.reflectionInvitations ?? []),
+      );
       try {
         setIdentityHistory(
           await invoke<IdentityStateVersion[]>("list_identity_history"),
@@ -228,6 +257,31 @@ export function App() {
     const dismissed = await resolveCeremony(ceremony);
     if (dismissed && continueResponding) {
       messageInput.current?.focus();
+    }
+  }
+
+  async function decideReflectionInvitation(
+    invitation: ReflectionInvitationCeremony,
+    decision: ReflectionInvitationDecision,
+  ) {
+    const key = `reflection:${invitation.id}`;
+    if (ceremonyAction !== null) {
+      return;
+    }
+    setCeremonyAction(key);
+    setError(null);
+    try {
+      await invoke("decide_reflection_invitation", {
+        invitationId: invitation.id,
+        decision,
+      });
+      setReflectionInvitations((current) =>
+        current.filter((item) => item.id !== invitation.id),
+      );
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setCeremonyAction(null);
     }
   }
 
@@ -350,6 +404,7 @@ export function App() {
   }
 
   const activeCeremony = ceremonies[0];
+  const activeReflection = activeCeremony === undefined ? reflectionInvitations[0] : undefined;
 
   return (
     <main className="conversation-shell">
@@ -592,6 +647,81 @@ export function App() {
                 type="button"
               >
                 确认退出
+              </button>
+            </div>
+          </article>
+        </div>
+      ) : null}
+
+      {activeReflection ? (
+        <div className="ceremony-layer">
+          <article
+            aria-labelledby="reflection-invitation-title"
+            aria-modal="true"
+            className="ceremony-card"
+            role="dialog"
+          >
+            <p className="eyebrow">反思邀请</p>
+            <h2 id="reflection-invitation-title">想和你一起看一件事</h2>
+            <p className="ceremony-statement">{activeReflection.observation}</p>
+            <dl className="ceremony-boundaries">
+              <div>
+                <dt>为何现在提出</dt>
+                <dd>{activeReflection.whyNow}</dd>
+              </div>
+              <div>
+                <dt>依据类型</dt>
+                <dd>{reflectionBasisText(activeReflection.basis)}</dd>
+              </div>
+              <div>
+                <dt>重要性</dt>
+                <dd>{reflectionImportanceText(activeReflection.importance)}</dd>
+              </div>
+            </dl>
+            <div className="ceremony-evidence" aria-label="反思邀请的逐字依据">
+              {activeReflection.evidence.map((item) => (
+                <blockquote key={`${item.evidenceId}-${item.quote}`}>
+                  <span>{item.speaker === "person" ? "你" : "第二自我"}</span>
+                  {item.quote}
+                </blockquote>
+              ))}
+            </div>
+            <p className="ceremony-note">
+              {activeReflection.showMutePrompt
+                ? "这项邀请已经延后过一次。你可以继续延后，或只停止它今后的主动出现；观察与证据不会被删除。"
+                : "你可以稍后再谈；只有明确选择已谈完，才会把这项邀请标记为完成。"}
+            </p>
+            <div className="ceremony-actions">
+              <button
+                className="secondary-action"
+                disabled={ceremonyAction !== null}
+                onClick={() =>
+                  void decideReflectionInvitation(activeReflection, "defer")
+                }
+                type="button"
+              >
+                {activeReflection.showMutePrompt ? "继续延后" : "稍后再说"}
+              </button>
+              {activeReflection.showMutePrompt ? (
+                <button
+                  className="secondary-action"
+                  disabled={ceremonyAction !== null}
+                  onClick={() =>
+                    void decideReflectionInvitation(activeReflection, "mute")
+                  }
+                  type="button"
+                >
+                  不再主动提起
+                </button>
+              ) : null}
+              <button
+                disabled={ceremonyAction !== null}
+                onClick={() =>
+                  void decideReflectionInvitation(activeReflection, "resolve")
+                }
+                type="button"
+              >
+                这次已谈完
               </button>
             </div>
           </article>
@@ -867,6 +997,25 @@ export function App() {
   );
 }
 
+function reflectionBasisText(
+  basis: ReflectionInvitationCeremony["basis"],
+): string {
+  return basis === "importantSingleChange" ? "重要单次变化" : "暂定重复模式";
+}
+
+function reflectionImportanceText(
+  importance: ReflectionInvitationCeremony["importance"],
+): string {
+  switch (importance) {
+    case "ordinary":
+      return "普通";
+    case "important":
+      return "重要";
+    case "immediateSafetyRisk":
+      return "即时安全风险";
+  }
+}
+
 function ceremonyTitle(ceremony: SharedExperienceCeremony): string {
   switch (ceremony.experienceKind) {
     case "agreement":
@@ -925,6 +1074,17 @@ function mergeCeremonies(
     byKey.set(ceremonyKey(item), item);
   }
   return [...byKey.values()];
+}
+
+function mergeReflectionInvitations(
+  current: ReflectionInvitationCeremony[],
+  incoming: ReflectionInvitationCeremony[],
+): ReflectionInvitationCeremony[] {
+  const byId = new Map(current.map((item) => [item.id, item]));
+  for (const item of incoming) {
+    byId.set(item.id, item);
+  }
+  return [...byId.values()].sort((left, right) => left.id - right.id);
 }
 
 function mergeTurns(

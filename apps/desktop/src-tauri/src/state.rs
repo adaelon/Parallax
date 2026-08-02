@@ -8,9 +8,12 @@ use std::{
 use eam_core::{
     AgreementWithdrawalActor, ClaimId, Clock, ConversationEvidence, CounterpartRuntime,
     EvidenceCitation, EvidenceId, IdentityEvolutionRepository, IdentityStateSnapshot, MemoryCore,
-    MemoryRepository, SessionId, SharedAgreementCandidateStatus, SharedAgreementDecision,
-    SharedAgreementResolution, SharedAgreementRevision, SharedExperienceKind,
-    SharedExperienceRepository, Speaker, SystemClock, WorkingContext, agreement_is_active_at,
+    MemoryRepository, ReflectionDecision, ReflectionImportance, ReflectionInvitation,
+    ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationRepository,
+    ReflectionInvitationState, ReflectionOpportunity, SessionId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementResolution, SharedAgreementRevision,
+    SharedExperienceKind, SharedExperienceRepository, Speaker, SystemClock, WorkingContext,
+    agreement_is_active_at,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_ingestion::{
@@ -82,6 +85,36 @@ pub struct ConversationTurnResult {
     person: ConversationTurnView,
     counterpart: ConversationTurnView,
     ceremonies: Vec<SharedExperienceCeremonyView>,
+    reflection_invitations: Vec<ReflectionInvitationView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReflectionInvitationEvidenceView {
+    evidence_id: u64,
+    speaker: &'static str,
+    quote: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReflectionInvitationView {
+    id: u64,
+    topic_key: String,
+    observation: String,
+    why_now: String,
+    importance: &'static str,
+    basis: &'static str,
+    defer_count: u32,
+    show_mute_prompt: bool,
+    evidence: Vec<ReflectionInvitationEvidenceView>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReflectionInvitationDecisionView {
+    invitation_id: u64,
+    state: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -301,6 +334,32 @@ impl ManagedHost {
     pub fn list_identity_history(&self) -> Result<Vec<IdentityStateView>, String> {
         match &*self.lock() {
             HostSlot::Ready(host) => list_identity_history_from_core(&host.core),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn list_offered_reflection_invitations(
+        &self,
+    ) -> Result<Vec<ReflectionInvitationView>, String> {
+        match &*self.lock() {
+            HostSlot::Ready(host) => list_offered_reflection_invitations_from_core(&host.core),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn decide_reflection_invitation(
+        &self,
+        invitation_id: u64,
+        decision: &str,
+    ) -> Result<ReflectionInvitationDecisionView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                decide_reflection_invitation_from_core(&mut host.core, invitation_id, decision)
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -571,7 +630,7 @@ fn send_message_with_core<R, T, C>(
     verbatim: String,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: SharedExperienceRepository + IdentityEvolutionRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository + ReflectionInvitationRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -596,6 +655,8 @@ where
             working_context,
         )?
     };
+    let working_context =
+        with_reflection_opportunity(core.repository(), &verbatim, working_context)?;
     run_message_with_context(core, verbatim, working_context)
 }
 
@@ -604,7 +665,10 @@ fn send_message_with_retrieval<R, T, C>(
     verbatim: String,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: SharedExperienceRepository + IdentityEvolutionRepository + RetrievalRepository,
+    R: SharedExperienceRepository
+        + IdentityEvolutionRepository
+        + ReflectionInvitationRepository
+        + RetrievalRepository,
     <R as RetrievalRepository>::Error: std::fmt::Display,
     T: CounterpartRuntime,
     C: Clock,
@@ -624,6 +688,7 @@ where
     let frozen_at = selected.frozen_at();
     let selected_evidence = selected.evidence().to_vec();
     if search_terms(&verbatim).is_empty() {
+        let selected = with_reflection_opportunity(core.repository(), &verbatim, selected)?;
         return run_message_with_context(core, verbatim, selected);
     }
     let query = RetrievalQuery::lexical(&verbatim);
@@ -636,7 +701,65 @@ where
     )
     .map_err(|error| error.to_string())?;
     let working_context = with_relational_constraints(core.repository(), &query, working_context)?;
+    let working_context =
+        with_reflection_opportunity(core.repository(), &verbatim, working_context)?;
     run_message_with_context(core, verbatim, working_context)
+}
+
+fn with_reflection_opportunity<R: ReflectionInvitationRepository>(
+    repository: &R,
+    verbatim: &str,
+    working_context: WorkingContext,
+) -> Result<WorkingContext, String> {
+    let message_terms = search_terms(verbatim)
+        .into_iter()
+        .filter(|term| term.chars().count() >= 2)
+        .collect::<std::collections::BTreeSet<_>>();
+    if message_terms.is_empty() {
+        return Ok(working_context);
+    }
+    let mut related = repository
+        .all_reflection_invitations()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(ReflectionInvitation::is_open)
+        .filter(|invitation| reflection_topic_matches(&message_terms, invitation.topic_key()))
+        .collect::<Vec<_>>();
+    related.sort_by(|left, right| {
+        right
+            .importance()
+            .cmp(&left.importance())
+            .then_with(|| {
+                left.created_at()
+                    .as_millis()
+                    .cmp(&right.created_at().as_millis())
+            })
+            .then_with(|| left.id().cmp(&right.id()))
+    });
+    Ok(match related.first() {
+        Some(invitation) => working_context.with_reflection_opportunity(
+            ReflectionOpportunity::RelatedTopic(invitation.topic_key().to_owned()),
+        ),
+        None => working_context,
+    })
+}
+
+fn reflection_topic_matches(
+    message_terms: &std::collections::BTreeSet<String>,
+    topic_key: &str,
+) -> bool {
+    let topic_terms = search_terms(topic_key)
+        .into_iter()
+        .filter(|term| term.chars().count() >= 2)
+        .collect::<Vec<_>>();
+    let required_matches = topic_terms.len().min(2);
+    required_matches > 0
+        && topic_terms
+            .iter()
+            .filter(|term| message_terms.contains(*term))
+            .take(required_matches)
+            .count()
+            == required_matches
 }
 
 fn with_relational_constraints<R: SharedExperienceRepository>(
@@ -667,7 +790,7 @@ fn run_message_with_context<R, T, C>(
     working_context: WorkingContext,
 ) -> Result<ConversationTurnResult, String>
 where
-    R: SharedExperienceRepository + IdentityEvolutionRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository + ReflectionInvitationRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -681,10 +804,97 @@ where
     let person = conversation_turn(core, outcome.person_evidence_id())?;
     let counterpart = conversation_turn(core, outcome.counterpart_evidence_id())?;
     let ceremonies = list_shared_experience_ceremonies_from_core(core)?;
+    let reflection_invitations = list_offered_reflection_invitations_from_core(core)?;
     Ok(ConversationTurnResult {
         person,
         counterpart,
         ceremonies,
+        reflection_invitations,
+    })
+}
+
+fn list_offered_reflection_invitations_from_core<R, T, C>(
+    core: &MemoryCore<R, T, C>,
+) -> Result<Vec<ReflectionInvitationView>, String>
+where
+    R: ReflectionInvitationRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    core.repository()
+        .all_reflection_invitations()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|invitation| invitation.state() == ReflectionInvitationState::Offered)
+        .map(|invitation| reflection_invitation_view(core.repository(), &invitation))
+        .collect()
+}
+
+fn reflection_invitation_view<R: MemoryRepository>(
+    repository: &R,
+    invitation: &ReflectionInvitation,
+) -> Result<ReflectionInvitationView, String> {
+    let evidence = invitation
+        .evidence_refs()
+        .iter()
+        .map(|citation| {
+            let source = repository
+                .evidence(citation.evidence_id())
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "reflection evidence {} is missing",
+                        citation.evidence_id().get()
+                    )
+                })?;
+            if !source.verbatim().contains(citation.quote()) {
+                return Err(format!(
+                    "reflection evidence {} no longer matches its quote",
+                    citation.evidence_id().get()
+                ));
+            }
+            Ok(ReflectionInvitationEvidenceView {
+                evidence_id: source.id().get(),
+                speaker: encode_speaker(source.speaker()),
+                quote: citation.quote().to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(ReflectionInvitationView {
+        id: invitation.id().get(),
+        topic_key: invitation.topic_key().to_owned(),
+        observation: invitation.observation().to_owned(),
+        why_now: invitation.why_now().to_owned(),
+        importance: encode_reflection_importance(invitation.importance()),
+        basis: encode_reflection_basis(invitation.basis()),
+        defer_count: invitation.defer_count(),
+        show_mute_prompt: invitation.mute_prompted() && invitation.defer_count() == 1,
+        evidence,
+    })
+}
+
+fn decide_reflection_invitation_from_core<R, T, C>(
+    core: &mut MemoryCore<R, T, C>,
+    invitation_id: u64,
+    decision: &str,
+) -> Result<ReflectionInvitationDecisionView, String>
+where
+    R: SharedExperienceRepository + IdentityEvolutionRepository + ReflectionInvitationRepository,
+    T: CounterpartRuntime,
+    C: Clock,
+{
+    let decision = match decision {
+        "defer" => ReflectionDecision::Defer,
+        "mute" => ReflectionDecision::Mute,
+        "resolve" => ReflectionDecision::Resolve,
+        _ => return Err("unknown reflection invitation decision".to_owned()),
+    };
+    let receipt = core
+        .decide_reflection_invitation(ReflectionInvitationId::from_raw(invitation_id), decision)
+        .map_err(|error| error.to_string())?;
+    Ok(ReflectionInvitationDecisionView {
+        invitation_id: receipt.id().get(),
+        state: encode_reflection_state(receipt.state()),
     })
 }
 
@@ -815,7 +1025,7 @@ fn withdraw_shared_agreement_as_person_from_core<R, T, C>(
     reason: Option<String>,
 ) -> Result<Option<u64>, String>
 where
-    R: SharedExperienceRepository + IdentityEvolutionRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository + ReflectionInvitationRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -905,7 +1115,7 @@ fn resolve_shared_agreement_from_core<R, T, C>(
     confirm: bool,
 ) -> Result<SharedAgreementResolutionView, String>
 where
-    R: SharedExperienceRepository + IdentityEvolutionRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository + ReflectionInvitationRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -934,7 +1144,7 @@ fn revise_shared_agreement_from_core<R, T, C>(
     supersedes_agreement_ids: Vec<u64>,
 ) -> Result<SharedAgreementRevisionView, String>
 where
-    R: SharedExperienceRepository + IdentityEvolutionRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository + ReflectionInvitationRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -974,7 +1184,7 @@ fn dismiss_shared_experience_ceremony_from_core<R, T, C>(
     claim_id: u64,
 ) -> Result<(), String>
 where
-    R: SharedExperienceRepository + IdentityEvolutionRepository,
+    R: SharedExperienceRepository + IdentityEvolutionRepository + ReflectionInvitationRepository,
     T: CounterpartRuntime,
     C: Clock,
 {
@@ -999,6 +1209,31 @@ const fn encode_agreement_withdrawal_actor(actor: AgreementWithdrawalActor) -> &
     match actor {
         AgreementWithdrawalActor::Person => "person",
         AgreementWithdrawalActor::Counterpart => "counterpart",
+    }
+}
+
+const fn encode_reflection_importance(importance: ReflectionImportance) -> &'static str {
+    match importance {
+        ReflectionImportance::Ordinary => "ordinary",
+        ReflectionImportance::Important => "important",
+        ReflectionImportance::ImmediateSafetyRisk => "immediateSafetyRisk",
+    }
+}
+
+const fn encode_reflection_basis(basis: ReflectionInvitationBasis) -> &'static str {
+    match basis {
+        ReflectionInvitationBasis::ImportantSingleChange => "importantSingleChange",
+        ReflectionInvitationBasis::RepeatedPattern => "repeatedPattern",
+    }
+}
+
+const fn encode_reflection_state(state: ReflectionInvitationState) -> &'static str {
+    match state {
+        ReflectionInvitationState::Pending => "pending",
+        ReflectionInvitationState::Offered => "offered",
+        ReflectionInvitationState::Deferred => "deferred",
+        ReflectionInvitationState::MutedByPerson => "mutedByPerson",
+        ReflectionInvitationState::Resolved => "resolved",
     }
 }
 
@@ -1275,6 +1510,188 @@ mod tests {
         assert_eq!(history[0].name, "岚");
         assert_eq!(history[0].change_reason, "基于初始自述形成");
         assert_eq!(history[0].evidence_ids, [7]);
+    }
+
+    #[test]
+    fn offered_reflection_projection_requires_a_whitelisted_core_decision() {
+        let mut repository = InMemoryRepository::new();
+        let evidence_id = repository.next_evidence_id();
+        repository
+            .append_evidence(ConversationEvidence::restore(
+                evidence_id,
+                SessionId::new(CONTINUOUS_SESSION_ID),
+                Speaker::Person,
+                "最近我第一次把工作节奏提快了。".to_owned(),
+                Timestamp::from_millis(1_000),
+            ))
+            .unwrap();
+        let invitation_id = repository.next_reflection_invitation_id();
+        let pending = ReflectionInvitation::restore(
+            invitation_id,
+            "work-rhythm",
+            "这次工作节奏变化值得一起看。",
+            vec![EvidenceCitation::new(evidence_id, "第一次把工作节奏提快了")],
+            "这是刚发生且有直接依据的重要变化。",
+            ReflectionImportance::Important,
+            ReflectionInvitationBasis::ImportantSingleChange,
+            ReflectionInvitationState::Pending,
+            Timestamp::from_millis(2_000),
+            Timestamp::from_millis(2_000),
+            None,
+            None,
+            0,
+            false,
+        );
+        repository
+            .commit_reflection_invitation(pending.clone())
+            .unwrap();
+        let first_offer =
+            eam_core::offer_reflection_invitation(&pending, Timestamp::from_millis(3_000)).unwrap();
+        repository
+            .transition_reflection_invitation(
+                ReflectionInvitationState::Pending,
+                first_offer.clone(),
+            )
+            .unwrap();
+        let first_defer = eam_core::decide_reflection_invitation(
+            &first_offer,
+            ReflectionDecision::Defer,
+            Timestamp::from_millis(4_000),
+        )
+        .unwrap();
+        repository
+            .transition_reflection_invitation(
+                ReflectionInvitationState::Offered,
+                first_defer.clone(),
+            )
+            .unwrap();
+        let second_offer = eam_core::offer_reflection_invitation(
+            &first_defer,
+            Timestamp::from_millis(4_000 + eam_core::REFLECTION_DEFER_MILLIS),
+        )
+        .unwrap();
+        repository
+            .transition_reflection_invitation(ReflectionInvitationState::Deferred, second_offer)
+            .unwrap();
+        let mut core = MemoryCore::new(
+            repository,
+            ScriptedRuntime::default(),
+            IncrementingClock::new(5_000 + eam_core::REFLECTION_DEFER_MILLIS),
+        );
+
+        let invitations = list_offered_reflection_invitations_from_core(&core).unwrap();
+        assert_eq!(invitations.len(), 1);
+        assert_eq!(invitations[0].observation, "这次工作节奏变化值得一起看。");
+        assert_eq!(invitations[0].evidence[0].evidence_id, evidence_id.get());
+        assert!(invitations[0].show_mute_prompt);
+
+        assert!(
+            decide_reflection_invitation_from_core(&mut core, invitation_id.get(), "delete")
+                .is_err()
+        );
+        assert_eq!(
+            core.repository()
+                .reflection_invitation(invitation_id)
+                .unwrap()
+                .unwrap()
+                .state(),
+            ReflectionInvitationState::Offered
+        );
+
+        let decision =
+            decide_reflection_invitation_from_core(&mut core, invitation_id.get(), "mute").unwrap();
+        assert_eq!(decision.state, "mutedByPerson");
+        assert!(
+            list_offered_reflection_invitations_from_core(&core)
+                .unwrap()
+                .is_empty()
+        );
+        let retained = core
+            .repository()
+            .reflection_invitation(invitation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.observation(), "这次工作节奏变化值得一起看。");
+        assert_eq!(retained.evidence_refs()[0].evidence_id(), evidence_id);
+    }
+
+    #[test]
+    fn person_topic_reentry_reaches_muted_reflection_as_discuss_only() {
+        let mut repository = InMemoryRepository::new();
+        let evidence_id = repository.next_evidence_id();
+        repository
+            .append_evidence(ConversationEvidence::restore(
+                evidence_id,
+                SessionId::new(CONTINUOUS_SESSION_ID),
+                Speaker::Person,
+                "工作节奏最近发生了重要变化。".to_owned(),
+                Timestamp::from_millis(1_000),
+            ))
+            .unwrap();
+        let invitation_id = repository.next_reflection_invitation_id();
+        let pending = ReflectionInvitation::restore(
+            invitation_id,
+            "工作节奏",
+            "这次工作节奏变化值得一起看。",
+            vec![EvidenceCitation::new(
+                evidence_id,
+                "工作节奏最近发生了重要变化",
+            )],
+            "这是一项有直接依据的重要变化。",
+            ReflectionImportance::Important,
+            ReflectionInvitationBasis::ImportantSingleChange,
+            ReflectionInvitationState::Pending,
+            Timestamp::from_millis(2_000),
+            Timestamp::from_millis(2_000),
+            None,
+            None,
+            0,
+            false,
+        );
+        repository
+            .commit_reflection_invitation(pending.clone())
+            .unwrap();
+        let offered =
+            eam_core::offer_reflection_invitation(&pending, Timestamp::from_millis(3_000)).unwrap();
+        repository
+            .transition_reflection_invitation(ReflectionInvitationState::Pending, offered.clone())
+            .unwrap();
+        let muted = eam_core::decide_reflection_invitation(
+            &offered,
+            ReflectionDecision::Mute,
+            Timestamp::from_millis(4_000),
+        )
+        .unwrap();
+        repository
+            .transition_reflection_invitation(ReflectionInvitationState::Offered, muted)
+            .unwrap();
+        let runtime = ScriptedRuntime::new(
+            [PersonTurnClassification::Question],
+            [RuntimeResponse::new(
+                "可以，我们按你现在主动提起的方向继续谈。",
+            )],
+        );
+        let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(5_000));
+
+        let result =
+            send_message_with_core(&mut core, "我想继续聊聊工作节奏。".to_owned()).unwrap();
+
+        assert!(result.reflection_invitations.is_empty());
+        assert_eq!(
+            core.runtime().seen_requests()[0]
+                .reflection()
+                .unwrap()
+                .disposition(),
+            eam_core::ReflectionRuntimeDisposition::DiscussOnly
+        );
+        assert_eq!(
+            core.repository()
+                .reflection_invitation(invitation_id)
+                .unwrap()
+                .unwrap()
+                .state(),
+            ReflectionInvitationState::MutedByPerson
+        );
     }
 
     #[test]

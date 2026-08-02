@@ -9,11 +9,14 @@ use eam_core::{
     ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, ConversationEvidence,
     DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository, ForgetTarget,
     IdentityEvolutionRepository, IdentityProfileSnapshot, IdentityRevisionCommit,
-    IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot, MemoryRepository,
-    RelationalConstraintDeparture, RepositoryError, SessionId, SharedAgreementCandidate,
-    SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedAgreementDecision,
-    SharedAgreementResolution, SharedExperience, SharedExperienceKind, SharedExperienceRepository,
-    Speaker, Timestamp, Uncertainty,
+    IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot,
+    MAX_OPEN_REFLECTION_INVITATIONS, MemoryRepository, ReflectionImportance, ReflectionInvitation,
+    ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationReceipt,
+    ReflectionInvitationRepository, ReflectionInvitationState, RelationalConstraintDeparture,
+    RepositoryError, SessionId, SharedAgreementCandidate, SharedAgreementCandidateId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
+    SharedExperience, SharedExperienceKind, SharedExperienceRepository, Speaker, Timestamp,
+    Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -89,6 +92,7 @@ pub struct VaultRepository {
     next_evidence_id: u64,
     next_claim_id: u64,
     next_shared_agreement_candidate_id: u64,
+    next_reflection_invitation_id: u64,
     next_archive_id: u64,
 }
 
@@ -130,6 +134,7 @@ impl VaultRepository {
         let next_claim_id = next_identifier(&connection, "claims")?;
         let next_shared_agreement_candidate_id =
             next_identifier(&connection, "shared_agreement_candidates")?;
+        let next_reflection_invitation_id = next_identifier(&connection, "reflection_invitations")?;
         let next_archive_id = next_identifier_with_deletion_watermark(
             &connection,
             "archived_evidence",
@@ -145,6 +150,7 @@ impl VaultRepository {
             next_evidence_id,
             next_claim_id,
             next_shared_agreement_candidate_id,
+            next_reflection_invitation_id,
             next_archive_id,
         })
     }
@@ -4730,6 +4736,113 @@ impl IdentityEvolutionRepository for VaultRepository {
     }
 }
 
+impl ReflectionInvitationRepository for VaultRepository {
+    fn next_reflection_invitation_id(&mut self) -> ReflectionInvitationId {
+        let id = ReflectionInvitationId::from_raw(self.next_reflection_invitation_id);
+        self.next_reflection_invitation_id = self
+            .next_reflection_invitation_id
+            .checked_add(1)
+            .expect("reflection invitation identifier space exhausted");
+        id
+    }
+
+    fn commit_reflection_invitation(
+        &mut self,
+        invitation: ReflectionInvitation,
+    ) -> Result<ReflectionInvitationReceipt, RepositoryError> {
+        if invitation.id().get() == 0 || invitation.state() != ReflectionInvitationState::Pending {
+            return Err(RepositoryError::new("invalid new reflection invitation"));
+        }
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        let open_count = transaction
+            .query_row(
+                "SELECT count(*) FROM reflection_invitations WHERE state != 4",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(repository_error)?;
+        if usize::try_from(open_count).map_err(repository_error)? >= MAX_OPEN_REFLECTION_INVITATIONS
+        {
+            return Err(RepositoryError::new(
+                "open reflection invitation budget exceeded",
+            ));
+        }
+        insert_reflection_invitation(&transaction, &invitation)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(ReflectionInvitationReceipt::new(
+            invitation.id(),
+            invitation.state(),
+        ))
+    }
+
+    fn transition_reflection_invitation(
+        &mut self,
+        expected_state: ReflectionInvitationState,
+        invitation: ReflectionInvitation,
+    ) -> Result<ReflectionInvitationReceipt, RepositoryError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        let current = load_reflection_invitation(&transaction, invitation.id())?
+            .ok_or_else(|| RepositoryError::new("reflection invitation does not exist"))?;
+        if current.state() != expected_state
+            || !reflection_immutable_fields_match(&current, &invitation)
+            || !valid_reflection_transition(&current, &invitation)
+        {
+            return Err(RepositoryError::new(
+                "reflection invitation compare-and-swap failed",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE reflection_invitations
+                 SET state = ?1, updated_at = ?2, next_eligible_at = ?3,
+                     last_offered_at = ?4, defer_count = ?5, mute_prompted = ?6
+                 WHERE id = ?7 AND state = ?8",
+                params![
+                    encode_reflection_state(invitation.state()),
+                    invitation.updated_at().as_millis(),
+                    invitation.next_eligible_at().map(Timestamp::as_millis),
+                    invitation.last_offered_at().map(Timestamp::as_millis),
+                    i64::from(invitation.defer_count()),
+                    i64::from(invitation.mute_prompted()),
+                    to_sql_id(invitation.id().get())?,
+                    encode_reflection_state(expected_state),
+                ],
+            )
+            .map_err(repository_error)?;
+        if changed != 1 {
+            return Err(RepositoryError::new(
+                "reflection invitation compare-and-swap failed",
+            ));
+        }
+        transaction.commit().map_err(repository_error)?;
+        Ok(ReflectionInvitationReceipt::new(
+            invitation.id(),
+            invitation.state(),
+        ))
+    }
+
+    fn reflection_invitation(
+        &self,
+        id: ReflectionInvitationId,
+    ) -> Result<Option<ReflectionInvitation>, RepositoryError> {
+        load_reflection_invitation(self.connection(), id)
+    }
+
+    fn all_reflection_invitations(&self) -> Result<Vec<ReflectionInvitation>, RepositoryError> {
+        load_reflection_invitations(self.connection())
+    }
+}
+
 impl SelfBundleRepository for VaultRepository {
     fn append_self_bundle(&mut self, bundle: SelfBundleVersion) -> Result<(), RepositoryError> {
         validate_self_bundle_chain(self.connection(), &bundle)?;
@@ -4982,6 +5095,273 @@ fn identity_runtime_context(
         bundle.version(),
         identity_state_snapshot(identity),
     )
+}
+
+const fn encode_reflection_importance(value: ReflectionImportance) -> i64 {
+    match value {
+        ReflectionImportance::Ordinary => 0,
+        ReflectionImportance::Important => 1,
+        ReflectionImportance::ImmediateSafetyRisk => 2,
+    }
+}
+
+fn decode_reflection_importance(value: i64) -> Result<ReflectionImportance, RepositoryError> {
+    match value {
+        0 => Ok(ReflectionImportance::Ordinary),
+        1 => Ok(ReflectionImportance::Important),
+        2 => Ok(ReflectionImportance::ImmediateSafetyRisk),
+        _ => Err(RepositoryError::new("invalid reflection importance")),
+    }
+}
+
+const fn encode_reflection_basis(value: ReflectionInvitationBasis) -> i64 {
+    match value {
+        ReflectionInvitationBasis::ImportantSingleChange => 0,
+        ReflectionInvitationBasis::RepeatedPattern => 1,
+    }
+}
+
+fn decode_reflection_basis(value: i64) -> Result<ReflectionInvitationBasis, RepositoryError> {
+    match value {
+        0 => Ok(ReflectionInvitationBasis::ImportantSingleChange),
+        1 => Ok(ReflectionInvitationBasis::RepeatedPattern),
+        _ => Err(RepositoryError::new("invalid reflection basis")),
+    }
+}
+
+const fn encode_reflection_state(value: ReflectionInvitationState) -> i64 {
+    match value {
+        ReflectionInvitationState::Pending => 0,
+        ReflectionInvitationState::Offered => 1,
+        ReflectionInvitationState::Deferred => 2,
+        ReflectionInvitationState::MutedByPerson => 3,
+        ReflectionInvitationState::Resolved => 4,
+    }
+}
+
+fn decode_reflection_state(value: i64) -> Result<ReflectionInvitationState, RepositoryError> {
+    match value {
+        0 => Ok(ReflectionInvitationState::Pending),
+        1 => Ok(ReflectionInvitationState::Offered),
+        2 => Ok(ReflectionInvitationState::Deferred),
+        3 => Ok(ReflectionInvitationState::MutedByPerson),
+        4 => Ok(ReflectionInvitationState::Resolved),
+        _ => Err(RepositoryError::new("invalid reflection invitation state")),
+    }
+}
+
+fn reflection_immutable_fields_match(
+    current: &ReflectionInvitation,
+    updated: &ReflectionInvitation,
+) -> bool {
+    current.topic_key() == updated.topic_key()
+        && current.observation() == updated.observation()
+        && current.evidence_refs() == updated.evidence_refs()
+        && current.why_now() == updated.why_now()
+        && current.importance() == updated.importance()
+        && current.basis() == updated.basis()
+        && current.created_at() == updated.created_at()
+}
+
+fn valid_reflection_transition(
+    current: &ReflectionInvitation,
+    updated: &ReflectionInvitation,
+) -> bool {
+    if updated.updated_at().as_millis() < current.updated_at().as_millis() {
+        return false;
+    }
+    match (current.state(), updated.state()) {
+        (
+            ReflectionInvitationState::Pending
+            | ReflectionInvitationState::Deferred
+            | ReflectionInvitationState::MutedByPerson,
+            ReflectionInvitationState::Offered,
+        ) if current.state() != ReflectionInvitationState::MutedByPerson
+            || current.importance() == ReflectionImportance::ImmediateSafetyRisk =>
+        {
+            updated.next_eligible_at().is_none()
+                && updated.last_offered_at() == Some(updated.updated_at())
+                && updated.defer_count() == current.defer_count()
+                && updated.mute_prompted() == (current.mute_prompted() || current.defer_count() > 0)
+        }
+        (ReflectionInvitationState::Offered, ReflectionInvitationState::Deferred) => {
+            updated.next_eligible_at().is_some()
+                && updated.last_offered_at() == current.last_offered_at()
+                && updated.defer_count() == current.defer_count().saturating_add(1)
+                && updated.mute_prompted() == current.mute_prompted()
+        }
+        (
+            ReflectionInvitationState::Offered,
+            ReflectionInvitationState::MutedByPerson | ReflectionInvitationState::Resolved,
+        ) => {
+            updated.next_eligible_at().is_none()
+                && updated.last_offered_at() == current.last_offered_at()
+                && updated.defer_count() == current.defer_count()
+                && updated.mute_prompted() == current.mute_prompted()
+        }
+        _ => false,
+    }
+}
+
+fn insert_reflection_invitation(
+    transaction: &rusqlite::Transaction<'_>,
+    invitation: &ReflectionInvitation,
+) -> Result<(), RepositoryError> {
+    transaction
+        .execute(
+            "INSERT INTO reflection_invitations
+         (id, topic_key, observation, why_now, importance, basis, state,
+          created_at, updated_at, next_eligible_at, last_offered_at,
+          defer_count, mute_prompted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                to_sql_id(invitation.id().get())?,
+                invitation.topic_key(),
+                invitation.observation(),
+                invitation.why_now(),
+                encode_reflection_importance(invitation.importance()),
+                encode_reflection_basis(invitation.basis()),
+                encode_reflection_state(invitation.state()),
+                invitation.created_at().as_millis(),
+                invitation.updated_at().as_millis(),
+                invitation.next_eligible_at().map(Timestamp::as_millis),
+                invitation.last_offered_at().map(Timestamp::as_millis),
+                i64::from(invitation.defer_count()),
+                i64::from(invitation.mute_prompted()),
+            ],
+        )
+        .map_err(repository_error)?;
+    for (ordinal, citation) in invitation.evidence_refs().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO reflection_invitation_evidence
+             (invitation_id, ordinal, evidence_id, quote) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    to_sql_id(invitation.id().get())?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(citation.evidence_id().get())?,
+                    citation.quote(),
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
+}
+
+fn load_reflection_invitations(
+    connection: &Connection,
+) -> Result<Vec<ReflectionInvitation>, RepositoryError> {
+    let ids = {
+        let mut statement = connection
+            .prepare("SELECT id FROM reflection_invitations ORDER BY id")
+            .map_err(repository_error)?;
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(repository_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_error)?
+    };
+    ids.into_iter()
+        .map(|id| {
+            let id = ReflectionInvitationId::from_raw(u64::try_from(id).map_err(repository_error)?);
+            load_reflection_invitation(connection, id)?
+                .ok_or_else(|| RepositoryError::new("persisted reflection invitation is missing"))
+        })
+        .collect()
+}
+
+fn load_reflection_invitation(
+    connection: &Connection,
+    id: ReflectionInvitationId,
+) -> Result<Option<ReflectionInvitation>, RepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT topic_key, observation, why_now, importance, basis, state,
+                    created_at, updated_at, next_eligible_at, last_offered_at,
+                    defer_count, mute_prompted
+             FROM reflection_invitations WHERE id = ?1",
+            [to_sql_id(id.get())?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(repository_error)?;
+    let Some((
+        topic_key,
+        observation,
+        why_now,
+        importance,
+        basis,
+        state,
+        created_at,
+        updated_at,
+        next_eligible_at,
+        last_offered_at,
+        defer_count,
+        mute_prompted,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ReflectionInvitation::restore(
+        id,
+        topic_key,
+        observation,
+        load_reflection_invitation_evidence(connection, id)?,
+        why_now,
+        decode_reflection_importance(importance)?,
+        decode_reflection_basis(basis)?,
+        decode_reflection_state(state)?,
+        Timestamp::from_millis(created_at),
+        Timestamp::from_millis(updated_at),
+        next_eligible_at.map(Timestamp::from_millis),
+        last_offered_at.map(Timestamp::from_millis),
+        u32::try_from(defer_count).map_err(repository_error)?,
+        match mute_prompted {
+            0 => false,
+            1 => true,
+            _ => return Err(RepositoryError::new("invalid reflection mute prompt flag")),
+        },
+    )))
+}
+
+fn load_reflection_invitation_evidence(
+    connection: &Connection,
+    id: ReflectionInvitationId,
+) -> Result<Vec<EvidenceCitation>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT evidence_id, quote FROM reflection_invitation_evidence
+             WHERE invitation_id = ?1 ORDER BY ordinal",
+        )
+        .map_err(repository_error)?;
+    statement
+        .query_map([to_sql_id(id.get())?], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(repository_error)?
+        .map(|stored| {
+            let (evidence_id, quote) = stored.map_err(repository_error)?;
+            Ok(EvidenceCitation::new(
+                EvidenceId::from_raw(u64::try_from(evidence_id).map_err(repository_error)?),
+                quote,
+            ))
+        })
+        .collect()
 }
 
 fn validate_identity_revision_commit(
@@ -8981,6 +9361,7 @@ fn delete_conversation_evidence_closure(
     counts.derived += clear_retrieval_index_counted(transaction)?;
     delete_bundle_and_identity_closure(transaction, &plan, &mut counts)?;
     delete_memory_closure(transaction, &plan, &mut counts)?;
+    delete_reflection_invitation_closure(transaction, &plan, &mut counts)?;
     delete_conversation_claim_closure(transaction, &plan, &mut counts)?;
     counts.authority += transaction.execute(
         "DELETE FROM conversation_evidence WHERE id = ?1",
@@ -9215,6 +9596,35 @@ fn delete_memory_closure(
         &format!(
             "DELETE FROM long_term_memories WHERE {}",
             id_predicate("id", &plan.memory_ids)
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+fn delete_reflection_invitation_closure(
+    transaction: &rusqlite::Transaction<'_>,
+    plan: &ConversationForgetPlan,
+    counts: &mut ForgetClosureCounts,
+) -> Result<(), VaultError> {
+    let invitation_ids = query_u64_ids(
+        transaction,
+        "SELECT invitation_id FROM reflection_invitation_evidence
+         WHERE evidence_id = ?1 ORDER BY invitation_id",
+        plan.evidence_id_sql,
+    )?;
+    if invitation_ids.is_empty() {
+        return Ok(());
+    }
+    let invitation_predicate = id_predicate("invitation_id", &invitation_ids);
+    counts.derived += transaction.execute(
+        &format!("DELETE FROM reflection_invitation_evidence WHERE {invitation_predicate}"),
+        [],
+    )?;
+    counts.derived += transaction.execute(
+        &format!(
+            "DELETE FROM reflection_invitations WHERE {}",
+            id_predicate("id", &invitation_ids)
         ),
         [],
     )?;
@@ -10408,6 +10818,77 @@ mod tests {
                 .unwrap()
                 .candidates()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn reflection_forget_failure_rolls_back_evidence_and_invitation_across_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let key = [0x49; 32];
+        let mut repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        let evidence_id = repository.next_evidence_id();
+        repository
+            .append_evidence(ConversationEvidence::restore(
+                evidence_id,
+                SessionId::new("reflection-forget-interrupted"),
+                Speaker::Person,
+                "工作再次挤压了真实生活。".to_owned(),
+                Timestamp::from_millis(10),
+            ))
+            .unwrap();
+        let invitation = ReflectionInvitation::restore(
+            repository.next_reflection_invitation_id(),
+            "工作挤压生活",
+            "你刚才明确说工作再次挤压了真实生活。",
+            vec![EvidenceCitation::new(
+                evidence_id,
+                "工作再次挤压了真实生活。",
+            )],
+            "这是一项有直接证据的重要变化。",
+            ReflectionImportance::Important,
+            ReflectionInvitationBasis::ImportantSingleChange,
+            ReflectionInvitationState::Pending,
+            Timestamp::from_millis(20),
+            Timestamp::from_millis(20),
+            None,
+            None,
+            0,
+            false,
+        );
+        repository
+            .commit_reflection_invitation(invitation.clone())
+            .unwrap();
+
+        let result = repository.forget_with_hook(
+            ForgetTarget::ConversationEvidence(evidence_id),
+            Timestamp::from_millis(30),
+            |_| Err(VaultError::ForgetInterrupted),
+        );
+
+        assert!(matches!(result, Err(VaultError::ForgetInterrupted)));
+        assert!(repository.deletion_intents().unwrap().is_empty());
+        assert!(
+            MemoryRepository::evidence(&repository, evidence_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            repository.reflection_invitation(invitation.id()).unwrap(),
+            Some(invitation.clone())
+        );
+        repository.close().unwrap();
+
+        let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        assert!(repository.deletion_intents().unwrap().is_empty());
+        assert!(
+            MemoryRepository::evidence(&repository, evidence_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            repository.reflection_invitation(invitation.id()).unwrap(),
+            Some(invitation)
         );
     }
 

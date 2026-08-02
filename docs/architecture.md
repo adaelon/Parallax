@@ -1836,3 +1836,40 @@ Vault current IdentityStateVersion + SelfBundleVersion
 ```
 
 S25 复用 schema v2 的身份版本表和 schema v3 的 Self Bundle 版本表，不引入新迁移；已有外键用于故障注入时证明两条链原子回滚。本人没有身份写入 command 或编辑控件，只能通过进入冻结工作上下文的对话证据影响第二自我。一次响应最多接受一个修订；旧前驱、宪法版本变化、放弃反思使命、冒充本人、空变化、无理由或无可信证据均保持零身份写入。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0002](adr/0002-portable-local-self-bundle.md) 与 [ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)。
+
+### 9.26 S26 可延后反思邀请当前实现边界
+
+```text
+crates/core/src/
+  domain.rs / ports.rs / memory_loop.rs   # G08 状态机、自然时机、提议门禁与本人决定
+  in_memory.rs                            # 虚拟时间调度、唯一议题与遗忘确定性适配器
+crates/vault/src/
+  schema.rs / repository.rs               # schema v22、CAS 转换、重启恢复与遗忘闭包
+crates/vault/tests/
+  reflection_persistence.rs               # 延后重启、议题唯一、事务失败与遗忘验收
+crates/runtime-gateway/src/
+  adapter.rs / transport.rs               # 单邀请最小输入、严格提议白名单与出站审计
+apps/desktop/src-tauri/src/
+  lib.rs / state.rs                       # OFFERED 邀请可信投影与决定白名单
+apps/desktop/src/
+  App.tsx / App.test.tsx                  # 延后、一次性静默提示与完成仪式
+```
+
+```text
+G08 scheduler freezes at most one ReflectionRuntimeContext
+  -> Runtime Gateway serializes invitation + offer | discuss_only disposition
+  -> disclosure records invitation ID and every exact evidence ID
+  -> RuntimeResponse proposes at most one sourced invitation
+  -> Core validates basis, direct quote, why_now, importance and G08 budgets
+  -> unrelated ordinary invitation remains PENDING
+  -> natural opportunity CAS-transitions PENDING | DEFERRED -> OFFERED
+  -> person decision CAS-transitions OFFERED -> DEFERRED | MUTED_BY_PERSON | RESOLVED
+  -> Vault schema v22 preserves schedule state and citation order across restart
+  -> forgetting any supporting ConversationEvidence deletes the derived invitation atomically
+  -> desktop projects only OFFERED invitations with exact evidence quotes
+  -> defer | mute | resolve command returns the explicit decision to Core
+  -> trusted desktop topic overlap freezes RelatedTopic on person re-entry
+  -> muted invitation reaches Runtime as discuss_only and remains MUTED_BY_PERSON
+```
+
+同一 `topic_key` 同时至多存在一个未解决邀请；已解决议题可形成后续新邀请。普通邀请遵守 7 天延后与空闲/定时回顾 24 小时主动频率，静默保留观察和证据；只有 G08 固定即时风险夹具可越过无关任务或静默。桌面只对 `OFFERED` 状态展示仪式：第一次提供延后/完成，延后过一次后的下一次提供额外显示唯一一次静默询问；三个决定都由 Core 校验和持久化。本人消息命中未解决 `topic_key` 的至多两个规范词项时，可信宿主才冻结相关话题机会；静默议题以 `discuss_only` 进入运行时且不恢复主动资格。该实现落实 [ADR-0040](adr/0040-counterpart-uses-deferrable-reflection-invitations.md) 与 [ADR-0041](adr/0041-person-may-mute-proactive-reflection.md)。

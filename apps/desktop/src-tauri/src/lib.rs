@@ -15,8 +15,9 @@ use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
 use state::{
     ActiveSharedAgreementView, ConversationTurnResult, ConversationTurnView, HostStatusView,
-    IdentityStateView, ImportContextFileView, ManagedHost, SharedAgreementResolutionView,
-    SharedAgreementRevisionView, SharedExperienceCeremonyView,
+    IdentityStateView, ImportContextFileView, ManagedHost, ReflectionInvitationDecisionView,
+    ReflectionInvitationView, SharedAgreementResolutionView, SharedAgreementRevisionView,
+    SharedExperienceCeremonyView,
 };
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
@@ -84,10 +85,32 @@ fn list_identity_history(
 }
 
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn list_offered_reflection_invitations(
+    host: tauri::State<'_, ManagedHost>,
+) -> Result<Vec<ReflectionInvitationView>, String> {
+    host.list_offered_reflection_invitations()
+}
+
+#[tauri::command]
 async fn send_message(app: AppHandle, verbatim: String) -> Result<ConversationTurnResult, String> {
     tauri::async_runtime::spawn_blocking(move || app.state::<ManagedHost>().send_message(verbatim))
         .await
         .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn decide_reflection_invitation(
+    app: AppHandle,
+    invitation_id: u64,
+    decision: String,
+) -> Result<ReflectionInvitationDecisionView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>()
+            .decide_reflection_invitation(invitation_id, &decision)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -337,7 +360,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             list_shared_experience_ceremonies,
             list_active_shared_agreements,
             list_identity_history,
+            list_offered_reflection_invitations,
             send_message,
+            decide_reflection_invitation,
             resolve_shared_agreement,
             withdraw_shared_agreement_as_person,
             revise_shared_agreement,

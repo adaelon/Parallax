@@ -143,7 +143,7 @@ fn agreement_candidate_survives_reopen_without_entering_shared_ledger_until_conf
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 21);
+    assert_eq!(repository.schema_version().unwrap(), 22);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].id(), candidate_id);
@@ -248,7 +248,7 @@ fn reasoned_agreement_breach_survives_reopen_and_forgets_with_its_agreement() {
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0xC7; 32])).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 21);
+    assert_eq!(repository.schema_version().unwrap(), 22);
     let experiences = repository.all_shared_experiences().unwrap();
     assert_eq!(experiences.len(), 2);
     let breach = experiences
@@ -293,7 +293,7 @@ fn withdrawal_survives_reopen_preserves_breach_and_forgets_as_one_closure() {
         persist_person_withdrawal_with_breach(vault.path(), reason);
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0x98; 32])).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 21);
+    assert_eq!(repository.schema_version().unwrap(), 22);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     let experiences = repository.all_shared_experiences().unwrap();
     assert_eq!(experiences.len(), 3);
@@ -670,7 +670,7 @@ fn supersession_survives_reopen_preserves_old_breach_and_forgets_as_one_closure(
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0x97; 32])).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 21);
+    assert_eq!(repository.schema_version().unwrap(), 22);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     let replacement = repository
         .shared_agreement_candidate(replacement_candidate_id)

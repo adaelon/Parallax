@@ -4,7 +4,9 @@ use crate::{
     AgreementWithdrawalActor, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId,
     ClaimOwner, ClaimStatus, ConversationEvidence, EvidenceId, ForgetReceipt, ForgetRepository,
     ForgetTarget, IdentityEvolutionRepository, IdentityRevisionCommit, IdentityRevisionReceipt,
-    IdentityRuntimeContext, IdentityStateSnapshot, MemoryRepository, RepositoryError,
+    IdentityRuntimeContext, IdentityStateSnapshot, MAX_OPEN_REFLECTION_INVITATIONS,
+    MemoryRepository, ReflectionInvitation, ReflectionInvitationId, ReflectionInvitationReceipt,
+    ReflectionInvitationRepository, ReflectionInvitationState, RepositoryError,
     SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
     SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
     SharedExperienceRepository, Speaker, Timestamp, agreement_is_active_at,
@@ -21,6 +23,8 @@ pub struct InMemoryRepository {
     shared_experiences: BTreeMap<ClaimId, SharedExperience>,
     identity_context: Option<IdentityRuntimeContext>,
     identity_history: Vec<IdentityStateSnapshot>,
+    next_reflection_invitation_id: u64,
+    reflection_invitations: BTreeMap<ReflectionInvitationId, ReflectionInvitation>,
     deletion_intents: BTreeMap<ForgetTarget, ForgetReceipt>,
     next_deletion_intent_id: u64,
 }
@@ -44,6 +48,8 @@ impl InMemoryRepository {
             shared_experiences: BTreeMap::new(),
             identity_context: None,
             identity_history: Vec::new(),
+            next_reflection_invitation_id: 1,
+            reflection_invitations: BTreeMap::new(),
             deletion_intents: BTreeMap::new(),
             next_deletion_intent_id: 1,
         }
@@ -177,6 +183,117 @@ impl IdentityEvolutionRepository for InMemoryRepository {
 
     fn identity_history(&self) -> Result<Vec<IdentityStateSnapshot>, RepositoryError> {
         Ok(self.identity_history.clone())
+    }
+}
+
+fn validate_reflection_invitation_evidence(
+    evidence: &BTreeMap<EvidenceId, ConversationEvidence>,
+    invitation: &ReflectionInvitation,
+) -> Result<(), RepositoryError> {
+    for citation in invitation.evidence_refs() {
+        let source = evidence
+            .get(&citation.evidence_id())
+            .ok_or_else(|| RepositoryError::new("reflection evidence does not exist"))?;
+        if citation.quote().is_empty() || !source.verbatim().contains(citation.quote()) {
+            return Err(RepositoryError::new(
+                "reflection evidence quote does not match",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reflection_immutable_fields_match(
+    current: &ReflectionInvitation,
+    updated: &ReflectionInvitation,
+) -> bool {
+    current.topic_key() == updated.topic_key()
+        && current.observation() == updated.observation()
+        && current.evidence_refs() == updated.evidence_refs()
+        && current.why_now() == updated.why_now()
+        && current.importance() == updated.importance()
+        && current.basis() == updated.basis()
+        && current.created_at() == updated.created_at()
+}
+
+impl ReflectionInvitationRepository for InMemoryRepository {
+    fn next_reflection_invitation_id(&mut self) -> ReflectionInvitationId {
+        let id = ReflectionInvitationId::from_raw(self.next_reflection_invitation_id);
+        self.next_reflection_invitation_id = self
+            .next_reflection_invitation_id
+            .checked_add(1)
+            .expect("reflection invitation identifier space exhausted");
+        id
+    }
+
+    fn commit_reflection_invitation(
+        &mut self,
+        invitation: ReflectionInvitation,
+    ) -> Result<ReflectionInvitationReceipt, RepositoryError> {
+        if invitation.id().get() == 0
+            || invitation.state() != ReflectionInvitationState::Pending
+            || self.reflection_invitations.contains_key(&invitation.id())
+        {
+            return Err(RepositoryError::new("invalid new reflection invitation"));
+        }
+        validate_reflection_invitation_evidence(&self.evidence, &invitation)?;
+        if self
+            .reflection_invitations
+            .values()
+            .any(|stored| stored.is_open() && stored.topic_key() == invitation.topic_key())
+        {
+            return Err(RepositoryError::new(
+                "reflection topic already has an open invitation",
+            ));
+        }
+        if self
+            .reflection_invitations
+            .values()
+            .filter(|stored| stored.is_open())
+            .count()
+            >= MAX_OPEN_REFLECTION_INVITATIONS
+        {
+            return Err(RepositoryError::new(
+                "open reflection invitation budget exceeded",
+            ));
+        }
+        let receipt = ReflectionInvitationReceipt::new(invitation.id(), invitation.state());
+        self.reflection_invitations
+            .insert(invitation.id(), invitation);
+        Ok(receipt)
+    }
+
+    fn transition_reflection_invitation(
+        &mut self,
+        expected_state: ReflectionInvitationState,
+        invitation: ReflectionInvitation,
+    ) -> Result<ReflectionInvitationReceipt, RepositoryError> {
+        let current = self
+            .reflection_invitations
+            .get(&invitation.id())
+            .ok_or_else(|| RepositoryError::new("reflection invitation does not exist"))?;
+        if current.state() != expected_state
+            || !reflection_immutable_fields_match(current, &invitation)
+        {
+            return Err(RepositoryError::new(
+                "reflection invitation compare-and-swap failed",
+            ));
+        }
+        let receipt = ReflectionInvitationReceipt::new(invitation.id(), invitation.state());
+        self.reflection_invitations
+            .insert(invitation.id(), invitation);
+        Ok(receipt)
+    }
+
+    fn reflection_invitation(
+        &self,
+        id: ReflectionInvitationId,
+    ) -> Result<Option<ReflectionInvitation>, RepositoryError> {
+        Ok(self.reflection_invitations.get(&id).cloned())
+    }
+
+    fn all_reflection_invitations(&self) -> Result<Vec<ReflectionInvitation>, RepositoryError> {
+        Ok(self.reflection_invitations.values().cloned().collect())
     }
 }
 
@@ -769,13 +886,27 @@ impl ForgetRepository for InMemoryRepository {
         for claim_id in &affected_experiences {
             self.shared_experiences.remove(claim_id);
         }
+        let affected_reflections = self
+            .reflection_invitations
+            .values()
+            .filter(|invitation| {
+                invitation
+                    .evidence_refs()
+                    .iter()
+                    .any(|citation| citation.evidence_id() == evidence_id)
+            })
+            .map(ReflectionInvitation::id)
+            .collect::<Vec<_>>();
+        for invitation_id in &affected_reflections {
+            self.reflection_invitations.remove(invitation_id);
+        }
         self.evidence.remove(&evidence_id);
 
         let receipt = ForgetReceipt::new(
             self.next_deletion_intent_id,
             target,
             1 + affected_claims.len(),
-            affected_candidates.len() + affected_experiences.len(),
+            affected_candidates.len() + affected_experiences.len() + affected_reflections.len(),
             0,
         );
         self.next_deletion_intent_id += 1;

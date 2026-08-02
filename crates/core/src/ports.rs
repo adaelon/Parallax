@@ -7,7 +7,8 @@ use std::{
 use crate::{
     Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceCitation, EvidenceId,
     ForgetReceipt, ForgetTarget, IdentityRevisionCommit, IdentityRevisionReceipt,
-    IdentityRuntimeContext, IdentityStateSnapshot, PersonTurnClassification, RuntimeRequest,
+    IdentityRuntimeContext, IdentityStateSnapshot, PersonTurnClassification, ReflectionInvitation,
+    ReflectionInvitationId, ReflectionInvitationReceipt, ReflectionInvitationState, RuntimeRequest,
     RuntimeResponse, SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
     SharedAgreementResolution, SharedExperience, Timestamp,
 };
@@ -199,6 +200,51 @@ pub trait IdentityEvolutionRepository: MemoryRepository {
     ///
     /// Returns an adapter error when any persisted version cannot be decoded.
     fn identity_history(&self) -> Result<Vec<IdentityStateSnapshot>, RepositoryError>;
+}
+
+pub trait ReflectionInvitationRepository: MemoryRepository {
+    fn next_reflection_invitation_id(&mut self) -> ReflectionInvitationId;
+
+    /// Atomically appends one validated pending invitation without replacing
+    /// another open invitation for the same topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without writing when evidence, identity,
+    /// uniqueness, state, or the G08 open-invitation budget is invalid.
+    fn commit_reflection_invitation(
+        &mut self,
+        invitation: ReflectionInvitation,
+    ) -> Result<ReflectionInvitationReceipt, RepositoryError>;
+
+    /// Compare-and-swaps one invitation state while preserving immutable fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error without writing when current state or immutable
+    /// fields differ from the supplied transition.
+    fn transition_reflection_invitation(
+        &mut self,
+        expected_state: ReflectionInvitationState,
+        invitation: ReflectionInvitation,
+    ) -> Result<ReflectionInvitationReceipt, RepositoryError>;
+
+    /// Resolves one current invitation snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when storage cannot be queried.
+    fn reflection_invitation(
+        &self,
+        id: ReflectionInvitationId,
+    ) -> Result<Option<ReflectionInvitation>, RepositoryError>;
+
+    /// Returns every invitation in identifier order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when persisted state cannot be decoded.
+    fn all_reflection_invitations(&self) -> Result<Vec<ReflectionInvitation>, RepositoryError>;
 }
 
 pub trait SharedExperienceRepository: MemoryRepository {

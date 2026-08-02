@@ -1,5 +1,57 @@
 # 代码链路
 
+## 2026-08-02 S26-5 全仓门禁与实现级收口
+
+**触达**:
+- `crates/core/src/memory_loop.rs:immediate_safety_fixture_matches`、`crates/core/tests/reflection_invitations.rs:counterpart_quote_cannot_impersonate_person_immediate_safety_evidence` — 固定即时风险只接受属于本人的精确证据，第二自我同文历史不能越过静默。
+- `apps/desktop/src-tauri/src/state.rs:with_reflection_opportunity/person_topic_reentry_reaches_muted_reflection_as_discuss_only` — 证明本人重提从真实桌面入口进入 `discuss_only`，并保持静默状态。
+- `docs/reflection-scheduling-v1.md`、`docs/architecture.md`、`docs/code-trail.md` — 对齐 G08 证据归属、生产入口和 S26 完整数据流。
+
+**入口**：S26-1～S26-4 的完整实现 diff 经全仓行为测试、静态检查、桌面/前端构建、链接与夹具审计后进入提交。
+**测试**：Rust 全仓 245/245、fmt、Clippy `-D warnings`、桌面 all-targets；React 12/12、TypeScript 与生产构建通过；5 个 Markdown 的 162 个本地链接、JSON 外层/嵌套载荷与 G08 10×9 TSV 通过。
+
+## 2026-08-02 S26-4 桌面延后与静默仪式
+
+**触达**:
+- `apps/desktop/src-tauri/src/state.rs:ReflectionInvitationView/with_reflection_opportunity/list_offered_reflection_invitations_from_core/decide_reflection_invitation_from_core` — 可信识别本人直接重提的议题，只投影 `OFFERED` 邀请及逐字依据，并把延后、静默、完成决定交回 Core。
+- `apps/desktop/src-tauri/src/lib.rs:list_offered_reflection_invitations/decide_reflection_invitation` — 登记两个最小 Tauri 白名单 command，不向 WebView 暴露仓储能力。
+- `apps/desktop/src/App.tsx:decideReflectionInvitation/reflection invitation dialog`、`App.test.tsx:S26 deferrable reflection invitation ceremony` — 展示观察、`why_now`、重要性与证据；第二次提出显示一次静默选择，首次提出不主动询问静默。
+
+**入口**：启动恢复或对话成功后读取所有 `OFFERED` 邀请；本人在仪式中选择稍后、停止主动提起或本次已谈完。
+**测试**：桌面 Rust `offered_reflection_projection_requires_a_whitelisted_core_decision`、`person_topic_reentry_reaches_muted_reflection_as_discuss_only` 覆盖可信投影、未知决定拒绝、静默认知保留与本人重提；React 12/12 与 TypeScript 通过。
+
+## 2026-08-02 S26-3 运行时结构化邀请与出站审计
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:ReflectionRuntimeInput/parse_reflection_invitation_operation/reflection_invitation_operation_schema` — 向模型发送单个已调度邀请及 offer/discuss-only 语义，严格解析有来源的新邀请操作。
+- `crates/runtime-gateway/src/transport.rs:OutboundContextSource::ReflectionInvitation` — 审计外发邀请 ID 与其逐字证据 ID，不暴露仓储能力。
+- `crates/runtime-gateway/tests/fixtures/reflection-invitation-response.json`、`runtime_contract.rs:runtime_receives_one_scheduled_reflection_and_emits_a_strict_sourced_invitation` — 固定已有邀请输入、新邀请输出、schema 白名单与精确 disclosure。
+
+**入口**：`MemoryCore::run_counterpart_turn` 把冻结的 `ReflectionRuntimeContext` 交给统一模型网关；模型只能通过 `propose_reflection_invitation` 提交 Core 再验证的候选。
+**测试**：Runtime contract 19/19、Runtime Gateway 与 Vault Clippy `-D warnings` 通过。
+
+## 2026-08-02 S26-2 schema v22、重启延后与遗忘闭包
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_22` — 新增反思邀请与逐字证据表、状态约束、到期索引及未解决议题部分唯一索引。
+- `crates/vault/src/repository.rs:ReflectionInvitationRepository/load_reflection_invitation/delete_reflection_invitation_closure` — 在 SQLCipher 事务中追加和 CAS 转换邀请，重启恢复完整调度状态，遗忘来源时删除派生邀请。
+- `crates/vault/tests/reflection_persistence.rs`、`repository.rs:reflection_forget_failure_rolls_back_evidence_and_invitation_across_reopen` — 覆盖延后重启、议题唯一、证据外键原子回滚、遗忘闭包与提交前故障全回滚。
+
+**入口**：Core 经 `ReflectionInvitationRepository` 提交或转换已验证邀请；Vault 打开时迁移到 schema v22 并恢复所有未遗忘邀请。
+**测试**：反思持久化 4/4、遗忘故障注入 1/1、Vault 全套 93/93、`cargo check -p vault --lib` 通过。
+
+## 2026-08-02 S26-1 G08 调度契约与反思邀请 Core 状态机
+
+**触达**:
+- `docs/reflection-scheduling-v1.md:G08 Reflection Scheduling Contract v1`、`crates/core/tests/fixtures/g08-reflection-schedule.tsv` — 冻结 7 天延后、24 小时主动频率、单机会一个邀请、32 个未解决预算与固定即时风险边界。
+- `crates/core/src/domain.rs:ReflectionInvitation/reflection_delivery/offer_reflection_invitation/decide_reflection_invitation` — 建模 `PENDING -> OFFERED -> DEFERRED | MUTED_BY_PERSON | RESOLVED`，本人重提只允许讨论，固定即时风险可越过静默。
+- `crates/core/src/ports.rs:ReflectionInvitationRepository`、`in_memory.rs:ReflectionInvitationRepository` — 定义邀请创建、compare-and-swap 转换、认知保留与遗忘闭包。
+- `crates/core/src/memory_loop.rs:run_counterpart_turn/persist_reflection_invitation_proposals/immediate_safety_fixture_matches` — 在冻结自然时机中选择一个邀请，运行时成功后才消费提出机会，并拒绝无来源、模式冒充、重复议题及不属于本人的伪即时风险。
+- `crates/core/tests/reflection_invitations.rs` — 覆盖时间重放、无关任务排队、相关话题提出、重复延后、静默、本人重提、固定安全例外、S27 边界与遗忘。
+
+**入口**：`WorkingContext::with_reflection_opportunity` 冻结当前机会；运行时可提交一个结构化 `ReflectionInvitationProposal`，本人通过 `MemoryCore::decide_reflection_invitation` 延后、静默或完成。
+**测试**：Core 反思邀请 5/5、Core 全套 45/45、`cargo clippy -p core --all-targets -- -D warnings` 通过。
+
 ## 2026-08-02 S25-4 全仓门禁与实现级收口
 
 **触达**:
