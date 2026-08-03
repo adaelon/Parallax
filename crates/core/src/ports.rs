@@ -7,7 +7,8 @@ use std::{
 use crate::{
     Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceCitation, EvidenceId,
     ForgetReceipt, ForgetTarget, IdentityRevisionCommit, IdentityRevisionReceipt,
-    IdentityRuntimeContext, IdentityStateSnapshot, PersonTurnClassification, ReflectionInvitation,
+    IdentityRuntimeContext, IdentityStateSnapshot, PatternMaturityCommitOutcome,
+    PatternMaturityProposal, PersonTurnClassification, ReflectionInvitation,
     ReflectionInvitationId, ReflectionInvitationReceipt, ReflectionInvitationState, RuntimeRequest,
     RuntimeResponse, SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
     SharedAgreementResolution, SharedExperience, Timestamp,
@@ -134,6 +135,25 @@ pub trait MemoryRepository {
     ///
     /// Returns an adapter error when the backing store cannot be queried.
     fn all_claims(&self) -> Result<Vec<Claim>, RepositoryError>;
+
+    /// Passes one runtime-authored maturity proposal to the repository's
+    /// trusted long-term-memory domain adapter.
+    ///
+    /// Repositories without that adapter reject closed by default. A concrete
+    /// adapter must reuse the memory domain's qualification service rather
+    /// than reproduce its eligibility matrix in Core.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error only when trusted persistence fails; domain
+    /// qualification failures are represented by the returned outcome.
+    fn commit_pattern_maturity(
+        &mut self,
+        _proposal: &PatternMaturityProposal,
+        _proposed_at: Timestamp,
+    ) -> Result<PatternMaturityCommitOutcome, RepositoryError> {
+        Ok(PatternMaturityCommitOutcome::QualificationRejected)
+    }
 }
 
 pub trait ClaimCorrectionRepository: MemoryRepository {

@@ -60,9 +60,11 @@ pub enum MemoryStatus {
     Active,
     Provisional,
     ProvisionalPattern,
+    SupportedCounterpartView,
     Disputed,
     Superseded,
     Retracted,
+    Weakened,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -90,6 +92,7 @@ pub enum MemoryDisputeOutcome {
     Retracted,
     Revised,
     Maintained,
+    Weakened,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +155,7 @@ pub enum MemoryDisputeReviewDecision {
     Retract,
     Revise(MemoryProposal),
     Maintain,
+    Weaken,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,6 +184,16 @@ impl MemoryDisputeReview {
             rationale: rationale.into(),
             evidence: Vec::new(),
             decision: MemoryDisputeReviewDecision::Retract,
+        }
+    }
+
+    #[must_use]
+    pub fn weaken(dispute_id: MemoryDisputeId, rationale: impl Into<String>) -> Self {
+        Self {
+            dispute_id,
+            rationale: rationale.into(),
+            evidence: Vec::new(),
+            decision: MemoryDisputeReviewDecision::Weaken,
         }
     }
 
@@ -518,6 +532,7 @@ pub struct MemoryProposal {
     confidence: Option<MemoryConfidence>,
     salience_reason: String,
     basis: Option<MemoryBasis>,
+    pattern_counterexample_review: Option<EvidenceCitation>,
 }
 
 impl MemoryProposal {
@@ -533,6 +548,7 @@ impl MemoryProposal {
             confidence: None,
             salience_reason: String::new(),
             basis: None,
+            pattern_counterexample_review: None,
         }
     }
 
@@ -594,6 +610,12 @@ impl MemoryProposal {
     }
 
     #[must_use]
+    pub fn with_pattern_counterexample_review(mut self, evidence: EvidenceCitation) -> Self {
+        self.pattern_counterexample_review = Some(evidence);
+        self
+    }
+
+    #[must_use]
     pub const fn target(&self) -> MemoryTarget {
         self.target
     }
@@ -637,6 +659,11 @@ impl MemoryProposal {
     pub const fn basis(&self) -> Option<MemoryBasis> {
         self.basis
     }
+
+    #[must_use]
+    pub const fn pattern_counterexample_review(&self) -> Option<&EvidenceCitation> {
+        self.pattern_counterexample_review.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -651,6 +678,7 @@ pub struct ValidatedMemoryProposal {
     salience_reason: String,
     basis: MemoryBasis,
     initial_status: MemoryStatus,
+    pattern_counterexample_review: Option<EvidenceCitation>,
 }
 
 impl ValidatedMemoryProposal {
@@ -666,6 +694,7 @@ impl ValidatedMemoryProposal {
         salience_reason: String,
         basis: MemoryBasis,
         initial_status: MemoryStatus,
+        pattern_counterexample_review: Option<EvidenceCitation>,
     ) -> Self {
         Self {
             target,
@@ -678,6 +707,7 @@ impl ValidatedMemoryProposal {
             salience_reason,
             basis,
             initial_status,
+            pattern_counterexample_review,
         }
     }
 
@@ -730,6 +760,174 @@ impl ValidatedMemoryProposal {
     pub const fn initial_status(&self) -> MemoryStatus {
         self.initial_status
     }
+
+    #[must_use]
+    pub const fn pattern_counterexample_review(&self) -> Option<&EvidenceCitation> {
+        self.pattern_counterexample_review.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedPatternMaturityProposal {
+    memory_id: MemoryId,
+    expected_version: u64,
+    new_support_claim_ids: Vec<ClaimId>,
+    all_source_claim_ids: Vec<ClaimId>,
+    counter_evidence_refs: Vec<EvidenceCitation>,
+    counterexample_review_ref: EvidenceCitation,
+    discussion_evidence_refs: Vec<EvidenceCitation>,
+    rationale: String,
+}
+
+impl ValidatedPatternMaturityProposal {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        memory_id: MemoryId,
+        expected_version: u64,
+        new_support_claim_ids: Vec<ClaimId>,
+        all_source_claim_ids: Vec<ClaimId>,
+        counter_evidence_refs: Vec<EvidenceCitation>,
+        counterexample_review_ref: EvidenceCitation,
+        discussion_evidence_refs: Vec<EvidenceCitation>,
+        rationale: String,
+    ) -> Self {
+        Self {
+            memory_id,
+            expected_version,
+            new_support_claim_ids,
+            all_source_claim_ids,
+            counter_evidence_refs,
+            counterexample_review_ref,
+            discussion_evidence_refs,
+            rationale,
+        }
+    }
+
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn expected_version(&self) -> u64 {
+        self.expected_version
+    }
+
+    #[must_use]
+    pub fn new_support_claim_ids(&self) -> &[ClaimId] {
+        &self.new_support_claim_ids
+    }
+
+    #[must_use]
+    pub fn all_source_claim_ids(&self) -> &[ClaimId] {
+        &self.all_source_claim_ids
+    }
+
+    #[must_use]
+    pub fn counter_evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.counter_evidence_refs
+    }
+
+    #[must_use]
+    pub const fn counterexample_review_ref(&self) -> &EvidenceCitation {
+        &self.counterexample_review_ref
+    }
+
+    #[must_use]
+    pub fn discussion_evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.discussion_evidence_refs
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &str {
+        &self.rationale
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatternMaturityRecord {
+    memory_id: MemoryId,
+    from_version: u64,
+    to_version: u64,
+    new_support_claim_ids: Vec<ClaimId>,
+    counter_evidence_refs: Vec<EvidenceCitation>,
+    counterexample_review_ref: EvidenceCitation,
+    discussion_evidence_refs: Vec<EvidenceCitation>,
+    rationale: String,
+    proposed_at: Timestamp,
+}
+
+impl PatternMaturityRecord {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn restore(
+        memory_id: MemoryId,
+        from_version: u64,
+        to_version: u64,
+        new_support_claim_ids: Vec<ClaimId>,
+        counter_evidence_refs: Vec<EvidenceCitation>,
+        counterexample_review_ref: EvidenceCitation,
+        discussion_evidence_refs: Vec<EvidenceCitation>,
+        rationale: String,
+        proposed_at: Timestamp,
+    ) -> Self {
+        Self {
+            memory_id,
+            from_version,
+            to_version,
+            new_support_claim_ids,
+            counter_evidence_refs,
+            counterexample_review_ref,
+            discussion_evidence_refs,
+            rationale,
+            proposed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn from_version(&self) -> u64 {
+        self.from_version
+    }
+
+    #[must_use]
+    pub const fn to_version(&self) -> u64 {
+        self.to_version
+    }
+
+    #[must_use]
+    pub fn new_support_claim_ids(&self) -> &[ClaimId] {
+        &self.new_support_claim_ids
+    }
+
+    #[must_use]
+    pub fn counter_evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.counter_evidence_refs
+    }
+
+    #[must_use]
+    pub const fn counterexample_review_ref(&self) -> &EvidenceCitation {
+        &self.counterexample_review_ref
+    }
+
+    #[must_use]
+    pub fn discussion_evidence(&self) -> &[EvidenceCitation] {
+        &self.discussion_evidence_refs
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &str {
+        &self.rationale
+    }
+
+    #[must_use]
+    pub const fn proposed_at(&self) -> Timestamp {
+        self.proposed_at
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -747,6 +945,7 @@ pub struct MemoryVersion {
     basis: MemoryBasis,
     status: MemoryStatus,
     formed_at: Timestamp,
+    pattern_counterexample_review: Option<EvidenceCitation>,
 }
 
 impl MemoryVersion {
@@ -766,6 +965,7 @@ impl MemoryVersion {
         basis: MemoryBasis,
         status: MemoryStatus,
         formed_at: Timestamp,
+        pattern_counterexample_review: Option<EvidenceCitation>,
     ) -> Self {
         Self {
             id,
@@ -781,6 +981,7 @@ impl MemoryVersion {
             basis,
             status,
             formed_at,
+            pattern_counterexample_review,
         }
     }
 
@@ -851,5 +1052,10 @@ impl MemoryVersion {
     #[must_use]
     pub const fn formed_at(&self) -> Timestamp {
         self.formed_at
+    }
+
+    #[must_use]
+    pub const fn pattern_counterexample_review(&self) -> Option<&EvidenceCitation> {
+        self.pattern_counterexample_review.as_ref()
     }
 }

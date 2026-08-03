@@ -5,12 +5,12 @@ use eam_core::{
     ConversationEvidence, CounterpartRuntime, DecisionImpact, DisputeState, EvidenceCitation,
     EvidenceId, IdentityPersonRepresentation, IdentityProfileChanges,
     IdentityReflectivePurposeStatus, IdentityRevisionAuthorship, IdentityRevisionProposal,
-    IdentityRuntimeContext, JudgmentProposal, PersonTurnClassification, ReflectionImportance,
-    ReflectionInvitationBasis, ReflectionInvitationProposal, ReflectionInvitationState,
-    ReflectionRuntimeContext, ReflectionRuntimeDisposition, RelationalConstraintDeparture,
-    RelationalConstraintPriority, RetrievedContextItem, RuntimeError, RuntimeRequest,
-    RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate, SharedExperienceKind,
-    SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
+    IdentityRuntimeContext, JudgmentProposal, PatternMaturityProposal, PersonTurnClassification,
+    ReflectionImportance, ReflectionInvitationBasis, ReflectionInvitationProposal,
+    ReflectionInvitationState, ReflectionRuntimeContext, ReflectionRuntimeDisposition,
+    RelationalConstraintDeparture, RelationalConstraintPriority, RetrievedContextItem,
+    RuntimeError, RuntimeRequest, RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate,
+    SharedExperienceKind, SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,6 +57,11 @@ const ORDINARY_RESPONSE_INSTRUCTIONS: &str = concat!(
     "Use propose_reflection_invitation only for one directly supported important change in S26, ",
     "with an exact citation and why_now. Do not claim a repeated pattern. Mark immediate_safety_risk ",
     "only for the fixed exact quote 我现在正打算伤害自己。. ",
+    "Use propose_pattern_maturity only when a known provisional pattern's exact memory ID and ",
+    "version are available and you autonomously choose to form a stable counterpart view. Include ",
+    "new independent support Claim IDs, a fresh exact counterpart counterexample-review citation, ",
+    "exact person and counterpart discussion citations, any counter-evidence considered, and a ",
+    "non-empty rationale. Qualification never auto-upgrades and person discussion is not approval. ",
     "Return only the strict JSON schema."
 );
 const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
@@ -95,6 +100,11 @@ const HIGH_IMPACT_RESPONSE_INSTRUCTIONS: &str = concat!(
     "Use propose_reflection_invitation only for one directly supported important change in S26, ",
     "with an exact citation and why_now. Do not claim a repeated pattern. Mark immediate_safety_risk ",
     "only for the fixed exact quote 我现在正打算伤害自己。. ",
+    "Use propose_pattern_maturity only when a known provisional pattern's exact memory ID and ",
+    "version are available and you autonomously choose to form a stable counterpart view. Include ",
+    "new independent support Claim IDs, a fresh exact counterpart counterexample-review citation, ",
+    "exact person and counterpart discussion citations, any counter-evidence considered, and a ",
+    "non-empty rationale. Qualification never auto-upgrades and person discussion is not approval. ",
     "Return only the strict JSON schema."
 );
 
@@ -1048,6 +1058,17 @@ struct ReflectionInvitationOperation {
 }
 
 #[derive(Deserialize)]
+struct PatternMaturityOperation {
+    memory_id: u64,
+    expected_version: u64,
+    new_support_claim_ids: Vec<u64>,
+    counter_evidence_refs: Vec<WireCitation>,
+    counterexample_review_ref: WireCitation,
+    discussion_evidence_refs: Vec<WireCitation>,
+    rationale: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireReflectionImportance {
     Ordinary,
@@ -1277,6 +1298,10 @@ fn parse_turn_response(body: &str) -> Result<RuntimeResponse, RuntimeError> {
                 response = response
                     .with_reflection_invitation(parse_reflection_invitation_operation(operation)?);
             }
+            "propose_pattern_maturity" => {
+                response =
+                    response.with_pattern_maturity(parse_pattern_maturity_operation(operation)?);
+            }
             _ => response = response.with_unsupported_operation(operation_index, name),
         }
     }
@@ -1380,6 +1405,37 @@ fn parse_reflection_invitation_operation(
     ))
 }
 
+fn parse_pattern_maturity_operation(
+    operation: Value,
+) -> Result<PatternMaturityProposal, RuntimeError> {
+    let proposal: PatternMaturityOperation = serde_json::from_value(operation)
+        .map_err(|error| RuntimeError::invalid_response(error.to_string()))?;
+    Ok(PatternMaturityProposal::new(
+        proposal.memory_id,
+        proposal.expected_version,
+        proposal.rationale,
+    )
+    .with_new_support_claims(
+        proposal
+            .new_support_claim_ids
+            .into_iter()
+            .map(eam_core::ClaimId::from_raw),
+    )
+    .with_counter_evidence_all(
+        proposal
+            .counter_evidence_refs
+            .into_iter()
+            .map(WireCitation::into_domain),
+    )
+    .with_counterexample_review(proposal.counterexample_review_ref.into_domain())
+    .with_discussion_evidence(
+        proposal
+            .discussion_evidence_refs
+            .into_iter()
+            .map(WireCitation::into_domain),
+    ))
+}
+
 fn classification_schema() -> Value {
     json!({
         "type": "object",
@@ -1411,6 +1467,7 @@ fn response_schema() -> Value {
     let agreement_withdrawal_operation = agreement_withdrawal_operation_schema();
     let identity_revision_operation = identity_revision_operation_schema(&citation);
     let reflection_invitation_operation = reflection_invitation_operation_schema(&citation);
+    let pattern_maturity_operation = pattern_maturity_operation_schema(&citation);
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1427,7 +1484,8 @@ fn response_schema() -> Value {
                         relational_constraint_departure_operation,
                         agreement_withdrawal_operation,
                         identity_revision_operation,
-                        reflection_invitation_operation
+                        reflection_invitation_operation,
+                        pattern_maturity_operation
                     ]
                 }
             }
@@ -1711,6 +1769,50 @@ fn reflection_invitation_operation_schema(citation: &Value) -> Value {
             "why_now",
             "importance",
             "basis"
+        ]
+    })
+}
+
+fn pattern_maturity_operation_schema(citation: &Value) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["propose_pattern_maturity"]
+            },
+            "memory_id": { "type": "integer", "minimum": 1 },
+            "expected_version": { "type": "integer", "minimum": 1 },
+            "new_support_claim_ids": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "integer", "minimum": 1 }
+            },
+            "counter_evidence_refs": {
+                "type": "array",
+                "items": citation
+            },
+            "counterexample_review_ref": citation,
+            "discussion_evidence_refs": {
+                "type": "array",
+                "minItems": 2,
+                "items": citation
+            },
+            "rationale": {
+                "type": "string",
+                "minLength": 1
+            }
+        },
+        "required": [
+            "type",
+            "memory_id",
+            "expected_version",
+            "new_support_claim_ids",
+            "counter_evidence_refs",
+            "counterexample_review_ref",
+            "discussion_evidence_refs",
+            "rationale"
         ]
     })
 }

@@ -5,7 +5,8 @@ use eam_core::{Claim, ClaimId, ConversationEvidence, EvidenceId, RepositoryError
 use crate::{
     LongTermMemoryRepository, MemoryDispute, MemoryDisputeId, MemoryDisputeOutcome,
     MemoryDisputeResolution, MemoryDisputeReviewRecord, MemoryId, MemoryStatus, MemoryTarget,
-    MemoryVersion, ValidatedMemoryDispute, ValidatedMemoryDisputeReview, ValidatedMemoryProposal,
+    MemoryVersion, PatternMaturityRecord, ValidatedMemoryDispute, ValidatedMemoryDisputeReview,
+    ValidatedMemoryProposal, ValidatedPatternMaturityProposal,
 };
 
 #[derive(Debug, Default)]
@@ -13,6 +14,7 @@ pub struct InMemoryLongTermMemoryRepository {
     evidence: BTreeMap<EvidenceId, ConversationEvidence>,
     claims: BTreeMap<ClaimId, Claim>,
     memories: BTreeMap<MemoryId, Vec<MemoryVersion>>,
+    maturity_records: BTreeMap<MemoryId, Vec<PatternMaturityRecord>>,
     disputes: BTreeMap<MemoryDisputeId, MemoryDispute>,
     next_memory_id: u64,
     next_dispute_id: u64,
@@ -25,6 +27,7 @@ impl InMemoryLongTermMemoryRepository {
             evidence: BTreeMap::new(),
             claims: BTreeMap::new(),
             memories: BTreeMap::new(),
+            maturity_records: BTreeMap::new(),
             disputes: BTreeMap::new(),
             next_memory_id: 1,
             next_dispute_id: 1,
@@ -124,8 +127,71 @@ impl LongTermMemoryRepository for InMemoryLongTermMemoryRepository {
             proposal.basis(),
             proposal.initial_status(),
             formed_at,
+            proposal.pattern_counterexample_review().cloned(),
         );
         self.memories.entry(id).or_default().push(stored.clone());
+        Ok(stored)
+    }
+
+    fn append_pattern_maturity(
+        &mut self,
+        proposal: ValidatedPatternMaturityProposal,
+        proposed_at: Timestamp,
+    ) -> Result<MemoryVersion, RepositoryError> {
+        let versions = self
+            .memories
+            .get_mut(&proposal.memory_id())
+            .ok_or_else(|| RepositoryError::new("memory does not exist"))?;
+        let current = versions
+            .last_mut()
+            .ok_or_else(|| RepositoryError::new("memory has no versions"))?;
+        if current.version() != proposal.expected_version() {
+            return Err(RepositoryError::new("stale memory version"));
+        }
+        if current.status() != MemoryStatus::ProvisionalPattern
+            || current.basis() != crate::MemoryBasis::PatternCandidate
+        {
+            return Err(RepositoryError::new(
+                "only a provisional pattern can mature",
+            ));
+        }
+        let previous = current.clone();
+        let next_version = current
+            .version()
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::new("memory version space exhausted"))?;
+        current.set_status(MemoryStatus::Superseded);
+        let stored = MemoryVersion::restore(
+            previous.id(),
+            next_version,
+            Some(previous.version()),
+            previous.statement().to_owned(),
+            previous.subject(),
+            previous.kind(),
+            proposal.all_source_claim_ids().to_vec(),
+            previous.applicable_time(),
+            previous.confidence(),
+            previous.salience_reason().to_owned(),
+            previous.basis(),
+            MemoryStatus::SupportedCounterpartView,
+            proposed_at,
+            Some(proposal.counterexample_review_ref().clone()),
+        );
+        versions.push(stored.clone());
+        self.maturity_records
+            .entry(previous.id())
+            .or_default()
+            .push(PatternMaturityRecord::restore(
+                previous.id(),
+                previous.version(),
+                next_version,
+                proposal.new_support_claim_ids().to_vec(),
+                proposal.counter_evidence_refs().to_vec(),
+                proposal.counterexample_review_ref().clone(),
+                proposal.discussion_evidence_refs().to_vec(),
+                proposal.rationale().to_owned(),
+                proposed_at,
+            ));
         Ok(stored)
     }
 
@@ -139,6 +205,13 @@ impl LongTermMemoryRepository for InMemoryLongTermMemoryRepository {
 
     fn memory_versions(&self, id: MemoryId) -> Result<Vec<MemoryVersion>, RepositoryError> {
         Ok(self.memories.get(&id).cloned().unwrap_or_default())
+    }
+
+    fn pattern_maturity_records(
+        &self,
+        id: MemoryId,
+    ) -> Result<Vec<PatternMaturityRecord>, RepositoryError> {
+        Ok(self.maturity_records.get(&id).cloned().unwrap_or_default())
     }
 
     fn all_memory_versions(&self) -> Result<Vec<MemoryVersion>, RepositoryError> {
@@ -243,6 +316,10 @@ impl LongTermMemoryRepository for InMemoryLongTermMemoryRepository {
                 current.set_status(MemoryStatus::Retracted);
                 (current.clone(), None)
             }
+            MemoryDisputeOutcome::Weakened => {
+                current.set_status(MemoryStatus::Weakened);
+                (current.clone(), None)
+            }
             MemoryDisputeOutcome::Revised => {
                 let proposal = review
                     .revision()
@@ -276,6 +353,7 @@ impl LongTermMemoryRepository for InMemoryLongTermMemoryRepository {
                     proposal.basis(),
                     proposal.initial_status(),
                     reviewed_at,
+                    proposal.pattern_counterexample_review().cloned(),
                 );
                 versions.push(stored.clone());
                 (stored, Some(next_version))

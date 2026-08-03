@@ -1,6 +1,15 @@
+fn conversation(id: u64, speaker: Speaker, text: &str) -> ConversationEvidence {
+    ConversationEvidence::restore(
+        EvidenceId::from_raw(id),
+        SessionId::new("memory-proposal-test"),
+        speaker,
+        text.to_owned(),
+        Timestamp::from_millis(i64::try_from(id).unwrap() * 10),
+    )
+}
 use eam_core::{
-    ApplicableTime, Claim, ClaimId, ClaimOwner, ClaimStatus, EvidenceCitation, EvidenceId,
-    IncrementingClock, Timestamp, Uncertainty,
+    ApplicableTime, Claim, ClaimId, ClaimOwner, ClaimStatus, ConversationEvidence,
+    EvidenceCitation, EvidenceId, IncrementingClock, SessionId, Speaker, Timestamp, Uncertainty,
 };
 use eam_memory::{
     InMemoryLongTermMemoryRepository, LongTermMemoryRepository, MemoryBasis, MemoryConfidence,
@@ -10,46 +19,7 @@ use eam_memory::{
 
 #[test]
 fn explicit_direct_and_inferential_proposals_choose_bounded_initial_statuses() {
-    let person_claim = claim(
-        1,
-        ClaimOwner::Person,
-        "I live in Shenzhen",
-        None,
-        ApplicableTime::Since(Timestamp::from_millis(10)),
-    );
-    let counterpart_claim = claim(
-        2,
-        ClaimOwner::Counterpart,
-        "Their planning rhythm appears steadier",
-        Some(Uncertainty::Medium),
-        ApplicableTime::Since(Timestamp::from_millis(20)),
-    );
-    let repository = InMemoryLongTermMemoryRepository::with_claims([
-        person_claim,
-        counterpart_claim,
-        claim(
-            3,
-            ClaimOwner::Counterpart,
-            "Planning review one",
-            Some(Uncertainty::Low),
-            ApplicableTime::At(Timestamp::from_millis(30)),
-        ),
-        claim(
-            4,
-            ClaimOwner::Counterpart,
-            "Planning review two",
-            Some(Uncertainty::Low),
-            ApplicableTime::At(Timestamp::from_millis(40)),
-        ),
-        claim(
-            5,
-            ClaimOwner::Counterpart,
-            "Planning review three",
-            Some(Uncertainty::Low),
-            ApplicableTime::At(Timestamp::from_millis(50)),
-        ),
-    ])
-    .unwrap();
+    let repository = proposal_fixture_repository();
     let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(1_000));
 
     let active = maintenance
@@ -97,10 +67,65 @@ fn explicit_direct_and_inferential_proposals_choose_bounded_initial_statuses() {
                 .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(30)))
                 .with_confidence(MemoryConfidence::High)
                 .with_salience_reason("Worth retaining for later pattern qualification")
-                .with_basis(MemoryBasis::PatternCandidate),
+                .with_basis(MemoryBasis::PatternCandidate)
+                .with_pattern_counterexample_review(EvidenceCitation::new(
+                    EvidenceId::from_raw(6),
+                    "I checked these three planning reviews for counterexamples",
+                )),
         )
         .unwrap();
     assert_eq!(pattern.status(), MemoryStatus::ProvisionalPattern);
+}
+
+fn proposal_fixture_repository() -> InMemoryLongTermMemoryRepository {
+    let evidence = [
+        conversation(3, Speaker::Person, "Planning review one"),
+        conversation(4, Speaker::Person, "Planning review two"),
+        conversation(5, Speaker::Person, "Planning review three"),
+        conversation(
+            6,
+            Speaker::Counterpart,
+            "I checked these three planning reviews for counterexamples",
+        ),
+    ];
+    let claims = [
+        claim(
+            1,
+            ClaimOwner::Person,
+            "I live in Shenzhen",
+            None,
+            ApplicableTime::Since(Timestamp::from_millis(10)),
+        ),
+        claim(
+            2,
+            ClaimOwner::Counterpart,
+            "Their planning rhythm appears steadier",
+            Some(Uncertainty::Medium),
+            ApplicableTime::Since(Timestamp::from_millis(20)),
+        ),
+        claim(
+            3,
+            ClaimOwner::Counterpart,
+            "Planning review one",
+            Some(Uncertainty::Low),
+            ApplicableTime::At(Timestamp::from_millis(30)),
+        ),
+        claim(
+            4,
+            ClaimOwner::Counterpart,
+            "Planning review two",
+            Some(Uncertainty::Low),
+            ApplicableTime::At(Timestamp::from_millis(40)),
+        ),
+        claim(
+            5,
+            ClaimOwner::Counterpart,
+            "Planning review three",
+            Some(Uncertainty::Low),
+            ApplicableTime::At(Timestamp::from_millis(50)),
+        ),
+    ];
+    InMemoryLongTermMemoryRepository::with_evidence_and_claims(evidence, claims).unwrap()
 }
 
 #[test]

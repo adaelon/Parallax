@@ -1,5 +1,46 @@
 # 代码链路
 
+## 2026-08-02 S27-4 全仓门禁与实现级收口
+
+**触达**:
+- `crates/memory/src/service.rs:validate_maturity_target/validate_maturity_new_support/validate_maturity_counter_evidence/validate_maturity_review/validate_maturity_discussion` — 按资格阶段拆开唯一校验矩阵，保持原拒绝顺序并满足 Clippy 结构门禁。
+- `crates/core/src/memory_loop.rs:validate_response_citations`、`crates/vault/src/repository.rs:validate_dispute_revision_link` — 提取既有纯校验步骤，使 S27 接线后继续满足 100 行函数上限。
+- `docs/architecture.md:§5.4/§5.6/§9.27`、`docs/code-trail.md:S27-1～S27-4` — 对齐模式形成、成熟、运行时提交、反例修正与遗忘全链路。
+
+**入口**：S27-1～S27-3 的完整实现 diff 经全仓行为测试、静态检查、桌面/前端构建、链接与结构化夹具审计后进入提交。
+**测试**：Rust 全仓 257/257、fmt、Clippy `-D warnings`、桌面 all-targets；Runtime contract 23/23、React 12/12、TypeScript 与生产构建通过；2 个变更 Markdown 的 110 个本地文件链接及 5 个成熟 JSON 外层/嵌套载荷通过。
+
+## 2026-08-02 S27-3 Runtime 成熟提议与真实提交
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:PatternMaturityOperation/parse_pattern_maturity_operation/pattern_maturity_operation_schema` — 将完整 `propose_pattern_maturity` 加入严格结构化白名单，保留未知操作拒绝。
+- `crates/core/src/domain.rs:PatternMaturityReceipt/PatternMaturityWriteRejection/TurnOutcome`、`ports.rs:MemoryRepository::commit_pattern_maturity`、`memory_loop.rs:persist_pattern_maturity_proposals` — 每轮至多提交一个提议，显式返回成功或资格/重复拒绝。
+- `crates/memory/src/service.rs:commit_pattern_maturity`、`crates/vault/src/repository.rs:MemoryRepository::commit_pattern_maturity` — 生产 Vault 适配器复用唯一 Memory 资格矩阵并提交 schema v23 后继版本，Core 不反向依赖 Memory。
+- `crates/runtime-gateway/tests/runtime_contract.rs`、`tests/fixtures/pattern-maturity-*.json` — 覆盖严格缺字段、未知记忆、双方讨论不合格、重复操作和成功写入。
+
+**入口**：`MemoryCore::run_counterpart_turn` 解析 Runtime 白名单操作后，经可信 Vault 适配器交给 `eam_memory::commit_pattern_maturity`；没有长期记忆适配器的 Core 仓储默认关闭该写入。
+**测试**：Runtime contract 23/23；成功路径写 `SUPPORTED_COUNTERPART_VIEW` 版本 2 与一条完整成熟记录，未知/不合格保持 `PROVISIONAL_PATTERN`，重复不产生第三版本。
+
+## 2026-08-02 S27-2 schema v23、成熟记录与遗忘闭包
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_23` — 扩展记忆/争议状态约束，新增初始反例复查、成熟记录、新增支持与分类证据表及来源索引。
+- `crates/vault/src/repository.rs:append_pattern_maturity_with_hook/validate_persisted_pattern_maturity/load_pattern_maturity_records` — 事务内重检资格，原子写旧版本取代、稳定看法后继和完整有序提议记录，并在重启时恢复。
+- `crates/vault/src/repository.rs:conversation_forget_plan/delete_conversation_memory_closure`、`tests/memory_persistence.rs:pattern_maturity_survives_reopen_with_complete_qualification_evidence` — 把初始/再次复查和讨论证据纳入 S19 删除闭包。
+
+**入口**：Memory 领域校验后的 `ValidatedPatternMaturityProposal` 交给 `LongTermMemoryRepository::append_pattern_maturity`；遗忘任一资格证据从同一 SQLCipher 事务删除完整派生记忆。
+**测试**：schema v23 中断恢复、成熟提交前故障回滚、完整记录重启恢复、`SUPPORTED_COUNTERPART_VIEW -> DISPUTED -> WEAKENED` 与遗忘后重启不可见均通过；Vault 全套 93/93。
+
+## 2026-08-02 S27-1 模式门槛与成熟资格状态机
+
+**触达**:
+- `crates/memory/src/domain.rs:MemoryStatus/PatternMaturityRecord/ValidatedPatternMaturityProposal` — 增加 `SUPPORTED_COUNTERPART_VIEW`、`WEAKENED`、成熟记录与显式后继版本结构。
+- `crates/memory/src/service.rs:validate_initial_pattern/validate_pattern_maturity` — 初始模式要求三个跨时间独立事件和第二自我反例复查；成熟要求新增独立支持、再次复查、双方讨论、精确引用与当前版本。
+- `crates/memory/tests/pattern_maturity.rs` — 固定二事件、同源重复、缺复查、资格满足但未提议、逐项资格拒绝、成功成熟与强反例削弱矩阵。
+
+**入口**：`MemoryMaintenance::propose` 只创建 `PROVISIONAL_PATTERN`；只有第二自我显式调用 `MemoryMaintenance::mature_pattern` 才尝试稳定看法后继。
+**测试**：模式成熟领域测试 5/5；资格输入本身不改变状态，合法提议始终保留第二自我记忆归属。
+
 ## 2026-08-02 S26-5 全仓门禁与实现级收口
 
 **触达**:

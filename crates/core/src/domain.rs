@@ -3190,6 +3190,182 @@ impl IdentityRevisionReceipt {
     }
 }
 
+/// A counterpart-authored request to mature one provisional pattern.
+///
+/// This transport value deliberately carries only references and the
+/// counterpart's rationale. The memory domain resolves those references and
+/// decides whether the structural maturity prerequisites are present; it does
+/// not judge whether the interpretation is true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatternMaturityProposal {
+    memory_id: u64,
+    expected_version: u64,
+    new_support_claim_ids: Vec<ClaimId>,
+    counter_evidence_refs: Vec<EvidenceCitation>,
+    counterexample_review_ref: Option<EvidenceCitation>,
+    discussion_evidence_refs: Vec<EvidenceCitation>,
+    rationale: String,
+}
+
+impl PatternMaturityProposal {
+    #[must_use]
+    pub fn new(memory_id: u64, expected_version: u64, rationale: impl Into<String>) -> Self {
+        Self {
+            memory_id,
+            expected_version,
+            new_support_claim_ids: Vec::new(),
+            counter_evidence_refs: Vec::new(),
+            counterexample_review_ref: None,
+            discussion_evidence_refs: Vec::new(),
+            rationale: rationale.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_new_support_claim(mut self, claim_id: ClaimId) -> Self {
+        self.new_support_claim_ids.push(claim_id);
+        self
+    }
+
+    #[must_use]
+    pub fn with_new_support_claims(mut self, claim_ids: impl IntoIterator<Item = ClaimId>) -> Self {
+        self.new_support_claim_ids.extend(claim_ids);
+        self
+    }
+
+    #[must_use]
+    pub fn with_counter_evidence(mut self, evidence: EvidenceCitation) -> Self {
+        self.counter_evidence_refs.push(evidence);
+        self
+    }
+
+    #[must_use]
+    pub fn with_counter_evidence_all(
+        mut self,
+        evidence: impl IntoIterator<Item = EvidenceCitation>,
+    ) -> Self {
+        self.counter_evidence_refs.extend(evidence);
+        self
+    }
+
+    #[must_use]
+    pub fn with_counterexample_review(mut self, evidence: EvidenceCitation) -> Self {
+        self.counterexample_review_ref = Some(evidence);
+        self
+    }
+
+    #[must_use]
+    pub fn with_discussion_evidence(
+        mut self,
+        evidence: impl IntoIterator<Item = EvidenceCitation>,
+    ) -> Self {
+        self.discussion_evidence_refs.extend(evidence);
+        self
+    }
+
+    #[must_use]
+    pub const fn memory_id(&self) -> u64 {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn expected_version(&self) -> u64 {
+        self.expected_version
+    }
+
+    #[must_use]
+    pub fn new_support_claim_ids(&self) -> &[ClaimId] {
+        &self.new_support_claim_ids
+    }
+
+    #[must_use]
+    pub fn counter_evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.counter_evidence_refs
+    }
+
+    #[must_use]
+    pub const fn counterexample_review_ref(&self) -> Option<&EvidenceCitation> {
+        self.counterexample_review_ref.as_ref()
+    }
+
+    #[must_use]
+    pub fn discussion_evidence_refs(&self) -> &[EvidenceCitation] {
+        &self.discussion_evidence_refs
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &str {
+        &self.rationale
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatternMaturityReceipt {
+    memory_id: u64,
+    memory_version: u64,
+}
+
+impl PatternMaturityReceipt {
+    #[must_use]
+    pub const fn new(memory_id: u64, memory_version: u64) -> Self {
+        Self {
+            memory_id,
+            memory_version,
+        }
+    }
+
+    #[must_use]
+    pub const fn memory_id(self) -> u64 {
+        self.memory_id
+    }
+
+    #[must_use]
+    pub const fn memory_version(self) -> u64 {
+        self.memory_version
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternMaturityCommitOutcome {
+    Accepted(PatternMaturityReceipt),
+    QualificationRejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternMaturityWriteRejectionReason {
+    DuplicateProposal,
+    QualificationRejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatternMaturityWriteRejection {
+    proposal_index: usize,
+    reason: PatternMaturityWriteRejectionReason,
+}
+
+impl PatternMaturityWriteRejection {
+    #[must_use]
+    pub(crate) const fn new(
+        proposal_index: usize,
+        reason: PatternMaturityWriteRejectionReason,
+    ) -> Self {
+        Self {
+            proposal_index,
+            reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn proposal_index(self) -> usize {
+        self.proposal_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &PatternMaturityWriteRejectionReason {
+        &self.reason
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeResponse {
     text: String,
@@ -3201,6 +3377,7 @@ pub struct RuntimeResponse {
     agreement_withdrawals: Vec<AgreementWithdrawalProposal>,
     identity_revision_proposals: Vec<IdentityRevisionProposal>,
     reflection_invitation_proposals: Vec<ReflectionInvitationProposal>,
+    pattern_maturity_proposals: Vec<PatternMaturityProposal>,
     unsupported_operations: Vec<UnsupportedStructuredOperation>,
 }
 
@@ -3217,6 +3394,7 @@ impl RuntimeResponse {
             agreement_withdrawals: Vec::new(),
             identity_revision_proposals: Vec::new(),
             reflection_invitation_proposals: Vec::new(),
+            pattern_maturity_proposals: Vec::new(),
             unsupported_operations: Vec::new(),
         }
     }
@@ -3269,6 +3447,12 @@ impl RuntimeResponse {
     #[must_use]
     pub fn with_reflection_invitation(mut self, proposal: ReflectionInvitationProposal) -> Self {
         self.reflection_invitation_proposals.push(proposal);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pattern_maturity(mut self, proposal: PatternMaturityProposal) -> Self {
+        self.pattern_maturity_proposals.push(proposal);
         self
     }
 
@@ -3326,6 +3510,11 @@ impl RuntimeResponse {
     #[must_use]
     pub fn reflection_invitation_proposals(&self) -> &[ReflectionInvitationProposal] {
         &self.reflection_invitation_proposals
+    }
+
+    #[must_use]
+    pub fn pattern_maturity_proposals(&self) -> &[PatternMaturityProposal] {
+        &self.pattern_maturity_proposals
     }
 
     #[must_use]
@@ -3663,6 +3852,8 @@ pub struct TurnOutcome {
     accepted_reflection_invitations: Vec<ReflectionInvitationReceipt>,
     rejected_reflection_invitations: Vec<ReflectionInvitationRejection>,
     offered_reflection_invitation_id: Option<ReflectionInvitationId>,
+    accepted_pattern_maturities: Vec<PatternMaturityReceipt>,
+    rejected_pattern_maturities: Vec<PatternMaturityWriteRejection>,
     rejected_operations: Vec<StructuredOperationRejection>,
     validated_citations: Vec<EvidenceCitation>,
 }
@@ -3694,6 +3885,8 @@ impl TurnOutcome {
             accepted_reflection_invitations: Vec::new(),
             rejected_reflection_invitations: Vec::new(),
             offered_reflection_invitation_id: None,
+            accepted_pattern_maturities: Vec::new(),
+            rejected_pattern_maturities: Vec::new(),
             rejected_operations: Vec::new(),
             validated_citations,
         }
@@ -3770,6 +3963,16 @@ impl TurnOutcome {
         self.accepted_reflection_invitations = accepted;
         self.rejected_reflection_invitations = rejected;
         self.offered_reflection_invitation_id = offered;
+        self
+    }
+
+    pub(crate) fn with_pattern_maturities(
+        mut self,
+        accepted: Vec<PatternMaturityReceipt>,
+        rejected: Vec<PatternMaturityWriteRejection>,
+    ) -> Self {
+        self.accepted_pattern_maturities = accepted;
+        self.rejected_pattern_maturities = rejected;
         self
     }
 
@@ -3874,6 +4077,16 @@ impl TurnOutcome {
     #[must_use]
     pub const fn offered_reflection_invitation_id(&self) -> Option<ReflectionInvitationId> {
         self.offered_reflection_invitation_id
+    }
+
+    #[must_use]
+    pub fn accepted_pattern_maturities(&self) -> &[PatternMaturityReceipt] {
+        &self.accepted_pattern_maturities
+    }
+
+    #[must_use]
+    pub fn rejected_pattern_maturities(&self) -> &[PatternMaturityWriteRejection] {
+        &self.rejected_pattern_maturities
     }
 
     #[must_use]

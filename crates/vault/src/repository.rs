@@ -10,7 +10,8 @@ use eam_core::{
     DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository, ForgetTarget,
     IdentityEvolutionRepository, IdentityProfileSnapshot, IdentityRevisionCommit,
     IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot,
-    MAX_OPEN_REFLECTION_INVITATIONS, MemoryRepository, ReflectionImportance, ReflectionInvitation,
+    MAX_OPEN_REFLECTION_INVITATIONS, MemoryRepository, PatternMaturityCommitOutcome,
+    PatternMaturityProposal, PatternMaturityReceipt, ReflectionImportance, ReflectionInvitation,
     ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationReceipt,
     ReflectionInvitationRepository, ReflectionInvitationState, RelationalConstraintDeparture,
     RepositoryError, SessionId, SharedAgreementCandidate, SharedAgreementCandidateId,
@@ -42,9 +43,10 @@ use eam_markdown::{MarkdownBlockKind, MarkdownRelationKind, ParseResource, Parse
 use eam_memory::{
     LongTermMemoryRepository, MAX_DISPUTE_EVIDENCE, MAX_MEMORY_SOURCES, MemoryBasis,
     MemoryConfidence, MemoryDispute, MemoryDisputeId, MemoryDisputeOutcome,
-    MemoryDisputeResolution, MemoryDisputeReviewRecord, MemoryId, MemoryKind, MemoryStatus,
-    MemorySubject, MemoryTarget, MemoryVersion, ValidatedMemoryDispute,
-    ValidatedMemoryDisputeReview, ValidatedMemoryProposal,
+    MemoryDisputeResolution, MemoryDisputeReviewRecord, MemoryError, MemoryId, MemoryKind,
+    MemoryStatus, MemorySubject, MemoryTarget, MemoryVersion, PatternMaturityRecord,
+    ValidatedMemoryDispute, ValidatedMemoryDisputeReview, ValidatedMemoryProposal,
+    ValidatedPatternMaturityProposal, commit_pattern_maturity as commit_pattern_maturity_domain,
 };
 use eam_retrieval::{
     AuthoritativeCandidate, AuthoritativeEvidence, CandidateRef, DisputedMemoryRecall,
@@ -560,6 +562,58 @@ impl VaultRepository {
         self.connection
             .as_ref()
             .expect("an open vault always owns a database connection")
+    }
+
+    fn append_pattern_maturity_with_hook<F>(
+        &mut self,
+        proposal: &ValidatedPatternMaturityProposal,
+        proposed_at: Timestamp,
+        before_commit: F,
+    ) -> Result<MemoryVersion, RepositoryError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), RepositoryError>,
+    {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        let current = load_current_memory(&transaction, proposal.memory_id())?
+            .ok_or_else(|| RepositoryError::new("memory does not exist"))?;
+        if current.version() != proposal.expected_version() {
+            return Err(RepositoryError::new("stale memory version"));
+        }
+        if current.status() != MemoryStatus::ProvisionalPattern
+            || current.basis() != MemoryBasis::PatternCandidate
+        {
+            return Err(RepositoryError::new(
+                "only a provisional pattern can mature",
+            ));
+        }
+        validate_persisted_pattern_maturity(&transaction, &current, proposal)?;
+        let next_version = current
+            .version()
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::new("memory version space exhausted"))?;
+        insert_memory_state_event(
+            &transaction,
+            current.id(),
+            current.version(),
+            MemoryStatus::Superseded,
+            proposed_at,
+        )?;
+        insert_matured_pattern_version(
+            &transaction,
+            &current,
+            next_version,
+            proposal,
+            proposed_at,
+        )?;
+        insert_pattern_maturity_record(&transaction, proposal, next_version, proposed_at)?;
+        before_commit(&transaction)?;
+        transaction.commit().map_err(repository_error)?;
+        load_memory_version(self.connection(), current.id(), next_version)
     }
 
     fn archive_with_hook<F>(
@@ -1600,7 +1654,16 @@ impl LongTermMemoryRepository for VaultRepository {
             proposal.basis(),
             proposal.initial_status(),
             formed_at,
+            proposal.pattern_counterexample_review().cloned(),
         ))
+    }
+
+    fn append_pattern_maturity(
+        &mut self,
+        proposal: ValidatedPatternMaturityProposal,
+        proposed_at: Timestamp,
+    ) -> Result<MemoryVersion, RepositoryError> {
+        self.append_pattern_maturity_with_hook(&proposal, proposed_at, |_| Ok(()))
     }
 
     fn current_memory(&self, id: MemoryId) -> Result<Option<MemoryVersion>, RepositoryError> {
@@ -1609,6 +1672,13 @@ impl LongTermMemoryRepository for VaultRepository {
 
     fn memory_versions(&self, id: MemoryId) -> Result<Vec<MemoryVersion>, RepositoryError> {
         load_memory_versions(self.connection(), Some(id))
+    }
+
+    fn pattern_maturity_records(
+        &self,
+        id: MemoryId,
+    ) -> Result<Vec<PatternMaturityRecord>, RepositoryError> {
+        load_pattern_maturity_records(self.connection(), id)
     }
 
     fn all_memory_versions(&self) -> Result<Vec<MemoryVersion>, RepositoryError> {
@@ -1638,7 +1708,11 @@ impl LongTermMemoryRepository for VaultRepository {
         }
         if !matches!(
             current.status(),
-            MemoryStatus::Active | MemoryStatus::Provisional | MemoryStatus::ProvisionalPattern
+            MemoryStatus::Active
+                | MemoryStatus::Provisional
+                | MemoryStatus::ProvisionalPattern
+                | MemoryStatus::SupportedCounterpartView
+                | MemoryStatus::Weakened
         ) {
             return Err(RepositoryError::new("memory is not disputable"));
         }
@@ -1732,6 +1806,16 @@ impl LongTermMemoryRepository for VaultRepository {
                     current.id(),
                     current.version(),
                     MemoryStatus::Retracted,
+                    reviewed_at,
+                )?;
+                None
+            }
+            MemoryDisputeOutcome::Weakened => {
+                insert_memory_state_event(
+                    &transaction,
+                    current.id(),
+                    current.version(),
+                    MemoryStatus::Weakened,
                     reviewed_at,
                 )?;
                 None
@@ -1954,7 +2038,7 @@ fn propagate_claim_correction_to_memories(
                    )
                    AND (SELECT e.status FROM long_term_memory_state_events e
                         WHERE e.memory_id = v.memory_id AND e.version = v.version
-                        ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2, 4)
+                        ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2, 4, 6, 7)
                  ORDER BY v.memory_id",
             )
             .map_err(repository_error)?;
@@ -2151,6 +2235,131 @@ fn validate_persisted_memory_sources(
     Ok(())
 }
 
+fn validate_persisted_pattern_maturity(
+    connection: &Connection,
+    current: &MemoryVersion,
+    proposal: &ValidatedPatternMaturityProposal,
+) -> Result<(), RepositoryError> {
+    if proposal.new_support_claim_ids().is_empty()
+        || proposal.discussion_evidence_refs().is_empty()
+        || proposal.rationale().trim().is_empty()
+    {
+        return Err(RepositoryError::new(
+            "pattern maturity qualification is incomplete",
+        ));
+    }
+    let mut expected_sources = current.source_claim_ids().to_vec();
+    for claim_id in proposal.new_support_claim_ids() {
+        if !expected_sources.contains(claim_id) {
+            expected_sources.push(*claim_id);
+        }
+    }
+    if expected_sources != proposal.all_source_claim_ids() {
+        return Err(RepositoryError::new(
+            "pattern maturity source set changed after validation",
+        ));
+    }
+    let expected_owner = match current.subject() {
+        MemorySubject::Person => ClaimOwner::Person,
+        MemorySubject::Counterpart => ClaimOwner::Counterpart,
+        MemorySubject::Shared => ClaimOwner::Shared,
+    };
+    let mut base_evidence = BTreeSet::new();
+    for claim_id in current.source_claim_ids() {
+        let claim = load_claim(connection, *claim_id)?
+            .ok_or_else(|| RepositoryError::new("pattern source claim does not exist"))?;
+        for citation in claim.support() {
+            base_evidence.insert(citation.evidence_id());
+        }
+    }
+    let mut independent_new_evidence = BTreeSet::new();
+    for claim_id in proposal.new_support_claim_ids() {
+        let claim = load_claim(connection, *claim_id)?
+            .ok_or_else(|| RepositoryError::new("new pattern support does not exist"))?;
+        if claim.status() != ClaimStatus::Current || claim.owner() != expected_owner {
+            return Err(RepositoryError::new(
+                "new pattern support changed attribution or currentness",
+            ));
+        }
+        for citation in claim.support() {
+            let evidence = validate_pattern_citation(connection, citation)?;
+            if !base_evidence.contains(&citation.evidence_id())
+                && evidence.recorded_at().as_millis() > current.formed_at().as_millis()
+            {
+                independent_new_evidence.insert(citation.evidence_id());
+            }
+        }
+    }
+    if independent_new_evidence.is_empty() {
+        return Err(RepositoryError::new(
+            "pattern maturity has no independent new support",
+        ));
+    }
+    let review = validate_pattern_citation(connection, proposal.counterexample_review_ref())?;
+    if review.speaker() != Speaker::Counterpart
+        || review.recorded_at().as_millis() <= current.formed_at().as_millis()
+    {
+        return Err(RepositoryError::new(
+            "pattern maturity counterexample review is invalid",
+        ));
+    }
+    validate_pattern_citations(connection, proposal.counter_evidence_refs(), true)?;
+    let discussion =
+        validate_pattern_citations(connection, proposal.discussion_evidence_refs(), false)?;
+    let has_person = discussion
+        .iter()
+        .any(|evidence| evidence.speaker() == Speaker::Person);
+    let has_counterpart = discussion
+        .iter()
+        .any(|evidence| evidence.speaker() == Speaker::Counterpart);
+    if !has_person
+        || !has_counterpart
+        || discussion
+            .iter()
+            .any(|evidence| evidence.recorded_at().as_millis() <= current.formed_at().as_millis())
+    {
+        return Err(RepositoryError::new(
+            "pattern maturity discussion is not two-sided and subsequent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pattern_citations(
+    connection: &Connection,
+    citations: &[EvidenceCitation],
+    allow_empty: bool,
+) -> Result<Vec<ConversationEvidence>, RepositoryError> {
+    if (!allow_empty && citations.is_empty()) || citations.len() > MAX_DISPUTE_EVIDENCE {
+        return Err(RepositoryError::new(
+            "invalid pattern maturity evidence count",
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    let mut evidence = Vec::with_capacity(citations.len());
+    for citation in citations {
+        if !unique.insert(citation.evidence_id()) {
+            return Err(RepositoryError::new("duplicate pattern maturity evidence"));
+        }
+        evidence.push(validate_pattern_citation(connection, citation)?);
+    }
+    Ok(evidence)
+}
+
+fn validate_pattern_citation(
+    connection: &Connection,
+    citation: &EvidenceCitation,
+) -> Result<ConversationEvidence, RepositoryError> {
+    let evidence = load_conversation_evidence(connection, citation.evidence_id())?
+        .ok_or_else(|| RepositoryError::new("pattern maturity evidence does not exist"))?;
+    if citation.quote().trim().is_empty() || !evidence.verbatim().contains(citation.quote()) {
+        return Err(RepositoryError::new(
+            "pattern maturity evidence quote does not match",
+        ));
+    }
+    Ok(evidence)
+}
+
 fn insert_memory_version(
     transaction: &rusqlite::Transaction<'_>,
     memory_id: MemoryId,
@@ -2222,7 +2431,183 @@ fn insert_memory_version(
         version,
         proposal.initial_status(),
         formed_at,
+    )?;
+    if let Some(review) = proposal.pattern_counterexample_review() {
+        insert_memory_counterexample_review(transaction, memory_id, version, review)?;
+    }
+    Ok(())
+}
+
+fn insert_memory_counterexample_review(
+    connection: &Connection,
+    memory_id: MemoryId,
+    version: u64,
+    review: &EvidenceCitation,
+) -> Result<(), RepositoryError> {
+    connection
+        .execute(
+            "INSERT INTO long_term_memory_counterexample_reviews
+             (memory_id, version, evidence_id, quote) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                to_sql_id(memory_id.get())?,
+                to_sql_id(version)?,
+                to_sql_id(review.evidence_id().get())?,
+                review.quote(),
+            ],
+        )
+        .map_err(repository_error)?;
+    Ok(())
+}
+
+fn insert_matured_pattern_version(
+    transaction: &rusqlite::Transaction<'_>,
+    previous: &MemoryVersion,
+    version: u64,
+    proposal: &ValidatedPatternMaturityProposal,
+    proposed_at: Timestamp,
+) -> Result<(), RepositoryError> {
+    let (applicable_kind, applicable_start, applicable_end) =
+        encode_applicable_time(previous.applicable_time());
+    transaction
+        .execute(
+            "INSERT INTO long_term_memory_versions
+             (memory_id, version, predecessor_version, subject, kind, statement,
+              confidence, applicable_kind, applicable_start, applicable_end,
+              salience_reason, basis, formed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                to_sql_id(previous.id().get())?,
+                to_sql_id(version)?,
+                to_sql_id(previous.version())?,
+                encode_memory_subject(previous.subject()),
+                encode_memory_kind(previous.kind()),
+                previous.statement(),
+                encode_memory_confidence(previous.confidence()),
+                applicable_kind,
+                applicable_start,
+                applicable_end,
+                previous.salience_reason(),
+                encode_memory_basis(previous.basis()),
+                proposed_at.as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    for (ordinal, claim_id) in proposal.all_source_claim_ids().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO long_term_memory_sources
+                 (memory_id, version, ordinal, claim_id) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    to_sql_id(previous.id().get())?,
+                    to_sql_id(version)?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(claim_id.get())?,
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    let mut terms = BTreeSet::new();
+    terms.extend(search_terms(previous.statement()));
+    terms.extend(search_terms(previous.salience_reason()));
+    for term in terms {
+        transaction
+            .execute(
+                "INSERT INTO long_term_memory_terms (memory_id, version, term)
+                 VALUES (?1, ?2, ?3)",
+                params![to_sql_id(previous.id().get())?, to_sql_id(version)?, term],
+            )
+            .map_err(repository_error)?;
+    }
+    insert_memory_state_event(
+        transaction,
+        previous.id(),
+        version,
+        MemoryStatus::SupportedCounterpartView,
+        proposed_at,
+    )?;
+    insert_memory_counterexample_review(
+        transaction,
+        previous.id(),
+        version,
+        proposal.counterexample_review_ref(),
     )
+}
+
+fn insert_pattern_maturity_record(
+    transaction: &rusqlite::Transaction<'_>,
+    proposal: &ValidatedPatternMaturityProposal,
+    to_version: u64,
+    proposed_at: Timestamp,
+) -> Result<(), RepositoryError> {
+    transaction
+        .execute(
+            "INSERT INTO pattern_maturity_records
+             (memory_id, from_version, to_version, rationale, proposed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                to_sql_id(proposal.memory_id().get())?,
+                to_sql_id(proposal.expected_version())?,
+                to_sql_id(to_version)?,
+                proposal.rationale(),
+                proposed_at.as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    for (ordinal, claim_id) in proposal.new_support_claim_ids().iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO pattern_maturity_new_support
+                 (memory_id, to_version, ordinal, claim_id) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    to_sql_id(proposal.memory_id().get())?,
+                    to_sql_id(to_version)?,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(claim_id.get())?,
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    insert_pattern_maturity_evidence(
+        transaction,
+        proposal.memory_id(),
+        to_version,
+        0,
+        proposal.counter_evidence_refs(),
+    )?;
+    insert_pattern_maturity_evidence(
+        transaction,
+        proposal.memory_id(),
+        to_version,
+        1,
+        proposal.discussion_evidence_refs(),
+    )
+}
+
+fn insert_pattern_maturity_evidence(
+    transaction: &rusqlite::Transaction<'_>,
+    memory_id: MemoryId,
+    to_version: u64,
+    role: i64,
+    citations: &[EvidenceCitation],
+) -> Result<(), RepositoryError> {
+    for (ordinal, citation) in citations.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO pattern_maturity_evidence
+                 (memory_id, to_version, role, ordinal, evidence_id, quote)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    to_sql_id(memory_id.get())?,
+                    to_sql_id(to_version)?,
+                    role,
+                    i64::try_from(ordinal).map_err(repository_error)?,
+                    to_sql_id(citation.evidence_id().get())?,
+                    citation.quote(),
+                ],
+            )
+            .map_err(repository_error)?;
+    }
+    Ok(())
 }
 
 fn insert_memory_state_event(
@@ -2457,7 +2842,136 @@ fn load_memory_version(
         decode_memory_basis(basis)?,
         decode_memory_status(status)?,
         Timestamp::from_millis(formed_at),
+        load_memory_counterexample_review(connection, memory_id, version)?,
     ))
+}
+
+fn load_memory_counterexample_review(
+    connection: &Connection,
+    memory_id: MemoryId,
+    version: u64,
+) -> Result<Option<EvidenceCitation>, RepositoryError> {
+    let stored = connection
+        .query_row(
+            "SELECT evidence_id, quote
+             FROM long_term_memory_counterexample_reviews
+             WHERE memory_id = ?1 AND version = ?2",
+            params![to_sql_id(memory_id.get())?, to_sql_id(version)?],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(repository_error)?;
+    stored
+        .map(|(evidence_id, quote)| {
+            let evidence_id = u64::try_from(evidence_id).map_err(repository_error)?;
+            Ok(EvidenceCitation::new(
+                EvidenceId::from_raw(evidence_id),
+                quote,
+            ))
+        })
+        .transpose()
+}
+
+fn load_pattern_maturity_records(
+    connection: &Connection,
+    memory_id: MemoryId,
+) -> Result<Vec<PatternMaturityRecord>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT from_version, to_version, rationale, proposed_at
+             FROM pattern_maturity_records
+             WHERE memory_id = ?1 ORDER BY to_version",
+        )
+        .map_err(repository_error)?;
+    let rows = statement
+        .query_map([to_sql_id(memory_id.get())?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)?;
+    drop(statement);
+    rows.into_iter()
+        .map(|(from_version, to_version, rationale, proposed_at)| {
+            let from_version = u64::try_from(from_version).map_err(repository_error)?;
+            let to_version = u64::try_from(to_version).map_err(repository_error)?;
+            let review = load_memory_counterexample_review(connection, memory_id, to_version)?
+                .ok_or_else(|| {
+                    RepositoryError::new("pattern maturity record has no counterexample review")
+                })?;
+            Ok(PatternMaturityRecord::restore(
+                memory_id,
+                from_version,
+                to_version,
+                load_pattern_maturity_support(connection, memory_id, to_version)?,
+                load_pattern_maturity_evidence(connection, memory_id, to_version, 0)?,
+                review,
+                load_pattern_maturity_evidence(connection, memory_id, to_version, 1)?,
+                rationale,
+                Timestamp::from_millis(proposed_at),
+            ))
+        })
+        .collect()
+}
+
+fn load_pattern_maturity_support(
+    connection: &Connection,
+    memory_id: MemoryId,
+    to_version: u64,
+) -> Result<Vec<ClaimId>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT claim_id FROM pattern_maturity_new_support
+             WHERE memory_id = ?1 AND to_version = ?2 ORDER BY ordinal",
+        )
+        .map_err(repository_error)?;
+    statement
+        .query_map(
+            params![to_sql_id(memory_id.get())?, to_sql_id(to_version)?],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(repository_error)?
+        .map(|claim_id| {
+            let claim_id =
+                u64::try_from(claim_id.map_err(repository_error)?).map_err(repository_error)?;
+            Ok(ClaimId::from_raw(claim_id))
+        })
+        .collect()
+}
+
+fn load_pattern_maturity_evidence(
+    connection: &Connection,
+    memory_id: MemoryId,
+    to_version: u64,
+    role: i64,
+) -> Result<Vec<EvidenceCitation>, RepositoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT evidence_id, quote FROM pattern_maturity_evidence
+             WHERE memory_id = ?1 AND to_version = ?2 AND role = ?3
+             ORDER BY ordinal",
+        )
+        .map_err(repository_error)?;
+    statement
+        .query_map(
+            params![to_sql_id(memory_id.get())?, to_sql_id(to_version)?, role],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(repository_error)?
+        .map(|stored| {
+            let (evidence_id, quote) = stored.map_err(repository_error)?;
+            let evidence_id = u64::try_from(evidence_id).map_err(repository_error)?;
+            Ok(EvidenceCitation::new(
+                EvidenceId::from_raw(evidence_id),
+                quote,
+            ))
+        })
+        .collect()
 }
 
 fn load_memory_sources(
@@ -2748,28 +3262,15 @@ fn load_memory_dispute(
         }
         MemoryDisputeOutcome::Retracted
         | MemoryDisputeOutcome::Revised
-        | MemoryDisputeOutcome::Maintained => {
-            match outcome {
-                MemoryDisputeOutcome::Revised => {
-                    let successor = revised_version.ok_or_else(|| {
-                        RepositoryError::new("revised dispute has no successor version")
-                    })?;
-                    let successor = load_memory_version(connection, memory_id, successor)?;
-                    if successor.predecessor_version() != Some(memory_version) {
-                        return Err(RepositoryError::new(
-                            "revised dispute successor does not follow the disputed version",
-                        ));
-                    }
-                }
-                MemoryDisputeOutcome::Retracted | MemoryDisputeOutcome::Maintained => {
-                    if revised_version.is_some() {
-                        return Err(RepositoryError::new(
-                            "non-revised dispute has a successor version",
-                        ));
-                    }
-                }
-                MemoryDisputeOutcome::Open => unreachable!(),
-            }
+        | MemoryDisputeOutcome::Maintained
+        | MemoryDisputeOutcome::Weakened => {
+            validate_dispute_revision_link(
+                connection,
+                memory_id,
+                memory_version,
+                outcome,
+                revised_version,
+            )?;
             let reviewed_at = reviewed_at
                 .ok_or_else(|| RepositoryError::new("resolved dispute has no timestamp"))?;
             let rationale = rationale
@@ -2794,6 +3295,42 @@ fn load_memory_dispute(
         review,
         revised_version,
     )))
+}
+
+fn validate_dispute_revision_link(
+    connection: &Connection,
+    memory_id: MemoryId,
+    memory_version: u64,
+    outcome: MemoryDisputeOutcome,
+    revised_version: Option<u64>,
+) -> Result<(), RepositoryError> {
+    match outcome {
+        MemoryDisputeOutcome::Revised => {
+            let successor = revised_version
+                .ok_or_else(|| RepositoryError::new("revised dispute has no successor version"))?;
+            let successor = load_memory_version(connection, memory_id, successor)?;
+            if successor.predecessor_version() != Some(memory_version) {
+                return Err(RepositoryError::new(
+                    "revised dispute successor does not follow the disputed version",
+                ));
+            }
+        }
+        MemoryDisputeOutcome::Retracted
+        | MemoryDisputeOutcome::Maintained
+        | MemoryDisputeOutcome::Weakened => {
+            if revised_version.is_some() {
+                return Err(RepositoryError::new(
+                    "non-revised dispute has a successor version",
+                ));
+            }
+        }
+        MemoryDisputeOutcome::Open => {
+            return Err(RepositoryError::new(
+                "open memory dispute cannot carry a resolved revision link",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn load_memory_disputes(
@@ -2953,6 +3490,25 @@ impl MemoryRepository for VaultRepository {
             .into_iter()
             .map(|stored| stored.decode(self.connection()))
             .collect()
+    }
+
+    fn commit_pattern_maturity(
+        &mut self,
+        proposal: &PatternMaturityProposal,
+        proposed_at: Timestamp,
+    ) -> Result<PatternMaturityCommitOutcome, RepositoryError> {
+        match commit_pattern_maturity_domain(self, proposal, proposed_at) {
+            Ok(memory) => Ok(PatternMaturityCommitOutcome::Accepted(
+                PatternMaturityReceipt::new(memory.id().get(), memory.version()),
+            )),
+            Err(MemoryError::InvalidPatternMaturity(_)) => {
+                Ok(PatternMaturityCommitOutcome::QualificationRejected)
+            }
+            Err(MemoryError::Repository(error)) => Err(error),
+            Err(error) => Err(RepositoryError::new(format!(
+                "unexpected pattern maturity domain error: {error}"
+            ))),
+        }
     }
 }
 
@@ -6919,7 +7475,7 @@ fn recall_long_term_memory_candidates(
                    )
                AND (SELECT e.status FROM long_term_memory_state_events e
                     WHERE e.memory_id = v.memory_id AND e.version = v.version
-                    ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2)
+                    ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2, 6, 7)
                AND (?1 IS NULL OR (
                     v.applicable_start IS NOT NULL
                     AND v.applicable_start <= ?2
@@ -6953,7 +7509,7 @@ fn recall_long_term_memory_candidates(
                    )
                    AND (SELECT e.status FROM long_term_memory_state_events e
                         WHERE e.memory_id = v.memory_id AND e.version = v.version
-                        ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2)
+                        ORDER BY e.ordinal DESC LIMIT 1) IN (0, 1, 2, 6, 7)
                    AND (?2 IS NULL OR (
                         v.applicable_start IS NOT NULL
                         AND v.applicable_start <= ?3
@@ -7089,7 +7645,9 @@ fn load_disputed_memory_recall(
                 DisputeState::Maintained,
             )
         }
-        MemoryDisputeOutcome::Retracted | MemoryDisputeOutcome::Revised => {
+        MemoryDisputeOutcome::Retracted
+        | MemoryDisputeOutcome::Revised
+        | MemoryDisputeOutcome::Weakened => {
             return Err(VaultError::InvalidKeyOrCorrupt);
         }
     };
@@ -9441,7 +9999,11 @@ fn plan_conversation_forget(
                WHERE e.evidence_id = ?1
              UNION SELECT d.memory_id FROM memory_disputes d
                JOIN memory_dispute_review_evidence e ON e.dispute_id = d.id
-               WHERE e.evidence_id = ?1 ORDER BY memory_id"
+               WHERE e.evidence_id = ?1
+             UNION SELECT memory_id FROM long_term_memory_counterexample_reviews
+               WHERE evidence_id = ?1
+             UNION SELECT memory_id FROM pattern_maturity_evidence
+               WHERE evidence_id = ?1 ORDER BY memory_id"
         ),
         evidence_id_sql,
     )?;
@@ -9583,6 +10145,15 @@ fn delete_memory_closure(
         &format!("DELETE FROM memory_disputes WHERE {memory_predicate}"),
         [],
     )?;
+    for table in [
+        "pattern_maturity_evidence",
+        "pattern_maturity_new_support",
+        "pattern_maturity_records",
+        "long_term_memory_counterexample_reviews",
+    ] {
+        counts.derived +=
+            transaction.execute(&format!("DELETE FROM {table} WHERE {memory_predicate}"), [])?;
+    }
     for table in [
         "long_term_memory_terms",
         "long_term_memory_state_events",
@@ -10393,6 +10964,8 @@ const fn encode_memory_status(value: MemoryStatus) -> i64 {
         MemoryStatus::Superseded => 3,
         MemoryStatus::Disputed => 4,
         MemoryStatus::Retracted => 5,
+        MemoryStatus::SupportedCounterpartView => 6,
+        MemoryStatus::Weakened => 7,
     }
 }
 
@@ -10404,6 +10977,8 @@ fn decode_memory_status(value: i64) -> Result<MemoryStatus, RepositoryError> {
         3 => Ok(MemoryStatus::Superseded),
         4 => Ok(MemoryStatus::Disputed),
         5 => Ok(MemoryStatus::Retracted),
+        6 => Ok(MemoryStatus::SupportedCounterpartView),
+        7 => Ok(MemoryStatus::Weakened),
         _ => Err(RepositoryError::new("invalid persisted memory status")),
     }
 }
@@ -10414,6 +10989,7 @@ const fn encode_dispute_outcome(value: MemoryDisputeOutcome) -> i64 {
         MemoryDisputeOutcome::Retracted => 1,
         MemoryDisputeOutcome::Revised => 2,
         MemoryDisputeOutcome::Maintained => 3,
+        MemoryDisputeOutcome::Weakened => 4,
     }
 }
 
@@ -10423,6 +10999,7 @@ fn decode_dispute_outcome(value: i64) -> Result<MemoryDisputeOutcome, Repository
         1 => Ok(MemoryDisputeOutcome::Retracted),
         2 => Ok(MemoryDisputeOutcome::Revised),
         3 => Ok(MemoryDisputeOutcome::Maintained),
+        4 => Ok(MemoryDisputeOutcome::Weakened),
         _ => Err(RepositoryError::new(
             "invalid persisted memory dispute outcome",
         )),
@@ -10696,6 +11273,8 @@ fn load_self_bundle_intentions(
 
 #[cfg(test)]
 mod tests {
+    use eam_core::{IncrementingClock, PatternMaturityProposal};
+    use eam_memory::{MemoryError, MemoryMaintenance, MemoryProposal};
     use tempfile::tempdir;
 
     use super::*;
@@ -10889,6 +11468,167 @@ mod tests {
         assert_eq!(
             repository.reflection_invitation(invitation.id()).unwrap(),
             Some(invitation)
+        );
+    }
+
+    #[test]
+    fn pattern_maturity_failure_rolls_back_version_and_qualification_record_across_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let key = [0x59; 32];
+        let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        let (repository, pattern) = seed_interrupted_pattern_maturity(repository);
+        repository
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER interrupt_pattern_maturity
+                 BEFORE INSERT ON pattern_maturity_evidence
+                 WHEN NEW.role = 1
+                 BEGIN
+                   SELECT RAISE(ABORT, 'pattern maturity interrupted');
+                 END;",
+            )
+            .unwrap();
+        let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(2_000));
+        let result = maintenance.mature_pattern(
+            &PatternMaturityProposal::new(
+                pattern.id().get(),
+                pattern.version(),
+                "New support survived another review and discussion",
+            )
+            .with_new_support_claim(ClaimId::from_raw(4))
+            .with_counterexample_review(EvidenceCitation::new(
+                EvidenceId::from_raw(11),
+                "I checked the newer sequence for exceptions",
+            ))
+            .with_discussion_evidence([
+                EvidenceCitation::new(
+                    EvidenceId::from_raw(12),
+                    "I see the tendency, although it does not fit every week",
+                ),
+                EvidenceCitation::new(
+                    EvidenceId::from_raw(13),
+                    "I still see a bounded recurring tendency",
+                ),
+            ]),
+        );
+        assert!(matches!(result, Err(MemoryError::Repository(_))));
+        assert_pattern_maturity_absent(maintenance.repository(), pattern.id());
+        let (repository, _) = maintenance.into_parts();
+        repository.close().unwrap();
+
+        let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        assert_pattern_maturity_absent(&repository, pattern.id());
+    }
+
+    fn seed_interrupted_pattern_maturity(
+        mut repository: VaultRepository,
+    ) -> (VaultRepository, MemoryVersion) {
+        append_interrupted_pattern_supports(&mut repository);
+        append_interrupted_pattern_qualification_evidence(&mut repository);
+        let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(1_000));
+        let pattern = maintenance
+            .propose(
+                &MemoryProposal::new("Planning reviews tend to become calmer across months")
+                    .with_subject(MemorySubject::Counterpart)
+                    .with_kind(MemoryKind::Hypothesis)
+                    .with_source_claims([
+                        ClaimId::from_raw(1),
+                        ClaimId::from_raw(2),
+                        ClaimId::from_raw(3),
+                    ])
+                    .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(100)))
+                    .with_confidence(MemoryConfidence::Medium)
+                    .with_salience_reason("Retain the bounded cross-month pattern")
+                    .with_basis(MemoryBasis::PatternCandidate)
+                    .with_pattern_counterexample_review(EvidenceCitation::new(
+                        EvidenceId::from_raw(10),
+                        "I checked the initial sequence for exceptions",
+                    )),
+            )
+            .unwrap();
+        let (repository, _) = maintenance.into_parts();
+        (repository, pattern)
+    }
+
+    fn append_interrupted_pattern_supports(repository: &mut VaultRepository) {
+        for (id, quote, recorded_at) in [
+            (1, "I reviewed plans calmly in January", 100),
+            (2, "I reviewed plans calmly in February", 200),
+            (3, "I reviewed plans calmly in March", 300),
+            (4, "I reviewed plans calmly in April", 1_200),
+        ] {
+            repository
+                .append_evidence(ConversationEvidence::restore(
+                    EvidenceId::from_raw(id),
+                    SessionId::new("maturity-interrupted"),
+                    Speaker::Person,
+                    quote.to_owned(),
+                    Timestamp::from_millis(recorded_at),
+                ))
+                .unwrap();
+            repository
+                .append_claim(Claim::restore(
+                    ClaimId::from_raw(id),
+                    ClaimOwner::Counterpart,
+                    format!("planning review event {id}"),
+                    vec![EvidenceCitation::new(EvidenceId::from_raw(id), quote)],
+                    Some(Uncertainty::Medium),
+                    ApplicableTime::At(Timestamp::from_millis(recorded_at)),
+                    Timestamp::from_millis(recorded_at),
+                ))
+                .unwrap();
+        }
+    }
+
+    fn append_interrupted_pattern_qualification_evidence(repository: &mut VaultRepository) {
+        for (id, speaker, quote, recorded_at) in [
+            (
+                10,
+                Speaker::Counterpart,
+                "I checked the initial sequence for exceptions",
+                350,
+            ),
+            (
+                11,
+                Speaker::Counterpart,
+                "I checked the newer sequence for exceptions",
+                1_300,
+            ),
+            (
+                12,
+                Speaker::Person,
+                "I see the tendency, although it does not fit every week",
+                1_400,
+            ),
+            (
+                13,
+                Speaker::Counterpart,
+                "I still see a bounded recurring tendency",
+                1_500,
+            ),
+        ] {
+            repository
+                .append_evidence(ConversationEvidence::restore(
+                    EvidenceId::from_raw(id),
+                    SessionId::new("maturity-interrupted"),
+                    speaker,
+                    quote.to_owned(),
+                    Timestamp::from_millis(recorded_at),
+                ))
+                .unwrap();
+        }
+    }
+
+    fn assert_pattern_maturity_absent(repository: &VaultRepository, memory_id: MemoryId) {
+        let current = repository.current_memory(memory_id).unwrap().unwrap();
+        assert_eq!(current.status(), MemoryStatus::ProvisionalPattern);
+        assert_eq!(repository.memory_versions(memory_id).unwrap().len(), 1);
+        assert!(
+            repository
+                .pattern_maturity_records(memory_id)
+                .unwrap()
+                .is_empty()
         );
     }
 

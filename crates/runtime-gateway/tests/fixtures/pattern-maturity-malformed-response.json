@@ -1,0 +1,14 @@
+{
+  "id": "resp_pattern_maturity_malformed_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"text\":\"This incomplete proposal must fail closed.\",\"citations\":[],\"operations\":[{\"type\":\"propose_pattern_maturity\",\"memory_id\":1,\"expected_version\":1,\"new_support_claim_ids\":[4],\"counter_evidence_refs\":[],\"counterexample_review_ref\":{\"evidence_id\":11,\"quote\":\"I checked the newer sequence for exceptions\"},\"discussion_evidence_refs\":[{\"evidence_id\":12,\"quote\":\"I think that pattern fits some weeks, but not every week\"},{\"evidence_id\":13,\"quote\":\"I agree it has limits and still see a recurring tendency\"}]}]}"
+        }
+      ]
+    }
+  ]
+}

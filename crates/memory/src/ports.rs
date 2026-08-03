@@ -2,7 +2,8 @@ use eam_core::{Claim, ClaimId, ConversationEvidence, EvidenceId, RepositoryError
 
 use crate::{
     MemoryDispute, MemoryDisputeId, MemoryDisputeResolution, MemoryId, MemoryVersion,
-    ValidatedMemoryDispute, ValidatedMemoryDisputeReview, ValidatedMemoryProposal,
+    PatternMaturityRecord, ValidatedMemoryDispute, ValidatedMemoryDisputeReview,
+    ValidatedMemoryProposal, ValidatedPatternMaturityProposal,
 };
 
 pub trait LongTermMemoryRepository {
@@ -32,6 +33,18 @@ pub trait LongTermMemoryRepository {
         formed_at: Timestamp,
     ) -> Result<MemoryVersion, RepositoryError>;
 
+    /// Atomically appends a successor version for one explicitly matured pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when version continuity, source independence,
+    /// evidence, or the complete maturity record changed after validation.
+    fn append_pattern_maturity(
+        &mut self,
+        proposal: ValidatedPatternMaturityProposal,
+        proposed_at: Timestamp,
+    ) -> Result<MemoryVersion, RepositoryError>;
+
     /// Loads the latest version of one stable memory identity.
     ///
     /// # Errors
@@ -45,6 +58,16 @@ pub trait LongTermMemoryRepository {
     ///
     /// Returns an adapter error when persisted memory state is invalid.
     fn memory_versions(&self, id: MemoryId) -> Result<Vec<MemoryVersion>, RepositoryError>;
+
+    /// Loads every recorded explicit maturity proposal for one memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when persisted maturity evidence is invalid.
+    fn pattern_maturity_records(
+        &self,
+        id: MemoryId,
+    ) -> Result<Vec<PatternMaturityRecord>, RepositoryError>;
 
     /// Loads all versions ordered by memory identity and version.
     ///

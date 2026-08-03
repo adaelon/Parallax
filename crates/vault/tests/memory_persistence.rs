@@ -1,12 +1,12 @@
 use eam_core::{
     ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence, EvidenceCitation, EvidenceId,
-    IncrementingClock, MemoryRepository, RetrievedContextItem, SessionId, Speaker, Timestamp,
-    Uncertainty,
+    ForgetRepository, ForgetTarget, IncrementingClock, MemoryRepository, PatternMaturityProposal,
+    RetrievedContextItem, SessionId, Speaker, Timestamp, Uncertainty,
 };
 use eam_memory::{
     LongTermMemoryRepository, MemoryBasis, MemoryConfidence, MemoryDisputeOutcome,
     MemoryDisputeRequest, MemoryDisputeReview, MemoryId, MemoryKind, MemoryMaintenance,
-    MemoryProposal, MemoryStatus, MemorySubject,
+    MemoryProposal, MemoryStatus, MemorySubject, MemoryVersion,
 };
 use eam_retrieval::{
     AuthoritativeCandidate, RetrievalQuery, TimeRange, TokenBudget, freeze_working_context,
@@ -87,7 +87,7 @@ fn explicit_versions_survive_reopen_and_only_current_memory_sources_are_recalled
 
     let mut repository =
         VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 22);
+    assert_eq!(repository.schema_version().unwrap(), 23);
     let versions = repository.memory_versions(first.id()).unwrap();
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].status(), MemoryStatus::Superseded);
@@ -194,7 +194,7 @@ fn maintained_dispute_survives_reopen_and_freezes_only_as_a_complete_relevant_pa
 
     let mut repository =
         VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 22);
+    assert_eq!(repository.schema_version().unwrap(), 23);
     assert_eq!(
         repository
             .current_memory(memory.id())
@@ -387,6 +387,223 @@ fn retracted_dispute_survives_reopen_and_contributes_no_recall_path() {
                 AuthoritativeCandidate::Ledger(claim) if claim.id() == ClaimId::from_raw(1)
             )
     }));
+}
+
+#[test]
+fn pattern_maturity_survives_reopen_with_complete_qualification_evidence() {
+    let vault = tempdir().unwrap();
+    let (pattern, matured) = persist_matured_pattern(vault.path());
+
+    let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    assert_complete_maturity_record(&repository, &pattern, &matured);
+    let repository = weaken_matured_pattern(repository, &matured);
+    repository.close().unwrap();
+
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    assert_eq!(
+        repository
+            .current_memory(pattern.id())
+            .unwrap()
+            .unwrap()
+            .status(),
+        MemoryStatus::Weakened
+    );
+    assert_eq!(
+        repository.memory_disputes(pattern.id()).unwrap()[0].outcome(),
+        MemoryDisputeOutcome::Weakened
+    );
+    let receipt = repository
+        .commit_forget(
+            ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1_300)),
+            Timestamp::from_millis(3_000),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(receipt.removed_derived_records() > 0);
+    assert!(repository.current_memory(pattern.id()).unwrap().is_none());
+    assert!(
+        MemoryRepository::evidence(&repository, EvidenceId::from_raw(1_300))
+            .unwrap()
+            .is_none()
+    );
+    repository.close().unwrap();
+
+    let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    assert!(repository.current_memory(pattern.id()).unwrap().is_none());
+    assert!(
+        repository
+            .pattern_maturity_records(pattern.id())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn persist_matured_pattern(vault_path: &std::path::Path) -> (MemoryVersion, MemoryVersion) {
+    let mut repository = VaultRepository::open(vault_path, VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    seed_pattern_maturity_inputs(&mut repository);
+    let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(1_000));
+    let pattern = maintenance
+        .propose(
+            &MemoryProposal::new("Planning reviews tend to become calmer across months")
+                .with_subject(MemorySubject::Counterpart)
+                .with_kind(MemoryKind::Hypothesis)
+                .with_source_claims([
+                    ClaimId::from_raw(1),
+                    ClaimId::from_raw(2),
+                    ClaimId::from_raw(3),
+                ])
+                .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(1)))
+                .with_confidence(MemoryConfidence::Medium)
+                .with_salience_reason("Retain the bounded cross-month pattern")
+                .with_basis(MemoryBasis::PatternCandidate)
+                .with_pattern_counterexample_review(EvidenceCitation::new(
+                    EvidenceId::from_raw(10),
+                    "I checked the initial sequence for exceptions",
+                )),
+        )
+        .unwrap();
+    assert_eq!(pattern.status(), MemoryStatus::ProvisionalPattern);
+    let matured = maintenance
+        .mature_pattern(&complete_maturity_proposal(&pattern))
+        .unwrap();
+    assert_eq!(matured.status(), MemoryStatus::SupportedCounterpartView);
+    let (repository, _) = maintenance.into_parts();
+    repository.close().unwrap();
+    (pattern, matured)
+}
+
+fn complete_maturity_proposal(pattern: &MemoryVersion) -> PatternMaturityProposal {
+    PatternMaturityProposal::new(
+        pattern.id().get(),
+        pattern.version(),
+        "New support survived another review and a two-sided discussion",
+    )
+    .with_new_support_claim(ClaimId::from_raw(1_200))
+    .with_counter_evidence(EvidenceCitation::new(
+        EvidenceId::from_raw(1_600),
+        "One rushed week still ran differently",
+    ))
+    .with_counterexample_review(EvidenceCitation::new(
+        EvidenceId::from_raw(1_300),
+        "I checked the newer sequence for exceptions",
+    ))
+    .with_discussion_evidence([
+        EvidenceCitation::new(
+            EvidenceId::from_raw(1_400),
+            "I see the tendency, although it does not fit every week",
+        ),
+        EvidenceCitation::new(
+            EvidenceId::from_raw(1_500),
+            "I still see a bounded recurring tendency",
+        ),
+    ])
+}
+
+fn seed_pattern_maturity_inputs(repository: &mut VaultRepository) {
+    for (id, statement) in [
+        (1, "Planning review event one"),
+        (2, "Planning review event two"),
+        (3, "Planning review event three"),
+        (1_200, "Planning review event four"),
+    ] {
+        seed_claim(
+            repository,
+            id,
+            ClaimOwner::Counterpart,
+            statement,
+            Some(Uncertainty::Medium),
+            ApplicableTime::At(Timestamp::from_millis(i64::try_from(id).unwrap())),
+        );
+    }
+    for (id, speaker, text) in [
+        (
+            10,
+            Speaker::Counterpart,
+            "I checked the initial sequence for exceptions",
+        ),
+        (
+            1_300,
+            Speaker::Counterpart,
+            "I checked the newer sequence for exceptions",
+        ),
+        (
+            1_400,
+            Speaker::Person,
+            "I see the tendency, although it does not fit every week",
+        ),
+        (
+            1_500,
+            Speaker::Counterpart,
+            "I still see a bounded recurring tendency",
+        ),
+        (
+            1_600,
+            Speaker::Person,
+            "One rushed week still ran differently",
+        ),
+    ] {
+        seed_evidence(repository, id, speaker, text);
+    }
+}
+
+fn assert_complete_maturity_record(
+    repository: &VaultRepository,
+    pattern: &MemoryVersion,
+    matured: &MemoryVersion,
+) {
+    assert_eq!(repository.schema_version().unwrap(), 23);
+    let current = repository.current_memory(pattern.id()).unwrap().unwrap();
+    assert_eq!(&current, matured);
+    assert_eq!(current.status(), MemoryStatus::SupportedCounterpartView);
+    assert_eq!(
+        current
+            .pattern_counterexample_review()
+            .unwrap()
+            .evidence_id(),
+        EvidenceId::from_raw(1_300)
+    );
+    let records = repository.pattern_maturity_records(pattern.id()).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].from_version(), 1);
+    assert_eq!(records[0].to_version(), 2);
+    assert_eq!(
+        records[0].new_support_claim_ids(),
+        &[ClaimId::from_raw(1_200)]
+    );
+    assert_eq!(records[0].counter_evidence_refs().len(), 1);
+    assert_eq!(records[0].discussion_evidence().len(), 2);
+}
+
+fn weaken_matured_pattern(repository: VaultRepository, current: &MemoryVersion) -> VaultRepository {
+    let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(2_000));
+    let dispute = maintenance
+        .raise_dispute(
+            &MemoryDisputeRequest::new(
+                current.id(),
+                current.version(),
+                "The stronger exception narrows how broadly the stable view should be used",
+            )
+            .with_counter_evidence(EvidenceCitation::new(
+                EvidenceId::from_raw(1_600),
+                "One rushed week still ran differently",
+            )),
+        )
+        .unwrap();
+    let weakened = maintenance
+        .review_dispute(
+            &MemoryDisputeReview::weaken(
+                dispute.id(),
+                "The counterexample weakens but does not erase the longer observation",
+            )
+            .with_evidence(EvidenceCitation::new(
+                EvidenceId::from_raw(1_500),
+                "I still see a bounded recurring tendency",
+            )),
+        )
+        .unwrap();
+    assert_eq!(weakened.memory().status(), MemoryStatus::Weakened);
+    maintenance.into_parts().0
 }
 
 fn direct_proposal(statement: &str, claim_id: ClaimId, since_millis: i64) -> MemoryProposal {

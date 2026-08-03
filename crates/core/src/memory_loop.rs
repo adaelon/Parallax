@@ -12,9 +12,11 @@ use crate::{
     IdentityRuntimeContext, IdentityStateSnapshot, JudgmentProposal, JudgmentRejection,
     JudgmentRejectionReason, MAX_OPEN_REFLECTION_INVITATIONS, MAX_REFLECTION_EVIDENCE_REFS,
     MAX_REFLECTION_OBSERVATION_BYTES, MAX_REFLECTION_TOPIC_BYTES, MAX_REFLECTION_WHY_NOW_BYTES,
-    MemoryRepository, PersonTurnClassification, ReflectionDecision, ReflectionDelivery,
-    ReflectionImportance, ReflectionInvitation, ReflectionInvitationBasis, ReflectionInvitationId,
-    ReflectionInvitationProposal, ReflectionInvitationReceipt, ReflectionInvitationRejection,
+    MemoryRepository, PatternMaturityCommitOutcome, PatternMaturityReceipt,
+    PatternMaturityWriteRejection, PatternMaturityWriteRejectionReason, PersonTurnClassification,
+    ReflectionDecision, ReflectionDelivery, ReflectionImportance, ReflectionInvitation,
+    ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationProposal,
+    ReflectionInvitationReceipt, ReflectionInvitationRejection,
     ReflectionInvitationRejectionReason, ReflectionInvitationRepository, ReflectionInvitationState,
     ReflectionRuntimeContext, ReflectionRuntimeDisposition, ReflectionTransitionError,
     RelationalConstraintDeparture, RelationalConstraintDepartureRejection,
@@ -87,6 +89,11 @@ struct ReflectionInvitationWriteOutcome {
     accepted: Vec<ReflectionInvitationReceipt>,
     rejected: Vec<ReflectionInvitationRejection>,
     immediately_offered: Option<ReflectionInvitationId>,
+}
+
+struct PatternMaturityWriteOutcome {
+    accepted: Vec<PatternMaturityReceipt>,
+    rejected: Vec<PatternMaturityWriteRejection>,
 }
 
 fn reject_constraint_departure(
@@ -489,11 +496,7 @@ where
         let validation_context = request.working_context().clone();
         let response = self.runtime.respond(request)?;
 
-        for citation in response.citations() {
-            if let Err(reason) = validate_citation(citation, &validation_context, &prompt) {
-                return Err(CoreError::InvalidResponseCitation(reason));
-            }
-        }
+        validate_response_citations(&response, &validation_context, &prompt)?;
 
         let counterpart_evidence = self.append_conversation_evidence(
             session_id,
@@ -536,6 +539,7 @@ where
             counterpart_evidence.recorded_at(),
             offered_reflection,
         )?;
+        let pattern_maturities = self.persist_pattern_maturity_proposals(&response)?;
         let shared = self.persist_shared_experience_proposals(
             &response,
             &validation_context,
@@ -559,8 +563,43 @@ where
             reflections.rejected,
             reflections.immediately_offered.or(offered_reflection),
         )
+        .with_pattern_maturities(pattern_maturities.accepted, pattern_maturities.rejected)
         .with_shared_experiences(shared.pending_agreements, shared.admitted, shared.rejected)
         .with_rejected_operations(rejected_operations))
+    }
+
+    fn persist_pattern_maturity_proposals(
+        &mut self,
+        response: &crate::RuntimeResponse,
+    ) -> Result<PatternMaturityWriteOutcome, CoreError> {
+        let mut outcome = PatternMaturityWriteOutcome {
+            accepted: Vec::new(),
+            rejected: Vec::new(),
+        };
+        for (proposal_index, proposal) in response.pattern_maturity_proposals().iter().enumerate() {
+            if proposal_index > 0 {
+                outcome.rejected.push(PatternMaturityWriteRejection::new(
+                    proposal_index,
+                    PatternMaturityWriteRejectionReason::DuplicateProposal,
+                ));
+                continue;
+            }
+            match self
+                .repository
+                .commit_pattern_maturity(proposal, self.clock.now())?
+            {
+                PatternMaturityCommitOutcome::Accepted(receipt) => {
+                    outcome.accepted.push(receipt);
+                }
+                PatternMaturityCommitOutcome::QualificationRejected => {
+                    outcome.rejected.push(PatternMaturityWriteRejection::new(
+                        proposal_index,
+                        PatternMaturityWriteRejectionReason::QualificationRejected,
+                    ));
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     fn persist_scheduled_reflection_offer(
@@ -1845,6 +1884,17 @@ fn validate_identity_citation(
         return Err(IdentityRevisionRejectionReason::QuoteMismatch(
             citation.evidence_id(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_response_citations(
+    response: &crate::RuntimeResponse,
+    context: &WorkingContext,
+    prompt: &ConversationEvidence,
+) -> Result<(), CoreError> {
+    for citation in response.citations() {
+        validate_citation(citation, context, prompt).map_err(CoreError::InvalidResponseCitation)?;
     }
     Ok(())
 }

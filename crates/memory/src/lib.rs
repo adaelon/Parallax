@@ -15,12 +15,13 @@ pub use domain::{
     MemoryDispute, MemoryDisputeId, MemoryDisputeOutcome, MemoryDisputeRequest,
     MemoryDisputeResolution, MemoryDisputeReview, MemoryDisputeReviewDecision,
     MemoryDisputeReviewRecord, MemoryId, MemoryKind, MemoryProposal, MemoryStatus, MemorySubject,
-    MemoryTarget, MemoryVersion, ValidatedMemoryDispute, ValidatedMemoryDisputeReview,
-    ValidatedMemoryProposal,
+    MemoryTarget, MemoryVersion, PatternMaturityRecord, ValidatedMemoryDispute,
+    ValidatedMemoryDisputeReview, ValidatedMemoryProposal, ValidatedPatternMaturityProposal,
 };
 pub use in_memory::InMemoryLongTermMemoryRepository;
 pub use ports::LongTermMemoryRepository;
 pub use service::{
     MemoryDisputeRejectionReason, MemoryDisputeReviewRejectionReason, MemoryError,
     MemoryMaintenance, MemoryProposalField, MemoryProposalRejectionReason,
+    PatternMaturityRejectionReason, commit_pattern_maturity,
 };

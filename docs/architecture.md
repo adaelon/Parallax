@@ -683,6 +683,14 @@ ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
        person mutes -> state=MUTED_BY_PERSON; retain observation, stop proactive offers
        person raises topic -> allow discussion without deleting mute
        immediate_safety_risk -> may override mute
+  -> for each propose_pattern_maturity(memory_id, expected_version, qualification_refs, rationale):
+       require at most one maturity proposal in the runtime response
+       trusted repository adapter invokes the same Memory domain qualification service
+       require target is the exact current PROVISIONAL_PATTERN version
+       require independent new support + fresh counterexample review + two-sided discussion
+       qualification rejection -> retain PROVISIONAL_PATTERN and return an explicit rejection
+       valid proposal -> atomically append SUPPORTED_COUNTERPART_VIEW successor + maturity record
+       duplicate proposal -> reject before a second Memory service call
   -> for each shared_experience_candidate:
        agreement | relationship_commitment:
          require explicit assent from person and counterpart in ConversationEvidence
@@ -853,7 +861,9 @@ MemoryReviewRequested
 
 深度理解投影与长期记忆是两个独立层：前者是可重建的证据结构，后者是第二自我选择跨任务保留的认识。投影不能绕过记忆写入策略直接成为长期信念。
 
-S16 当前实现由 `crates/memory` 固定不完整提议表示、三账本来源校验、可信度上限、直接证据严格条件和显式版本目标。`MemoryMaintenance::propose` 是唯一初始晋升入口：直接证据写 `ACTIVE`，解释性推断写 `PROVISIONAL`，模式候选只写 `PROVISIONAL_PATTERN`；Vault 从 schema v13 起原子追加版本与状态事件。S18 只在既有来源 Claim 被本人纠正时传播版本或失效，不创建无既有记忆依据的长期记忆；S27 的三事件门槛/成熟提议仍不在本片入口内。
+S16 当前实现由 `crates/memory` 固定不完整提议表示、三账本来源校验、可信度上限、直接证据严格条件和显式版本目标。`MemoryMaintenance::propose` 是唯一初始晋升入口：直接证据写 `ACTIVE`，解释性推断写 `PROVISIONAL`，模式候选只写 `PROVISIONAL_PATTERN`；Vault 从 schema v13 起原子追加版本与状态事件。S18 只在既有来源 Claim 被本人纠正时传播版本或失效，不创建无既有记忆依据的长期记忆。
+
+S27 在同一 Memory 领域服务中增加初始三事件、跨时间、同源折叠与反例复查门禁，以及显式 `PatternMaturityProposal` 资格矩阵；新增支持、再次反例复查和双方讨论都只建立资格。Vault schema v23 保存初始复查、成熟提议、完整引用与后继版本，并把新表纳入遗忘闭包。真实 `MemoryCore::run_counterpart_turn` 只接受 Runtime 白名单中的至多一个成熟操作，经 Vault 可信适配器调用 `commit_pattern_maturity`；Core 不复制资格规则，合法提议写 `SUPPORTED_COUNTERPART_VIEW`，未知或不合格目标保持原状态，重复操作在第二次服务调用前拒绝。稳定看法继续走 S17 争议复核，强反例可进入 `WEAKENED`、`SUPERSEDED` 或 `RETRACTED`。
 
 S17 在长期记忆普通通道之外增加 `recall_disputed_memories`：查询必须有文本或实体词，并直接命中当前记忆、本人异议或复核依据；适用时间仍是交集门禁。Vault 只返回最新且状态为 `DISPUTED` 的 `OPEN/MAINTAINED` 争议，并在可信边界内回读记忆来源 Claim、本人逐字反证和第二自我复核依据。Context Builder 优先把整对作为单个预算项冻结；任何一方缺失、状态损坏或预算不足都不返回半对。`DecisionImpact` 同时进入 replay digest，确保普通与高影响上下文不可误当成同一快照。
 
@@ -1873,3 +1883,35 @@ G08 scheduler freezes at most one ReflectionRuntimeContext
 ```
 
 同一 `topic_key` 同时至多存在一个未解决邀请；已解决议题可形成后续新邀请。普通邀请遵守 7 天延后与空闲/定时回顾 24 小时主动频率，静默保留观察和证据；只有 G08 固定即时风险夹具可越过无关任务或静默。桌面只对 `OFFERED` 状态展示仪式：第一次提供延后/完成，延后过一次后的下一次提供额外显示唯一一次静默询问；三个决定都由 Core 校验和持久化。本人消息命中未解决 `topic_key` 的至多两个规范词项时，可信宿主才冻结相关话题机会；静默议题以 `discuss_only` 进入运行时且不恢复主动资格。该实现落实 [ADR-0040](adr/0040-counterpart-uses-deferrable-reflection-invitations.md) 与 [ADR-0041](adr/0041-person-may-mute-proactive-reflection.md)。
+
+### 9.27 S27 模式成熟与稳定看法当前实现边界
+
+```text
+crates/memory/src/
+  domain.rs / service.rs / ports.rs       # 初始模式门槛、唯一成熟资格矩阵与稳定看法版本
+  in_memory.rs                            # 无自动升级的确定性领域适配器
+crates/core/src/
+  domain.rs / ports.rs / memory_loop.rs   # Runtime 提议、单操作门禁与提交回执
+crates/vault/src/
+  schema.rs / repository.rs               # schema v23、资格重检、原子版本与遗忘闭包
+crates/runtime-gateway/src/
+  adapter.rs                              # propose_pattern_maturity 严格结构化白名单
+```
+
+```text
+explicit PatternCandidate proposal
+  -> Memory validates >= 3 independent evidence events across time
+  -> require counterpart counterexample-review evidence after the initial support
+  -> Vault atomically writes PROVISIONAL_PATTERN + ordered sources + initial review
+  -> new support/review/discussion alone do not mutate status
+  -> Runtime may emit at most one complete propose_pattern_maturity
+  -> Memory revalidates current version, source ownership/currentness, independent new support,
+     exact fresh review, exact counter-evidence and person+counterpart discussion
+  -> Vault transaction supersedes the provisional version and appends
+     SUPPORTED_COUNTERPART_VIEW + complete PatternMaturityRecord
+  -> restart restores both versions and every ordered qualification reference
+  -> person dispute enters DISPUTED; counterpart review may WEAKEN/SUPERSEDE/RETRACT
+  -> forgetting any source or qualification evidence removes the complete derived memory closure
+```
+
+Core 的 `MemoryRepository` 对没有长期记忆适配器的实现默认关闭成熟提交；生产 `VaultRepository` 才把提议交给 `eam_memory::commit_pattern_maturity`，避免 `core -> memory` 反向依赖和资格矩阵复制。该路径不新增桌面 command 或仪式，落实 [ADR-0035](adr/0035-counterpart-explicitly-proposes-long-term-memory.md)、[ADR-0042](adr/0042-pattern-reflection-requires-three-independent-events.md)、[ADR-0043](adr/0043-pattern-may-mature-into-supported-counterpart-view.md) 与 [ADR-0044](adr/0044-counterpart-explicitly-proposes-pattern-maturity.md)。

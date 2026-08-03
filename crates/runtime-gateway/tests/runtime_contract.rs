@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io::{Read, Write},
     net::TcpListener,
+    path::Path,
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -11,13 +12,17 @@ use eam_core::{
     CoreError, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId, FrozenEvidenceBlock,
     FrozenMemoryDispute, FrozenRetrievalWindow, IdentityEvolutionRepository,
     IdentityProfileSnapshot, IdentityRuntimeContext, IdentityStateSnapshot, InMemoryRepository,
-    IncrementingClock, MemoryCore, MemoryRepository, PersonTurnClassification,
-    ReflectionImportance, ReflectionInvitation, ReflectionInvitationBasis,
-    ReflectionInvitationRepository, ReflectionInvitationState, ReflectionOpportunity,
-    RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SessionId,
+    IncrementingClock, MemoryCore, MemoryRepository, PatternMaturityWriteRejectionReason,
+    PersonTurnClassification, ReflectionImportance, ReflectionInvitation,
+    ReflectionInvitationBasis, ReflectionInvitationRepository, ReflectionInvitationState,
+    ReflectionOpportunity, RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SessionId,
     SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementRevision,
     SharedExperienceKind, SharedExperienceRepository, SourceCurrentness, Speaker,
     StructuredOperationRejectionReason, Timestamp, Uncertainty, WorkingContext,
+};
+use eam_memory::{
+    LongTermMemoryRepository, MemoryBasis, MemoryConfidence, MemoryId, MemoryKind,
+    MemoryMaintenance, MemoryProposal, MemoryStatus, MemorySubject,
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL,
@@ -47,6 +52,15 @@ const AGREEMENT_WITHDRAWAL_MISSING_REASON_RESPONSE: &str =
 const IDENTITY_REVISION_RESPONSE: &str = include_str!("fixtures/identity-revision-response.json");
 const REFLECTION_INVITATION_RESPONSE: &str =
     include_str!("fixtures/reflection-invitation-response.json");
+const PATTERN_MATURITY_RESPONSE: &str = include_str!("fixtures/pattern-maturity-response.json");
+const PATTERN_MATURITY_DUPLICATE_RESPONSE: &str =
+    include_str!("fixtures/pattern-maturity-duplicate-response.json");
+const PATTERN_MATURITY_INELIGIBLE_RESPONSE: &str =
+    include_str!("fixtures/pattern-maturity-ineligible-response.json");
+const PATTERN_MATURITY_UNKNOWN_RESPONSE: &str =
+    include_str!("fixtures/pattern-maturity-unknown-response.json");
+const PATTERN_MATURITY_MALFORMED_RESPONSE: &str =
+    include_str!("fixtures/pattern-maturity-malformed-response.json");
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -495,6 +509,132 @@ fn runtime_receives_one_scheduled_reflection_and_emits_a_strict_sourced_invitati
             .to_string()
             .contains("propose_reflection_invitation")
     );
+}
+
+#[test]
+fn runtime_strict_pattern_maturity_schema_rejects_an_incomplete_operation() {
+    let runtime = cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(PATTERN_MATURITY_MALFORMED_RESPONSE),
+    ]);
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(2_800),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let error = core
+        .run_counterpart_turn(
+            SessionId::new("pattern-maturity-malformed"),
+            "Please review the pattern.",
+            context,
+        )
+        .expect_err("missing rationale must fail the runtime contract");
+    assert!(matches!(
+        error,
+        CoreError::Runtime(ref runtime_error)
+            if runtime_error.kind() == RuntimeErrorKind::InvalidResponse
+    ));
+}
+
+#[test]
+fn runtime_unknown_and_ineligible_pattern_maturity_are_rejected_without_writing() {
+    for response in [
+        PATTERN_MATURITY_UNKNOWN_RESPONSE,
+        PATTERN_MATURITY_INELIGIBLE_RESPONSE,
+    ] {
+        let directory = tempdir().unwrap();
+        let (outcome, core) = run_seeded_pattern_contract(directory.path(), response);
+
+        assert!(outcome.accepted_pattern_maturities().is_empty());
+        assert_eq!(outcome.rejected_pattern_maturities().len(), 1);
+        assert_eq!(
+            outcome.rejected_pattern_maturities()[0].reason(),
+            &PatternMaturityWriteRejectionReason::QualificationRejected
+        );
+        let pattern_id = MemoryId::new(1).unwrap();
+        let current = core
+            .repository()
+            .current_memory(pattern_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version(), 1);
+        assert_eq!(current.status(), MemoryStatus::ProvisionalPattern);
+        assert!(
+            core.repository()
+                .pattern_maturity_records(pattern_id)
+                .unwrap()
+                .is_empty()
+        );
+        let (repository, _, _) = core.into_parts();
+        repository.close().unwrap();
+    }
+}
+
+#[test]
+fn runtime_pattern_maturity_uses_memory_qualification_and_commits_the_successor() {
+    let directory = tempdir().unwrap();
+    let (outcome, core) = run_seeded_pattern_contract(directory.path(), PATTERN_MATURITY_RESPONSE);
+
+    assert!(outcome.rejected_operations().is_empty());
+    assert!(outcome.rejected_pattern_maturities().is_empty());
+    assert_eq!(outcome.accepted_pattern_maturities().len(), 1);
+    assert_eq!(outcome.accepted_pattern_maturities()[0].memory_id(), 1);
+    assert_eq!(outcome.accepted_pattern_maturities()[0].memory_version(), 2);
+    let pattern_id = MemoryId::new(1).unwrap();
+    let current = core
+        .repository()
+        .current_memory(pattern_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version(), 2);
+    assert_eq!(current.status(), MemoryStatus::SupportedCounterpartView);
+    assert_eq!(
+        core.repository()
+            .pattern_maturity_records(pattern_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let request: Value =
+        serde_json::from_str(core.runtime().disclosures().last().unwrap().request_json()).unwrap();
+    let schema = request["text"]["format"]["schema"].to_string();
+    assert!(schema.contains("propose_pattern_maturity"));
+    assert!(schema.contains("counterexample_review_ref"));
+    let instructions = request["instructions"].as_str().unwrap();
+    assert!(instructions.contains("Qualification never auto-upgrades"));
+    assert!(instructions.contains("person discussion is not approval"));
+    let (repository, _, _) = core.into_parts();
+    repository.close().unwrap();
+}
+
+#[test]
+fn runtime_rejects_a_duplicate_pattern_maturity_after_one_commit() {
+    let directory = tempdir().unwrap();
+    let (outcome, core) =
+        run_seeded_pattern_contract(directory.path(), PATTERN_MATURITY_DUPLICATE_RESPONSE);
+
+    assert_eq!(outcome.accepted_pattern_maturities().len(), 1);
+    assert_eq!(outcome.rejected_pattern_maturities().len(), 1);
+    assert_eq!(
+        outcome.rejected_pattern_maturities()[0].reason(),
+        &PatternMaturityWriteRejectionReason::DuplicateProposal
+    );
+    let pattern_id = MemoryId::new(1).unwrap();
+    assert_eq!(
+        core.repository()
+            .pattern_maturity_records(pattern_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        core.repository().memory_versions(pattern_id).unwrap().len(),
+        2
+    );
+    let (repository, _, _) = core.into_parts();
+    repository.close().unwrap();
 }
 
 #[test]
@@ -1085,6 +1225,146 @@ fn unavailable_runtime_does_not_rollback_encrypted_evidence_across_reopen() {
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].verbatim(), "重启后仍应存在的原始证据");
     repository.close().unwrap();
+}
+
+fn run_seeded_pattern_contract(
+    directory: &Path,
+    turn_response: &'static str,
+) -> (
+    eam_core::TurnOutcome,
+    MemoryCore<VaultRepository, OpenAiResponsesRuntime<ScriptedTransport>, IncrementingClock>,
+) {
+    let repository = seed_pattern_vault(directory);
+    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(turn_response)]);
+    let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(2_000));
+    let context = core.freeze_working_context(&[]).unwrap();
+    let outcome = core
+        .run_counterpart_turn(
+            SessionId::new("pattern-maturity-runtime"),
+            "Please decide whether the reviewed pattern should remain provisional.",
+            context,
+        )
+        .unwrap();
+    (outcome, core)
+}
+
+fn seed_pattern_vault(directory: &Path) -> VaultRepository {
+    let mut repository = VaultRepository::open(directory, VaultKey::new([0x72; 32])).unwrap();
+    for evidence in [
+        pattern_conversation(
+            1,
+            Speaker::Person,
+            "I reviewed plans calmly in January",
+            100,
+        ),
+        pattern_conversation(
+            2,
+            Speaker::Person,
+            "I reviewed plans calmly in February",
+            200,
+        ),
+        pattern_conversation(3, Speaker::Person, "I reviewed plans calmly in March", 300),
+        pattern_conversation(
+            4,
+            Speaker::Person,
+            "I reviewed plans calmly in April",
+            1_200,
+        ),
+        pattern_conversation(
+            10,
+            Speaker::Counterpart,
+            "I checked the initial sequence for exceptions",
+            350,
+        ),
+        pattern_conversation(
+            11,
+            Speaker::Counterpart,
+            "I checked the newer sequence for exceptions",
+            1_300,
+        ),
+        pattern_conversation(
+            12,
+            Speaker::Person,
+            "I think that pattern fits some weeks, but not every week",
+            1_400,
+        ),
+        pattern_conversation(
+            13,
+            Speaker::Counterpart,
+            "I agree it has limits and still see a recurring tendency",
+            1_500,
+        ),
+        pattern_conversation(
+            14,
+            Speaker::Person,
+            "One rushed week still ran differently",
+            1_600,
+        ),
+    ] {
+        repository.append_evidence(evidence).unwrap();
+    }
+    for (claim_id, evidence_id, quote, at) in [
+        (1, 1, "I reviewed plans calmly in January", 100),
+        (2, 2, "I reviewed plans calmly in February", 200),
+        (3, 3, "I reviewed plans calmly in March", 300),
+        (4, 4, "I reviewed plans calmly in April", 1_200),
+    ] {
+        repository
+            .append_claim(pattern_claim(claim_id, evidence_id, quote, at))
+            .unwrap();
+    }
+    let mut maintenance = MemoryMaintenance::new(repository, IncrementingClock::new(1_000));
+    let pattern = maintenance
+        .propose(
+            &MemoryProposal::new("Planning reviews tend to become calmer across months")
+                .with_subject(MemorySubject::Counterpart)
+                .with_kind(MemoryKind::Hypothesis)
+                .with_source_claims([1, 2, 3].into_iter().map(ClaimId::from_raw))
+                .with_applicable_time(ApplicableTime::Since(Timestamp::from_millis(100)))
+                .with_confidence(MemoryConfidence::Medium)
+                .with_salience_reason("Worth retaining as a provisional cross-month pattern")
+                .with_basis(MemoryBasis::PatternCandidate)
+                .with_pattern_counterexample_review(EvidenceCitation::new(
+                    EvidenceId::from_raw(10),
+                    "I checked the initial sequence for exceptions",
+                )),
+        )
+        .unwrap();
+    assert_eq!(pattern.id(), MemoryId::new(1).unwrap());
+    assert_eq!(pattern.version(), 1);
+    let (repository, _) = maintenance.into_parts();
+    repository.close().unwrap();
+    VaultRepository::open(directory, VaultKey::new([0x72; 32])).unwrap()
+}
+
+fn pattern_conversation(
+    id: u64,
+    speaker: Speaker,
+    text: &str,
+    recorded_at_millis: i64,
+) -> ConversationEvidence {
+    ConversationEvidence::restore(
+        EvidenceId::from_raw(id),
+        SessionId::new("pattern-maturity-seed"),
+        speaker,
+        text.to_owned(),
+        Timestamp::from_millis(recorded_at_millis),
+    )
+}
+
+fn pattern_claim(id: u64, evidence_id: u64, quote: &str, recorded_at_millis: i64) -> Claim {
+    Claim::restore(
+        ClaimId::from_raw(id),
+        ClaimOwner::Counterpart,
+        format!("planning review event {id}"),
+        vec![EvidenceCitation::new(
+            EvidenceId::from_raw(evidence_id),
+            quote,
+        )],
+        Some(Uncertainty::Medium),
+        ApplicableTime::At(Timestamp::from_millis(recorded_at_millis)),
+        Timestamp::from_millis(recorded_at_millis),
+    )
 }
 
 fn assert_retryable_error_degrades_to_local(error: TransportError) {

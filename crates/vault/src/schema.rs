@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 22;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 23;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1277,6 +1277,185 @@ CREATE UNIQUE INDEX one_open_reflection_per_topic
     ON reflection_invitations(topic_key) WHERE state != 4;
 ";
 
+const MIGRATION_23: &str = r"
+ALTER TABLE long_term_memory_state_events
+    RENAME TO long_term_memory_state_events_v22;
+
+CREATE TABLE long_term_memory_state_events (
+    memory_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    status INTEGER NOT NULL CHECK (status BETWEEN 0 AND 7),
+    occurred_at INTEGER NOT NULL,
+    PRIMARY KEY (memory_id, version, ordinal),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE CASCADE
+) STRICT;
+
+INSERT INTO long_term_memory_state_events
+    (memory_id, version, ordinal, status, occurred_at)
+SELECT memory_id, version, ordinal, status, occurred_at
+FROM long_term_memory_state_events_v22;
+
+DROP TABLE long_term_memory_state_events_v22;
+
+ALTER TABLE memory_dispute_counter_evidence
+    RENAME TO memory_dispute_counter_evidence_v22;
+ALTER TABLE memory_dispute_review_evidence
+    RENAME TO memory_dispute_review_evidence_v22;
+ALTER TABLE memory_dispute_terms
+    RENAME TO memory_dispute_terms_v22;
+DROP INDEX one_open_memory_dispute;
+DROP INDEX memory_disputes_memory;
+DROP INDEX memory_dispute_terms_lookup;
+ALTER TABLE memory_disputes RENAME TO memory_disputes_v22;
+
+CREATE TABLE memory_disputes (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    memory_id INTEGER NOT NULL,
+    memory_version INTEGER NOT NULL CHECK (memory_version > 0),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    raised_at INTEGER NOT NULL,
+    outcome INTEGER NOT NULL CHECK (outcome BETWEEN 0 AND 4),
+    reviewed_at INTEGER,
+    review_rationale TEXT,
+    revised_version INTEGER,
+    FOREIGN KEY (memory_id, memory_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    FOREIGN KEY (memory_id, revised_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    CHECK (
+        (outcome = 0 AND reviewed_at IS NULL AND review_rationale IS NULL
+                     AND revised_version IS NULL)
+        OR
+        (outcome BETWEEN 1 AND 4 AND reviewed_at IS NOT NULL
+                                 AND length(trim(review_rationale)) > 0)
+    ),
+    CHECK (
+        (outcome = 2 AND revised_version IS NOT NULL)
+        OR
+        (outcome <> 2 AND revised_version IS NULL)
+    )
+) STRICT;
+
+INSERT INTO memory_disputes
+    (id, memory_id, memory_version, reason, raised_at, outcome,
+     reviewed_at, review_rationale, revised_version)
+SELECT id, memory_id, memory_version, reason, raised_at, outcome,
+       reviewed_at, review_rationale, revised_version
+FROM memory_disputes_v22;
+
+CREATE UNIQUE INDEX one_open_memory_dispute
+    ON memory_disputes(memory_id, memory_version) WHERE outcome = 0;
+CREATE INDEX memory_disputes_memory
+    ON memory_disputes(memory_id, memory_version);
+
+CREATE TABLE memory_dispute_counter_evidence (
+    dispute_id INTEGER NOT NULL REFERENCES memory_disputes(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    evidence_id INTEGER NOT NULL REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    quote TEXT NOT NULL CHECK (length(trim(quote)) > 0),
+    PRIMARY KEY (dispute_id, ordinal),
+    UNIQUE (dispute_id, evidence_id)
+) STRICT;
+
+INSERT INTO memory_dispute_counter_evidence
+    (dispute_id, ordinal, evidence_id, quote)
+SELECT dispute_id, ordinal, evidence_id, quote
+FROM memory_dispute_counter_evidence_v22;
+
+CREATE TABLE memory_dispute_review_evidence (
+    dispute_id INTEGER NOT NULL REFERENCES memory_disputes(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    evidence_id INTEGER NOT NULL REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    quote TEXT NOT NULL CHECK (length(trim(quote)) > 0),
+    PRIMARY KEY (dispute_id, ordinal),
+    UNIQUE (dispute_id, evidence_id)
+) STRICT;
+
+INSERT INTO memory_dispute_review_evidence
+    (dispute_id, ordinal, evidence_id, quote)
+SELECT dispute_id, ordinal, evidence_id, quote
+FROM memory_dispute_review_evidence_v22;
+
+CREATE TABLE memory_dispute_terms (
+    dispute_id INTEGER NOT NULL REFERENCES memory_disputes(id) ON DELETE CASCADE,
+    term TEXT NOT NULL CHECK (length(term) > 0),
+    PRIMARY KEY (dispute_id, term)
+) STRICT;
+
+INSERT INTO memory_dispute_terms (dispute_id, term)
+SELECT dispute_id, term FROM memory_dispute_terms_v22;
+
+CREATE INDEX memory_dispute_terms_lookup ON memory_dispute_terms(term);
+
+DROP TABLE memory_dispute_counter_evidence_v22;
+DROP TABLE memory_dispute_review_evidence_v22;
+DROP TABLE memory_dispute_terms_v22;
+DROP TABLE memory_disputes_v22;
+
+CREATE TABLE long_term_memory_counterexample_reviews (
+    memory_id INTEGER NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    evidence_id INTEGER NOT NULL
+        REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    quote TEXT NOT NULL CHECK (length(trim(quote)) > 0),
+    PRIMARY KEY (memory_id, version),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX long_term_memory_counterexample_review_source
+    ON long_term_memory_counterexample_reviews(evidence_id);
+
+CREATE TABLE pattern_maturity_records (
+    memory_id INTEGER NOT NULL,
+    from_version INTEGER NOT NULL CHECK (from_version > 0),
+    to_version INTEGER NOT NULL CHECK (to_version = from_version + 1),
+    rationale TEXT NOT NULL CHECK (length(trim(rationale)) > 0),
+    proposed_at INTEGER NOT NULL,
+    PRIMARY KEY (memory_id, to_version),
+    FOREIGN KEY (memory_id, from_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    FOREIGN KEY (memory_id, to_version)
+        REFERENCES long_term_memory_versions(memory_id, version) ON DELETE RESTRICT,
+    FOREIGN KEY (memory_id, to_version)
+        REFERENCES long_term_memory_counterexample_reviews(memory_id, version)
+        ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE pattern_maturity_new_support (
+    memory_id INTEGER NOT NULL,
+    to_version INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE RESTRICT,
+    PRIMARY KEY (memory_id, to_version, ordinal),
+    UNIQUE (memory_id, to_version, claim_id),
+    FOREIGN KEY (memory_id, to_version)
+        REFERENCES pattern_maturity_records(memory_id, to_version) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX pattern_maturity_new_support_claim
+    ON pattern_maturity_new_support(claim_id);
+
+CREATE TABLE pattern_maturity_evidence (
+    memory_id INTEGER NOT NULL,
+    to_version INTEGER NOT NULL,
+    role INTEGER NOT NULL CHECK (role IN (0, 1)),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    evidence_id INTEGER NOT NULL
+        REFERENCES conversation_evidence(id) ON DELETE RESTRICT,
+    quote TEXT NOT NULL CHECK (length(trim(quote)) > 0),
+    PRIMARY KEY (memory_id, to_version, role, ordinal),
+    UNIQUE (memory_id, to_version, role, evidence_id),
+    FOREIGN KEY (memory_id, to_version)
+        REFERENCES pattern_maturity_records(memory_id, to_version) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX pattern_maturity_evidence_source
+    ON pattern_maturity_evidence(evidence_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1316,6 +1495,7 @@ where
             20 => transaction.execute_batch(MIGRATION_20)?,
             21 => transaction.execute_batch(MIGRATION_21)?,
             22 => transaction.execute_batch(MIGRATION_22)?,
+            23 => transaction.execute_batch(MIGRATION_23)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -2443,6 +2623,53 @@ mod tests {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema
                  WHERE name = 'agreement_withdrawals')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_exists);
+    }
+
+    #[test]
+    fn interrupted_pattern_maturity_migration_keeps_v22_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 23 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(23))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            22
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'pattern_maturity_records')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'pattern_maturity_records')",
                 [],
                 |row| row.get(0),
             )
