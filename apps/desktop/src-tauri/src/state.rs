@@ -33,7 +33,7 @@ use eam_retrieval::{
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, OpenAiResponsesRuntime, RuntimeTarget,
 };
-use eam_vault::{VaultKeyStore, VaultRepository};
+use eam_vault::{PreparedVault, VaultKey, VaultKeyStore, VaultRepository};
 use serde::Serialize;
 
 const LOCAL_RESPONSES_ENDPOINT: &str = "http://127.0.0.1:11434/v1/responses";
@@ -43,6 +43,7 @@ const CONTINUOUS_SESSION_ID: &str = "continuous-conversation";
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_TURNS: usize = 32;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+const VAULT_SETUP_INCOMPLETE: &str = "vault setup is not complete";
 
 type AppRuntime = Box<dyn CounterpartRuntime + Send>;
 type AppCore = MemoryCore<VaultRepository, AppRuntime, SystemClock>;
@@ -50,11 +51,14 @@ type AppCore = MemoryCore<VaultRepository, AppRuntime, SystemClock>;
 pub struct ManagedHost {
     inner: Mutex<HostSlot>,
     vault_root: PathBuf,
+    launch_mode: LaunchMode,
     updater_configured: bool,
 }
 
 #[allow(clippy::large_enum_variant)] // One mutex-owned Core is resident; boxing adds no useful boundary.
 enum HostSlot {
+    NeedsInitialization,
+    AwaitingRecoveryConfirmation(PreparedVault),
     Ready(HostCore),
     Locked(String),
     FailedClosed(String),
@@ -75,6 +79,12 @@ pub struct HostStatusView {
     vault_ready: bool,
     updater_configured: bool,
     detail: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryKeyView {
+    recovery_key: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -238,17 +248,101 @@ pub struct ImportContextFileView {
 impl ManagedHost {
     #[must_use]
     pub fn open(vault_root: PathBuf, launch_mode: LaunchMode, updater_configured: bool) -> Self {
-        let slot =
-            HostCore::open(&vault_root, launch_mode).map_or_else(HostSlot::Locked, HostSlot::Ready);
+        let slot = match VaultKeyStore::is_initialized(&vault_root) {
+            Ok(false) => HostSlot::NeedsInitialization,
+            Ok(true) => HostCore::open(&vault_root, launch_mode)
+                .map_or_else(HostSlot::Locked, HostSlot::Ready),
+            Err(error) => HostSlot::Locked(error.to_string()),
+        };
         Self {
             inner: Mutex::new(slot),
             vault_root,
+            launch_mode,
             updater_configured,
         }
     }
 
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        matches!(&*self.lock(), HostSlot::Ready(_))
+    }
+
+    pub fn initialize_vault(&self) -> Result<RecoveryKeyView, String> {
+        let mut slot = self.lock();
+        if !matches!(&*slot, HostSlot::NeedsInitialization) {
+            return Err(match &*slot {
+                HostSlot::AwaitingRecoveryConfirmation(_) => {
+                    "vault initialization is already awaiting recovery-key confirmation".to_owned()
+                }
+                HostSlot::Ready(_) => "vault is already initialized".to_owned(),
+                HostSlot::Locked(detail) => format!("vault is locked: {detail}"),
+                HostSlot::FailedClosed(detail) => format!("Core is closed: {detail}"),
+                HostSlot::Closed => "desktop host is already stopped".to_owned(),
+                HostSlot::NeedsInitialization => unreachable!(),
+            });
+        }
+
+        let prepared = VaultKeyStore::prepare().map_err(|error| error.to_string())?;
+        let recovery_key = prepared.recovery_key().expose_secret().to_owned();
+        *slot = HostSlot::AwaitingRecoveryConfirmation(prepared);
+        Ok(RecoveryKeyView { recovery_key })
+    }
+
+    pub fn confirm_recovery_key_saved(&self, confirmed: bool) -> Result<HostStatusView, String> {
+        if !confirmed {
+            return Err("recovery-key confirmation is required".to_owned());
+        }
+
+        let mut slot = self.lock();
+        let pending = match std::mem::replace(&mut *slot, HostSlot::Closed) {
+            HostSlot::AwaitingRecoveryConfirmation(pending) => pending,
+            other => {
+                let message = match &other {
+                    HostSlot::NeedsInitialization => {
+                        "vault initialization has not started".to_owned()
+                    }
+                    HostSlot::Ready(_) => "vault is already initialized".to_owned(),
+                    HostSlot::Locked(detail) => format!("vault is locked: {detail}"),
+                    HostSlot::FailedClosed(detail) => format!("Core is closed: {detail}"),
+                    HostSlot::Closed => "desktop host is already stopped".to_owned(),
+                    HostSlot::AwaitingRecoveryConfirmation(_) => unreachable!(),
+                };
+                *slot = other;
+                return Err(message);
+            }
+        };
+
+        if let Err(error) = pending.commit(&self.vault_root) {
+            *slot = HostSlot::AwaitingRecoveryConfirmation(pending);
+            return Err(error.to_string());
+        }
+        let (vault_key, recovery_key) = pending.into_parts();
+        drop(recovery_key);
+        match HostCore::open_with_key(&self.vault_root, vault_key, self.launch_mode) {
+            Ok(host) => *slot = HostSlot::Ready(host),
+            Err(error) => {
+                *slot = HostSlot::Locked(error.clone());
+                return Err(error);
+            }
+        }
+        drop(slot);
+        Ok(self.status())
+    }
+
     pub fn status(&self) -> HostStatusView {
         match &*self.lock() {
+            HostSlot::NeedsInitialization => HostStatusView {
+                state: "needsInitialization",
+                vault_ready: false,
+                updater_configured: self.updater_configured,
+                detail: None,
+            },
+            HostSlot::AwaitingRecoveryConfirmation(_) => HostStatusView {
+                state: "awaitingRecoveryConfirmation",
+                vault_ready: false,
+                updater_configured: self.updater_configured,
+                detail: None,
+            },
             HostSlot::Ready(host) => HostStatusView {
                 state: encode_host_state(host.lifecycle.state()),
                 vault_ready: true,
@@ -282,7 +376,10 @@ impl ManagedHost {
                 .lifecycle
                 .hide_window()
                 .map_err(|error| error.to_string()),
-            HostSlot::Locked(_) | HostSlot::FailedClosed(_) => Ok(()),
+            HostSlot::NeedsInitialization
+            | HostSlot::AwaitingRecoveryConfirmation(_)
+            | HostSlot::Locked(_)
+            | HostSlot::FailedClosed(_) => Ok(()),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
         }
     }
@@ -293,7 +390,10 @@ impl ManagedHost {
                 .lifecycle
                 .show_window()
                 .map_err(|error| error.to_string()),
-            HostSlot::Locked(_) | HostSlot::FailedClosed(_) => Ok(()),
+            HostSlot::NeedsInitialization
+            | HostSlot::AwaitingRecoveryConfirmation(_)
+            | HostSlot::Locked(_)
+            | HostSlot::FailedClosed(_) => Ok(()),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
         }
     }
@@ -312,7 +412,10 @@ impl ManagedHost {
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }
-            HostSlot::Locked(_) | HostSlot::FailedClosed(_) => Ok(()),
+            HostSlot::NeedsInitialization
+            | HostSlot::AwaitingRecoveryConfirmation(_)
+            | HostSlot::Locked(_)
+            | HostSlot::FailedClosed(_) => Ok(()),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
         }
     }
@@ -322,6 +425,9 @@ impl ManagedHost {
             HostSlot::Ready(host) => Ok(CaptureStatusView {
                 state: encode_capture_mode(host.capture.mode()),
             }),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -336,6 +442,9 @@ impl ManagedHost {
                 .all_capture_spans()
                 .map_err(|error| error.to_string())
                 .map(|spans| spans.iter().map(ActivityTimelineEntryView::from).collect()),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -372,7 +481,10 @@ impl ManagedHost {
                 };
                 persist_capture_checkpoint(host, checkpoint.as_ref())
             }
-            HostSlot::Locked(_) | HostSlot::FailedClosed(_) => Ok(()),
+            HostSlot::NeedsInitialization
+            | HostSlot::AwaitingRecoveryConfirmation(_)
+            | HostSlot::Locked(_)
+            | HostSlot::FailedClosed(_) => Ok(()),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
         }
     }
@@ -401,6 +513,9 @@ impl ManagedHost {
                     state: encode_capture_mode(host.capture.mode()),
                 })
             }
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -410,6 +525,9 @@ impl ManagedHost {
     pub fn list_conversation(&self) -> Result<Vec<ConversationTurnView>, String> {
         match &*self.lock() {
             HostSlot::Ready(host) => list_conversation_from_core(&host.core),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -419,6 +537,9 @@ impl ManagedHost {
     pub fn send_message(&self, verbatim: String) -> Result<ConversationTurnResult, String> {
         match &mut *self.lock() {
             HostSlot::Ready(host) => send_message_with_retrieval(&mut host.core, verbatim),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -430,6 +551,9 @@ impl ManagedHost {
     ) -> Result<Vec<SharedExperienceCeremonyView>, String> {
         match &*self.lock() {
             HostSlot::Ready(host) => list_shared_experience_ceremonies_from_core(&host.core),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -442,6 +566,9 @@ impl ManagedHost {
                 let at = host.host_clock.now();
                 list_active_shared_agreements_from_core(&host.core, at)
             }
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -451,6 +578,9 @@ impl ManagedHost {
     pub fn list_identity_history(&self) -> Result<Vec<IdentityStateView>, String> {
         match &*self.lock() {
             HostSlot::Ready(host) => list_identity_history_from_core(&host.core),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -462,6 +592,9 @@ impl ManagedHost {
     ) -> Result<Vec<ReflectionInvitationView>, String> {
         match &*self.lock() {
             HostSlot::Ready(host) => list_offered_reflection_invitations_from_core(&host.core),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -477,6 +610,9 @@ impl ManagedHost {
             HostSlot::Ready(host) => {
                 decide_reflection_invitation_from_core(&mut host.core, invitation_id, decision)
             }
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -491,6 +627,9 @@ impl ManagedHost {
         match &mut *self.lock() {
             HostSlot::Ready(host) => {
                 resolve_shared_agreement_from_core(&mut host.core, candidate_id, confirm)
+            }
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
             }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
@@ -511,6 +650,9 @@ impl ManagedHost {
                 confirmed,
                 reason,
             ),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -539,6 +681,9 @@ impl ManagedHost {
                 end_condition,
                 supersedes_agreement_ids,
             ),
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -549,6 +694,9 @@ impl ManagedHost {
         match &mut *self.lock() {
             HostSlot::Ready(host) => {
                 dismiss_shared_experience_ceremony_from_core(&mut host.core, claim_id)
+            }
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
             }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
@@ -572,6 +720,9 @@ impl ManagedHost {
                     archived_at_millis,
                 )
             }
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
+            }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
             HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
@@ -592,6 +743,9 @@ impl ManagedHost {
                     .repository_mut()
                     .record_browser_submission(session_id, submission)
                     .map_err(|error| error.to_string())
+            }
+            HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+                Err(VAULT_SETUP_INCOMPLETE.to_owned())
             }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
@@ -664,9 +818,17 @@ impl ManagedHost {
 
 impl HostCore {
     fn open(vault_root: &Path, launch_mode: LaunchMode) -> Result<Self, String> {
-        let runtime = configured_runtime()?;
         let vault_key =
             VaultKeyStore::unlock_local(vault_root).map_err(|error| error.to_string())?;
+        Self::open_with_key(vault_root, vault_key, launch_mode)
+    }
+
+    fn open_with_key(
+        vault_root: &Path,
+        vault_key: VaultKey,
+        launch_mode: LaunchMode,
+    ) -> Result<Self, String> {
+        let runtime = configured_runtime()?;
         let mut repository =
             VaultRepository::open(vault_root, vault_key).map_err(|error| error.to_string())?;
         let mut lifecycle = HostLifecycle::new();
@@ -1676,7 +1838,7 @@ mod tests {
         SharedExperienceProposal, Timestamp,
     };
     use eam_ingestion::{ArchiveInput, ArchiveReceipt};
-    use eam_vault::VaultKey;
+    use eam_vault::RecoveryKey;
     use tempfile::tempdir;
 
     use super::*;
@@ -1717,6 +1879,49 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn first_run_commits_nothing_until_the_recovery_key_is_confirmed() {
+        let _guard = sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let vault_root = directory.path().join("first-run-vault");
+        let interrupted = ManagedHost::open(vault_root.clone(), LaunchMode::Foreground, false);
+
+        assert_eq!(interrupted.status().state, "needsInitialization");
+        assert!(!interrupted.status().vault_ready);
+        let first_view = interrupted.initialize_vault().unwrap();
+        assert!(first_view.recovery_key.starts_with("eamrecovery1"));
+        assert_eq!(interrupted.status().state, "awaitingRecoveryConfirmation");
+        assert!(!vault_root.exists());
+        assert!(interrupted.initialize_vault().is_err());
+        assert!(interrupted.confirm_recovery_key_saved(false).is_err());
+        assert!(!vault_root.exists());
+        interrupted.shutdown(ExitReason::Explicit).unwrap();
+        assert!(!vault_root.exists());
+
+        let managed = ManagedHost::open(vault_root.clone(), LaunchMode::Foreground, false);
+        let recovery_view = managed.initialize_vault().unwrap();
+        let recovery_key = RecoveryKey::parse(&recovery_view.recovery_key).unwrap();
+        let ready = managed.confirm_recovery_key_saved(true).unwrap();
+
+        assert!(ready.vault_ready);
+        assert_eq!(ready.state, "foregroundRunning");
+        assert!(vault_root.join("bundle.meta").is_file());
+        assert!(vault_root.join("self.db").is_file());
+        assert!(managed.list_conversation().unwrap().is_empty());
+        managed.shutdown(ExitReason::Explicit).unwrap();
+
+        let recovered_key = VaultKeyStore::unlock_recovery(&vault_root, &recovery_key).unwrap();
+        VaultRepository::open(&vault_root, recovered_key)
+            .unwrap()
+            .close()
+            .unwrap();
+        let reopened = ManagedHost::open(vault_root, LaunchMode::Foreground, false);
+        assert!(reopened.is_ready());
+        assert!(reopened.initialize_vault().is_err());
+        reopened.shutdown(ExitReason::Explicit).unwrap();
+    }
+
     #[test]
     fn hiding_the_window_keeps_the_same_capture_interval_open() {
         let _guard = sqlcipher_test_lock();
@@ -1745,6 +1950,7 @@ mod tests {
                 host_clock: SystemClock,
             })),
             vault_root: directory.path().to_path_buf(),
+            launch_mode: LaunchMode::Foreground,
             updater_configured: false,
         };
         let snapshot = eam_capture_windows::ActivitySnapshot::new(
@@ -1797,6 +2003,7 @@ mod tests {
                 host_clock: SystemClock,
             })),
             vault_root: directory.path().to_path_buf(),
+            launch_mode: LaunchMode::Foreground,
             updater_configured: false,
         };
         let submission = BrowserSubmission::from_payload(BrowserSubmissionPayload {

@@ -13,7 +13,7 @@ mod schema;
 pub use backup::{BackupReceipt, RestoreReceipt, VaultBackup};
 pub use crypto::VaultKey;
 pub use error::VaultError;
-pub use key_store::{InitializedVault, RecoveryKey, VaultKeyStore};
+pub use key_store::{InitializedVault, PreparedVault, RecoveryKey, VaultKeyStore};
 pub use repository::VaultRepository;
 
 #[cfg(test)]

@@ -21,6 +21,24 @@ vi.mock("@tauri-apps/api/core", () => ({
 const invokeMock = vi.mocked(invoke);
 let root: Root;
 
+const READY_HOST_STATUS = {
+  state: "foregroundRunning",
+  vaultReady: true,
+  updaterConfigured: false,
+  detail: null,
+};
+
+type InvokeHandler = <T>(command: string) => Promise<T>;
+
+function mockReadyInvoke(implementation: InvokeHandler) {
+  invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    if (command === "get_host_status") {
+      return READY_HOST_STATUS as T;
+    }
+    return implementation<T>(command);
+  });
+}
+
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   document.body.innerHTML = '<div id="root"></div>';
@@ -32,6 +50,76 @@ afterEach(async () => {
   await act(async () => root.unmount());
 });
 
+describe("first-run encrypted vault setup", () => {
+  it("shows the recovery key once and loads trusted data only after confirmation", async () => {
+    const recoveryKey = "eamrecovery1first-run-test-carrier";
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "get_host_status") {
+        return {
+          state: "needsInitialization",
+          vaultReady: false,
+          updaterConfigured: false,
+          detail: null,
+        } as T;
+      }
+      if (command === "initialize_vault") {
+        return { recoveryKey } as T;
+      }
+      if (command === "confirm_recovery_key_saved") {
+        return READY_HOST_STATUS as T;
+      }
+      if (
+        command === "list_conversation" ||
+        command === "list_shared_experience_ceremonies" ||
+        command === "list_identity_history" ||
+        command === "list_offered_reflection_invitations" ||
+        command === "list_activity_timeline"
+      ) {
+        return [] as T;
+      }
+      if (command === "get_capture_status") {
+        return { state: "collecting" } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("创建你的加密保险库"),
+    );
+    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
+      "get_host_status",
+    ]);
+
+    await clickButton("生成恢复密钥");
+    await vi.waitFor(() => expect(document.body.textContent).toContain(recoveryKey));
+    const confirmButton = [...document.querySelectorAll("button")].find(
+      (button) => button.textContent === "我已安全保存，创建保险库",
+    ) as HTMLButtonElement;
+    expect(confirmButton.disabled).toBe(true);
+
+    await clickButton("复制恢复密钥");
+    expect(writeText).toHaveBeenCalledWith(recoveryKey);
+    const checkbox = document.querySelector<HTMLInputElement>("#recovery-key-saved")!;
+    await act(async () => checkbox.click());
+    expect(confirmButton.disabled).toBe(false);
+    await clickButton("我已安全保存，创建保险库");
+
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("从此刻继续认识彼此"),
+    );
+    expect(document.body.textContent).not.toContain(recoveryKey);
+    expect(invokeMock).toHaveBeenCalledWith("confirm_recovery_key_saved", {
+      confirmed: true,
+    });
+  });
+});
+
 describe("S07 continuous conversation", () => {
   it("restores prior turns and appends a successful round through whitelisted commands", async () => {
     const restored = [turn(1, "person", "重启前的原话")];
@@ -40,7 +128,7 @@ describe("S07 continuous conversation", () => {
       counterpart: turn(3, "counterpart", "我还在这里。"),
       ceremonies: [],
     };
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return restored as T;
       }
@@ -74,7 +162,7 @@ describe("S07 continuous conversation", () => {
     const persisted = [turn(4, "person", "即使失败也保留这句")];
     let listCalls = 0;
     let ceremonyCalls = 0;
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         listCalls += 1;
         return (listCalls === 1 ? [] : persisted) as T;
@@ -135,7 +223,7 @@ describe("S28 Windows activity timeline", () => {
         endedAtMillis: null,
       },
     ];
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (
         command === "list_conversation" ||
         command === "list_shared_experience_ceremonies"
@@ -176,7 +264,7 @@ describe("S28 Windows activity timeline", () => {
 describe("S20 typed shared-experience ceremony", () => {
   it("requires explicit confirmation before admitting a shared agreement", async () => {
     const ceremony = agreementCeremony();
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -214,7 +302,7 @@ describe("S20 typed shared-experience ceremony", () => {
 
   it("creates a new immutable candidate version instead of editing the signable one", async () => {
     const ceremony = agreementCeremony();
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -264,7 +352,7 @@ describe("S20 typed shared-experience ceremony", () => {
         },
       ],
     };
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -304,7 +392,7 @@ describe("S20 typed shared-experience ceremony", () => {
         { evidenceId: 2, speaker: "counterpart", quote: "我不同意" },
       ],
     };
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -362,7 +450,7 @@ describe("S20 typed shared-experience ceremony", () => {
         },
       ],
     };
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -400,7 +488,7 @@ describe("S24 asymmetric agreement withdrawal", () => {
       effectiveFromMillis: 1_785_000_000_000,
       effectiveUntilMillis: null,
     };
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -467,7 +555,7 @@ describe("S24 asymmetric agreement withdrawal", () => {
         },
       ],
     };
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -516,7 +604,7 @@ describe("S25 immutable identity history", () => {
         "这更能保持独立判断，同时让提醒可被质疑。",
       ),
     ];
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -553,7 +641,7 @@ describe("S25 immutable identity history", () => {
 describe("S26 deferrable reflection invitation ceremony", () => {
   it("shows the one-time mute choice after a repeated deferral and preserves explicit semantics", async () => {
     const reflection = reflectionInvitation(true);
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }
@@ -593,7 +681,7 @@ describe("S26 deferrable reflection invitation ceremony", () => {
 
   it("offers defer and resolve without prompting for mute on the first offer", async () => {
     const reflection = reflectionInvitation(false);
-    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
       if (command === "list_conversation") {
         return [] as T;
       }

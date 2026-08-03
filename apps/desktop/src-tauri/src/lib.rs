@@ -18,8 +18,9 @@ use serde::Serialize;
 use state::{
     ActiveSharedAgreementView, ActivityTimelineEntryView, CaptureStatusView,
     ConversationTurnResult, ConversationTurnView, HostStatusView, IdentityStateView,
-    ImportContextFileView, ManagedHost, ReflectionInvitationDecisionView, ReflectionInvitationView,
-    SharedAgreementResolutionView, SharedAgreementRevisionView, SharedExperienceCeremonyView,
+    ImportContextFileView, ManagedHost, RecoveryKeyView, ReflectionInvitationDecisionView,
+    ReflectionInvitationView, SharedAgreementResolutionView, SharedAgreementRevisionView,
+    SharedExperienceCeremonyView,
 };
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
@@ -53,6 +54,26 @@ struct UpdateAvailability {
 #[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
 fn get_host_status(host: tauri::State<'_, ManagedHost>) -> HostStatusView {
     host.status()
+}
+
+#[tauri::command]
+async fn initialize_vault(app: AppHandle) -> Result<RecoveryKeyView, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<ManagedHost>().initialize_vault())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn confirm_recovery_key_saved(
+    app: AppHandle,
+    confirmed: bool,
+) -> Result<HostStatusView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>()
+            .confirm_recovery_key_saved(confirmed)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -357,15 +378,11 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .setup(move |app| {
             let launch_mode = launch_mode();
             let vault_root = vault_root(app.handle())?;
-            app.manage(ManagedHost::open(
-                vault_root,
-                launch_mode,
-                updater_configured,
-            ));
+            let host = ManagedHost::open(vault_root, launch_mode, updater_configured);
+            let hide_background_window = launch_mode == LaunchMode::Background && host.is_ready();
+            app.manage(host);
             install_tray(app)?;
-            if launch_mode == LaunchMode::Background
-                && let Some(window) = app.get_webview_window("main")
-            {
+            if hide_background_window && let Some(window) = app.get_webview_window("main") {
                 window.hide()?;
             }
             spawn_heartbeat(app.handle().clone())?;
@@ -384,6 +401,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         })
         .invoke_handler(tauri::generate_handler![
             get_host_status,
+            initialize_vault,
+            confirm_recovery_key_saved,
             get_capture_status,
             list_activity_timeline,
             set_capture_paused,

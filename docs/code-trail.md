@@ -1,5 +1,27 @@
 # 代码链路
 
+## 2026-08-03 S31-2 完整系统验收与可安装构建
+
+**触达**:
+- `scripts/run-system-acceptance.ps1:Invoke-SystemAcceptanceMain` — 从矩阵、隐私和静态边界一路执行到全仓门禁、NSIS 构建与隔离安装烟测，18 个步骤全部通过。
+- `docs/system-acceptance-v1.md:§8` — 固定最终通过时间、覆盖计数、版本、安装包大小、SHA-256 与安装生命周期结果。
+- `target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe` — 生成供 S32 冻结使用的本地 NSIS 安装程序，不把安装包或本机结果 JSON 纳入 Git。
+
+**入口**：仓库根目录执行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-system-acceptance.ps1 -Mode Full`；结果写入被忽略的 `.local/system-acceptance/latest.json`。
+**测试**：完整 runner 18/18；Rust workspace、fmt、Clippy、desktop all-targets、React 14/14、浏览扩展 10/10、两套 TypeScript/生产构建、矩阵/隐私/链接、NSIS 构建及安装/启动/关窗保活/退出清理/卸载烟测全部通过；安装包 `0.1.0`、5,423,168 bytes、SHA-256 `0dac55330d748d74b314c6e184972eaa40467d097d068b83b23f915a0ba84c6b`。
+
+## 2026-08-03 S31-1 首次启动 Vault 闭环与烟测纠偏
+
+**触达**:
+- `crates/vault/src/key_store.rs:PreparedVault/VaultKeyStore::prepare` — 将首次密钥生成拆成确认前纯内存准备与确认后原子提交，保持 `bundle.meta` v1 不变。
+- `apps/desktop/src-tauri/src/state.rs:ManagedHost::{open,initialize_vault,confirm_recovery_key_saved}` — 区分未初始化、待确认、就绪和真实锁定状态，确认前拒绝全部 Core 操作。
+- `apps/desktop/src-tauri/src/lib.rs:{initialize_vault,confirm_recovery_key_saved}`、`apps/desktop/src/App.tsx:VaultSetup` — 增加两条白名单命令和一次性恢复密钥确认界面，不开放重读、文件或凭据权限。
+- `scripts/run-system-acceptance.ps1:Invoke-InstallerSmoke`、`crates/vault/examples/seed_installer_smoke_vault.rs` — 仅预置 DPAPI 元数据，并要求安装版 exe 实际创建 `self.db`。
+- `docs/adr/0052-one-time-recovery-key-webview-ceremony.md`、`docs/architecture.md:§3.7/§9.3/§9.7/§9.31` — 记录 Recovery Key 的窄 WebView 例外、零写入门禁与烟测判据。
+
+**入口**：默认 `%LOCALAPPDATA%/me.evrything.about/vault` 不存在时进入首次创建；已有 `bundle.meta` 仍只走 DPAPI 日常解锁。
+**测试**：`cargo test -p vault --test windows_unlock` 6/6；`cargo test -p desktop-app` 24/24；桌面 React 14/14 与 TypeScript 检查通过；验收脚本分支测试和烟测预置示例通过。
+
 ## 2026-08-03 S30-4 全仓门禁与实现级收口
 
 **触达**:

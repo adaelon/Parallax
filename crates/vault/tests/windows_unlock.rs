@@ -12,6 +12,32 @@ const LOCAL_BYTES_OFFSET: usize = LOCAL_LENGTH_OFFSET + 4;
 const RECOVERY_CIPHERTEXT_OFFSET: usize = 8 + 2 + 32 + 24;
 
 #[test]
+fn prepared_vault_stays_memory_only_until_recovery_confirmation() {
+    let parent = tempdir().unwrap();
+    let vault_root = parent.path().join("new-vault");
+    assert!(!VaultKeyStore::is_initialized(&vault_root).unwrap());
+
+    let prepared = VaultKeyStore::prepare().unwrap();
+    let recovery_key = RecoveryKey::parse(prepared.recovery_key().expose_secret()).unwrap();
+
+    assert!(!vault_root.exists());
+    prepared.commit(&vault_root).unwrap();
+    assert!(VaultKeyStore::is_initialized(&vault_root).unwrap());
+
+    let (vault_key, displayed_recovery_key) = prepared.into_parts();
+    drop(displayed_recovery_key);
+    VaultRepository::open(&vault_root, vault_key)
+        .unwrap()
+        .close()
+        .unwrap();
+    let recovered_key = VaultKeyStore::unlock_recovery(&vault_root, &recovery_key).unwrap();
+    VaultRepository::open(&vault_root, recovered_key)
+        .unwrap()
+        .close()
+        .unwrap();
+}
+
+#[test]
 fn same_user_and_recovery_paths_unlock_the_same_vault_without_a_dpapi_copy() {
     let directory = tempdir().unwrap();
     let initialized = VaultKeyStore::initialize(directory.path()).unwrap();
@@ -119,6 +145,10 @@ fn initialization_refuses_an_existing_database_without_key_metadata() {
 
     assert!(matches!(
         result,
+        Err(VaultError::ExistingVaultWithoutKeyMetadata)
+    ));
+    assert!(matches!(
+        VaultKeyStore::is_initialized(directory.path()),
         Err(VaultError::ExistingVaultWithoutKeyMetadata)
     ));
     assert!(!directory.path().join(META_FILE).exists());

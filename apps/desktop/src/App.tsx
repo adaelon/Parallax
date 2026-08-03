@@ -101,6 +101,26 @@ interface CaptureStatus {
   state: CaptureState;
 }
 
+interface HostStatus {
+  state: string;
+  vaultReady: boolean;
+  updaterConfigured: boolean;
+  detail: string | null;
+}
+
+interface RecoveryKeyView {
+  recoveryKey: string;
+}
+
+interface VaultProjection {
+  turns: ConversationTurn[];
+  ceremonies: SharedExperienceCeremony[];
+  identityHistory: IdentityStateVersion[];
+  reflectionInvitations: ReflectionInvitationCeremony[];
+  captureStatus: CaptureStatus;
+  activityTimeline: ActivityTimelineEntry[];
+}
+
 export interface ActivityTimelineEntry {
   id: number;
   kind: "activity" | "gap";
@@ -138,6 +158,36 @@ const timeFormatter = new Intl.DateTimeFormat("zh-CN", {
   minute: "2-digit",
 });
 
+async function loadVaultProjection(): Promise<VaultProjection> {
+  const [
+    turns,
+    ceremonies,
+    identityHistory,
+    reflectionInvitations,
+    captureStatus,
+    activityTimeline,
+  ] = await Promise.all([
+    invoke<ConversationTurn[]>("list_conversation"),
+    invoke<SharedExperienceCeremony[]>("list_shared_experience_ceremonies"),
+    invoke<IdentityStateVersion[]>("list_identity_history").catch(() => []),
+    invoke<ReflectionInvitationCeremony[]>(
+      "list_offered_reflection_invitations",
+    ).catch(() => []),
+    invoke<CaptureStatus>("get_capture_status").catch(() => ({
+      state: "collecting" as const,
+    })),
+    invoke<ActivityTimelineEntry[]>("list_activity_timeline").catch(() => []),
+  ]);
+  return {
+    turns,
+    ceremonies,
+    identityHistory,
+    reflectionInvitations,
+    captureStatus,
+    activityTimeline,
+  };
+}
+
 export function App() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [ceremonies, setCeremonies] = useState<SharedExperienceCeremony[]>([]);
@@ -146,6 +196,11 @@ export function App() {
   >([]);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
+  const [hostStatus, setHostStatus] = useState<HostStatus | null>(null);
+  const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
+  const [recoveryKeySaved, setRecoveryKeySaved] = useState(false);
+  const [recoveryKeyCopied, setRecoveryKeyCopied] = useState(false);
+  const [setupAction, setSetupAction] = useState(false);
   const [sending, setSending] = useState(false);
   const [ceremonyAction, setCeremonyAction] = useState<string | null>(null);
   const [activeAgreements, setActiveAgreements] = useState<ActiveSharedAgreement[]>([]);
@@ -169,46 +224,30 @@ export function App() {
 
   useEffect(() => {
     let active = true;
-    void Promise.all([
-      invoke<ConversationTurn[]>("list_conversation"),
-      invoke<SharedExperienceCeremony[]>("list_shared_experience_ceremonies"),
-      invoke<IdentityStateVersion[]>("list_identity_history").catch(() => []),
-      invoke<ReflectionInvitationCeremony[]>(
-        "list_offered_reflection_invitations",
-      ).catch(() => []),
-      invoke<CaptureStatus>("get_capture_status").catch(() => ({
-        state: "collecting" as const,
-      })),
-      invoke<ActivityTimelineEntry[]>("list_activity_timeline").catch(() => []),
-    ])
-      .then(([
-        restored,
-        restoredCeremonies,
-        restoredIdentity,
-        restoredReflections,
-        restoredCaptureStatus,
-        restoredTimeline,
-      ]) => {
+    void (async () => {
+      try {
+        const status = await invoke<HostStatus>("get_host_status");
         if (active) {
-          setTurns(restored);
-          setCeremonies(restoredCeremonies);
-          setIdentityHistory(restoredIdentity);
-          setReflectionInvitations(restoredReflections);
-          setCaptureStatus(restoredCaptureStatus);
-          setActivityTimeline(restoredTimeline);
+          setHostStatus(status);
+        }
+        if (!status.vaultReady) {
+          return;
+        }
+        const projection = await loadVaultProjection();
+        if (active) {
+          applyVaultProjection(projection);
           setError(null);
         }
-      })
-      .catch((reason: unknown) => {
+      } catch (reason: unknown) {
         if (active) {
           setError(errorMessage(reason));
         }
-      })
-      .finally(() => {
+      } finally {
         if (active) {
           setLoading(false);
         }
-      });
+      }
+    })();
     return () => {
       active = false;
     };
@@ -217,6 +256,85 @@ export function App() {
   useEffect(() => {
     conversationEnd.current?.scrollIntoView?.({ block: "end" });
   }, [turns, sending]);
+
+  function applyVaultProjection(projection: VaultProjection) {
+    setTurns(projection.turns);
+    setCeremonies(projection.ceremonies);
+    setIdentityHistory(projection.identityHistory);
+    setReflectionInvitations(projection.reflectionInvitations);
+    setCaptureStatus(projection.captureStatus);
+    setActivityTimeline(projection.activityTimeline);
+  }
+
+  async function beginVaultInitialization() {
+    if (setupAction) {
+      return;
+    }
+    setSetupAction(true);
+    setError(null);
+    try {
+      const result = await invoke<RecoveryKeyView>("initialize_vault");
+      setRecoveryKey(result.recoveryKey);
+      setRecoveryKeySaved(false);
+      setRecoveryKeyCopied(false);
+      setHostStatus((current) => ({
+        state: "awaitingRecoveryConfirmation",
+        vaultReady: false,
+        updaterConfigured: current?.updaterConfigured ?? false,
+        detail: null,
+      }));
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setSetupAction(false);
+    }
+  }
+
+  async function copyRecoveryKey() {
+    if (recoveryKey === null) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(recoveryKey);
+      setRecoveryKeyCopied(true);
+      setError(null);
+    } catch {
+      setError("无法自动复制；请选中恢复密钥并手动复制。");
+    }
+  }
+
+  async function confirmRecoveryKeySaved() {
+    if (!recoveryKeySaved || recoveryKey === null || setupAction) {
+      return;
+    }
+    setSetupAction(true);
+    setError(null);
+    try {
+      const status = await invoke<HostStatus>("confirm_recovery_key_saved", {
+        confirmed: true,
+      });
+      setHostStatus(status);
+      setRecoveryKey(null);
+      setRecoveryKeySaved(false);
+      setRecoveryKeyCopied(false);
+      const projection = await loadVaultProjection();
+      applyVaultProjection(projection);
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setSetupAction(false);
+    }
+  }
+
+  async function exitInterruptedInitialization() {
+    setSetupAction(true);
+    try {
+      await invoke("exit_application");
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+      setSetupAction(false);
+    }
+  }
 
   async function submitMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -487,6 +605,25 @@ export function App() {
 
   const activeCeremony = ceremonies[0];
   const activeReflection = activeCeremony === undefined ? reflectionInvitations[0] : undefined;
+
+  if (hostStatus === null || !hostStatus.vaultReady) {
+    return (
+      <VaultSetup
+        error={error}
+        loading={loading}
+        onBegin={() => void beginVaultInitialization()}
+        onConfirm={() => void confirmRecoveryKeySaved()}
+        onCopy={() => void copyRecoveryKey()}
+        onExitInterrupted={() => void exitInterruptedInitialization()}
+        recoveryKey={recoveryKey}
+        recoveryKeyCopied={recoveryKeyCopied}
+        recoveryKeySaved={recoveryKeySaved}
+        setRecoveryKeySaved={setRecoveryKeySaved}
+        setupAction={setupAction}
+        status={hostStatus}
+      />
+    );
+  }
 
   return (
     <main className="conversation-shell">
@@ -1155,6 +1292,146 @@ export function App() {
         </form>
         <p className="retention-note">逐字加密保留 · 不自动升格为记忆</p>
       </footer>
+    </main>
+  );
+}
+
+interface VaultSetupProps {
+  error: string | null;
+  loading: boolean;
+  onBegin: () => void;
+  onConfirm: () => void;
+  onCopy: () => void;
+  onExitInterrupted: () => void;
+  recoveryKey: string | null;
+  recoveryKeyCopied: boolean;
+  recoveryKeySaved: boolean;
+  setRecoveryKeySaved: (saved: boolean) => void;
+  setupAction: boolean;
+  status: HostStatus | null;
+}
+
+function VaultSetup({
+  error,
+  loading,
+  onBegin,
+  onConfirm,
+  onCopy,
+  onExitInterrupted,
+  recoveryKey,
+  recoveryKeyCopied,
+  recoveryKeySaved,
+  setRecoveryKeySaved,
+  setupAction,
+  status,
+}: VaultSetupProps) {
+  let content;
+  if (loading && status === null) {
+    content = (
+      <>
+        <p className="eyebrow">Local-first vault</p>
+        <h1>正在检查本地保险库…</h1>
+      </>
+    );
+  } else if (status?.state === "needsInitialization") {
+    content = (
+      <>
+        <p className="eyebrow">First run</p>
+        <h1>创建你的加密保险库</h1>
+        <p className="vault-setup-copy">
+          保险库只保存在这台电脑上。下一步会生成一枚独立恢复密钥；只有你能保管它，平台无法替你找回。
+        </p>
+        <button
+          className="vault-primary-action"
+          disabled={setupAction}
+          onClick={onBegin}
+          type="button"
+        >
+          {setupAction ? "正在生成…" : "生成恢复密钥"}
+        </button>
+      </>
+    );
+  } else if (recoveryKey !== null) {
+    content = (
+      <>
+        <p className="eyebrow">Recovery key · 仅此一次</p>
+        <h1>先保存恢复密钥</h1>
+        <p className="vault-setup-copy">
+          换机或本机密钥损坏时，只有它能恢复保险库。确认后应用不会再次显示，也不会替你上传或保存明文副本。
+        </p>
+        <label className="recovery-key-label" htmlFor="recovery-key">
+          恢复密钥
+        </label>
+        <textarea
+          aria-label="恢复密钥"
+          className="recovery-key-value"
+          id="recovery-key"
+          readOnly
+          rows={3}
+          value={recoveryKey}
+        />
+        <button className="vault-secondary-action" onClick={onCopy} type="button">
+          {recoveryKeyCopied ? "已复制" : "复制恢复密钥"}
+        </button>
+        <label className="recovery-confirmation" htmlFor="recovery-key-saved">
+          <input
+            checked={recoveryKeySaved}
+            id="recovery-key-saved"
+            onChange={(event) => setRecoveryKeySaved(event.target.checked)}
+            type="checkbox"
+          />
+          <span>我已把恢复密钥保存在独立且安全的位置，并理解丢失后平台无法恢复。</span>
+        </label>
+        <button
+          className="vault-primary-action"
+          disabled={!recoveryKeySaved || setupAction}
+          onClick={onConfirm}
+          type="button"
+        >
+          {setupAction ? "正在创建保险库…" : "我已安全保存，创建保险库"}
+        </button>
+      </>
+    );
+  } else if (status?.state === "awaitingRecoveryConfirmation") {
+    content = (
+      <>
+        <p className="eyebrow">Setup interrupted</p>
+        <h1>恢复密钥页面已中断</h1>
+        <p className="vault-setup-copy">
+          为防止同一密钥被重复读取，本页面不能再次索取它。确认前没有文件写入磁盘；退出后重新打开即可安全生成新密钥。
+        </p>
+        <button
+          className="vault-primary-action"
+          disabled={setupAction}
+          onClick={onExitInterrupted}
+          type="button"
+        >
+          退出应用，随后重新打开
+        </button>
+      </>
+    );
+  } else {
+    content = (
+      <>
+        <p className="eyebrow">Vault unavailable</p>
+        <h1>保险库无法打开</h1>
+        <p className="vault-setup-copy">
+          {status?.detail ?? "无法读取本地 Core 状态，请重新启动应用后再试。"}
+        </p>
+      </>
+    );
+  }
+
+  return (
+    <main className="vault-setup-shell">
+      <section aria-live="polite" className="vault-setup-card">
+        {content}
+        {error ? (
+          <p className="error-banner vault-setup-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+      </section>
     </main>
   );
 }

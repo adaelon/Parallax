@@ -218,7 +218,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 
 | 技术 | 职责 | 明确不负责 |
 | --- | --- | --- |
-| React + TypeScript | 视图状态、交互、可访问性、类型化命令客户端 | 密钥、持久化、文件解析、模型直连 |
+| React + TypeScript | 视图状态、交互、可访问性、类型化命令客户端；首次创建时一次性显示 Recovery Key 载体 | Vault Key、密钥持久化、文件解析、模型直连 |
 | Tauri 2 | Windows 单实例宿主、托盘、窗口与 WebView 生命周期、受限命令入口、打包入口 | 领域逻辑、保险库模式 |
 | Rust Core | 内嵌后台任务、Markdown 解析、领域模型、保险库单写、索引、策略、采集、运行时网关 | 直接渲染 UI、依赖 React 生命周期、作为 Windows Service 运行 |
 | Rust 摄取协调器 | 普通文件稳定性、资源上限、重解析点/非普通文件拒绝与先归档状态转换 | 解析内容、持有密钥、直接写数据库或跟随文件链接 |
@@ -1044,10 +1044,11 @@ VaultBackup::restore(snapshot, deletion_head, empty_destination, RecoveryKey)
 | `crates/backup`、Recovery Set、历史快照与最新删除头 | [ADR-0051：历史备份恢复必须携带最新删除头](adr/0051-recovery-set-deletion-head.md) |
 | Context Inbox、显式遗忘 | [ADR-0007：Inbox 导入语义](adr/0007-context-inbox-import-semantics.md) |
 | Windows 桌面壳、本地核心、浏览器扩展 | [ADR-0008：Tauri、React 和 Rust](adr/0008-tauri-react-rust-desktop-stack.md) |
+| 首次 Vault 创建、Recovery Key 展示与确认 | [ADR-0052：一次性恢复密钥 WebView 仪式](adr/0052-one-time-recovery-key-webview-ceremony.md) |
 | `self.db`、加密对象库、密钥派生与活动存储遗忘边界 | [ADR-0009：混合加密保险库存储](adr/0009-hybrid-encrypted-vault-storage.md) |
 | 本地文件、IPC、主机入侵与安全声明边界 | [ADR-0011：信任当前 Windows 登录会话](adr/0011-trust-current-windows-logon-session.md) |
 | `crates/capture-browser`、固定扩展来源、环回会话令牌与浏览提交 | [ADR-0050：浏览器采集采用固定来源环回会话通道](adr/0050-pinned-origin-loopback-browser-capture.md) |
-| 托盘常驻宿主、窗口关闭语义和内嵌 Core | [ADR-0012：托盘常驻 Tauri 宿主](adr/0012-tray-resident-tauri-host.md) |
+| 托盘常驻宿主、窗口关闭语义、加密心跳和安全升级 | [ADR-0012：托盘常驻 Tauri 宿主](adr/0012-tray-resident-tauri-host.md)、[ADR-0049：单宿主生命周期采用加密心跳与签名升级](adr/0049-heartbeated-single-host-lifecycle.md) |
 | Context Inbox 归档状态、延迟解析与重处理 | [ADR-0013：先归档后理解](adr/0013-archive-before-understanding.md) |
 | Obsidian 笔记库适配器、只读边界与结构提取 | [ADR-0015：只读 Obsidian 资料源](adr/0015-read-only-obsidian-source.md) |
 | Obsidian 来源当前性、历史保留与离线保护 | [ADR-0016：Obsidian 资料源移除语义](adr/0016-obsidian-source-removal-semantics.md) |
@@ -1197,6 +1198,17 @@ VaultKeyStore::initialize(vault_root)
   -> atomically commit versioned bundle.meta
   -> return (VaultKey, RecoveryKey) exactly once to trusted caller
 
+VaultKeyStore::prepare()
+  -> generate the same key material entirely in memory
+  -> return PreparedVault; drop means zeroized secrets + zero filesystem writes
+
+ManagedHost first run
+  -> missing bundle.meta + self.db => NEEDS_INITIALIZATION
+  -> initialize_vault => PreparedVault + one Recovery Key WebView response
+  -> AWAITING_RECOVERY_CONFIRMATION; all Core operations remain unavailable
+  -> confirm_recovery_key_saved(true)
+  -> atomically commit bundle.meta -> drop Recovery Key -> open self.db -> READY
+
 VaultKeyStore::unlock_local(vault_root)
   -> parse bounded bundle.meta -> DPAPI unprotect local field -> VaultKey
 
@@ -1205,7 +1217,7 @@ VaultKeyStore::unlock_recovery(vault_root, RecoveryKey)
   -> authenticated recovery unwrap -> VaultKey | UnlockFailed
 ```
 
-两条解锁路径都只产出 `VaultKey`，随后仍通过既有 `VaultRepository::open(vault_root, VaultKey)` 进入 Core 加密边界。恢复路径在 DPAPI 字段缺失时通过；错误 Recovery Key、无效载体和认证篡改使用同一个失败面。该实现落实 [ADR-0006](adr/0006-user-held-recovery-keys.md)、[ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md) 和 [ADR-0047](adr/0047-versioned-independent-vault-unlock.md)。
+两条解锁路径都只产出 `VaultKey`，随后仍通过既有 `VaultRepository::open(vault_root, VaultKey)` 进入 Core 加密边界。恢复路径在 DPAPI 字段缺失时通过；错误 Recovery Key、无效载体和认证篡改使用同一个失败面。首次创建是严格两阶段：确认前 `PreparedVault` 只驻 Rust 内存且退出即清零；WebView 只接收一次 Recovery Key 字符串，不写日志、浏览器存储或通用剪贴板插件，确认成功后 React 立即撤下该 DOM，Rust 落盘后销毁自身副本且不提供重读 command。这个窄例外不向 WebView 暴露 Vault Key、repository 或通用文件能力。该实现落实 [ADR-0006](adr/0006-user-held-recovery-keys.md)、[ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0047](adr/0047-versioned-independent-vault-unlock.md) 和 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md)。
 
 ### 9.4 S04 当前实现边界
 
@@ -1312,7 +1324,7 @@ React restore -> list_conversation -> SQLCipher evidence -> exact turn views
 explicit exit -> finish_host_session -> close Vault -> zeroize key -> release lock -> process exit
 ```
 
-主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater 和持续对话只能经宿主白名单 command 使用。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) 和 [ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)。
+主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater、首次创建和持续对话只能经宿主白名单 command 使用。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。首次创建的 Recovery Key 是 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 限定的一次性展示例外，不赋予 UI 任何 Vault Key 或持久密钥能力。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md)、[ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md) 和 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md)。
 
 ### 9.8 S08 Context Inbox 先归档当前实现边界
 
@@ -2050,3 +2062,22 @@ restore old generation + latest head
 ```
 
 S30 不新增 schema：删除重放消费 S19 schema v16 的 `deletion_intents`，快照覆盖当前 v25 权威库，派生索引在恢复时清空重建。实现拒绝保险库内备份位置、独立快照恢复、未知/重复/遍历路径、缺对象、现有目标覆盖以及跨组拼接；加密 envelope 当前有 1 GiB 硬上限。恢复不会改写历史 Recovery Set；新 Vault 必须创建新集合，旧集合仅用于再次恢复，不能由原设备与恢复设备继续双写。
+
+### 9.31 S31 自动化系统验收与可安装构建当前实现边界
+
+```text
+docs/system-acceptance-v1.md
+  -> 33 个产品确定性判据
+  -> FR-01..FR-12
+  -> 49 个 accepted ADR
+  -> 8 个威胁边界 + 5 个迁移契约
+scripts/run-system-acceptance.ps1
+  -> 精确集合/证据外键 + G10 隐私 + 静态边界
+  -> Rust workspace + desktop + browser extension
+  -> Tauri release -> versioned NSIS -> SHA-256 -> isolated install smoke
+  -> ephemeral bundle.meta seed -> installed exe must create self.db
+```
+
+G10 真实资料和 S32 观察记录只能位于仓库外或 `/.local/`；仓库只保留合成 fixture、协议和聚合结果。验收 runner 只记步骤、耗时、版本、文件大小与 SHA-256，中间 JSON 留在被忽略的 `/.local/system-acceptance/`。
+
+S31 本地构建只产生 NSIS 安装包，`createUpdaterArtifacts=false`。安装烟测用不打包、不输出 Recovery Key 的示例仅预置 `bundle.meta`，随后要求安装版 exe 自己创建 `self.db`；“进程仍存活”不再等价于 Vault 已打开。签名升级仍保持 G04 的 HTTPS endpoint + 内嵌公钥门禁；更新包只能在后续签名发布流水线同时提供静态 updater 配置与仓库外私钥时生成，不得为本地验收伪造签名材料。S31 不改变 schema 或领域语义。

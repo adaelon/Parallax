@@ -75,10 +75,78 @@ impl InitializedVault {
     }
 }
 
+/// First-run key material prepared in memory but not yet committed to a vault.
+///
+/// Dropping this value clears both secrets and leaves the filesystem unchanged.
+/// This lets a trusted caller present the Recovery Key and wait for explicit
+/// confirmation before making the new vault durable.
+pub struct PreparedVault {
+    vault_key: VaultKey,
+    recovery_key: RecoveryKey,
+    encoded_metadata: Zeroizing<Vec<u8>>,
+}
+
+impl PreparedVault {
+    #[must_use]
+    pub fn recovery_key(&self) -> &RecoveryKey {
+        &self.recovery_key
+    }
+
+    /// Atomically commits the prepared key metadata to an empty vault root.
+    ///
+    /// # Errors
+    ///
+    /// Fails if key metadata or an encrypted database already exists, or when
+    /// the destination cannot be created and synchronized.
+    pub fn commit(&self, vault_root: impl AsRef<Path>) -> Result<(), VaultError> {
+        let vault_root = vault_root.as_ref();
+        fs::create_dir_all(vault_root)?;
+        if vault_root.join(METADATA_FILE).try_exists()? {
+            return Err(VaultError::AlreadyInitialized);
+        }
+        if vault_root.join(DATABASE_FILE).try_exists()? {
+            return Err(VaultError::ExistingVaultWithoutKeyMetadata);
+        }
+        persist_metadata(vault_root, &self.encoded_metadata)
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (VaultKey, RecoveryKey) {
+        (self.vault_key, self.recovery_key)
+    }
+}
+
 /// Creates and opens the two independent S03 Vault Key unlock paths.
 pub struct VaultKeyStore;
 
 impl VaultKeyStore {
+    /// Reports whether committed key metadata exists at `vault_root`.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when an encrypted database exists without key metadata or
+    /// when the filesystem cannot be inspected.
+    pub fn is_initialized(vault_root: impl AsRef<Path>) -> Result<bool, VaultError> {
+        let vault_root = vault_root.as_ref();
+        if vault_root.join(METADATA_FILE).try_exists()? {
+            return Ok(true);
+        }
+        if vault_root.join(DATABASE_FILE).try_exists()? {
+            return Err(VaultError::ExistingVaultWithoutKeyMetadata);
+        }
+        Ok(false)
+    }
+
+    /// Prepares first-run key material without writing anything to disk.
+    ///
+    /// # Errors
+    ///
+    /// Fails when secure randomness or the Windows `CurrentUser` DPAPI wrapper
+    /// is unavailable.
+    pub fn prepare() -> Result<PreparedVault, VaultError> {
+        prepare()
+    }
+
     /// Creates a random Vault Key, a user-held Recovery Key, and one atomic
     /// metadata bundle containing independent recovery and DPAPI wrappers.
     ///
@@ -87,7 +155,13 @@ impl VaultKeyStore {
     /// Fails if key metadata already exists, secure randomness or DPAPI is
     /// unavailable, or the metadata cannot be committed.
     pub fn initialize(vault_root: impl AsRef<Path>) -> Result<InitializedVault, VaultError> {
-        initialize(vault_root.as_ref())
+        let prepared = Self::prepare()?;
+        prepared.commit(vault_root)?;
+        let (vault_key, recovery_key) = prepared.into_parts();
+        Ok(InitializedVault {
+            vault_key,
+            recovery_key,
+        })
     }
 
     /// Unlocks the Vault Key through the Windows `CurrentUser` DPAPI copy.
@@ -180,16 +254,7 @@ fn local_wrap_for_restore(_vault_key: &VaultKey) -> Result<Option<Vec<u8>>, Vaul
 }
 
 #[cfg(windows)]
-fn initialize(vault_root: &Path) -> Result<InitializedVault, VaultError> {
-    fs::create_dir_all(vault_root)?;
-    let metadata_path = vault_root.join(METADATA_FILE);
-    if metadata_path.exists() {
-        return Err(VaultError::AlreadyInitialized);
-    }
-    if vault_root.join(DATABASE_FILE).exists() {
-        return Err(VaultError::ExistingVaultWithoutKeyMetadata);
-    }
-
+fn prepare() -> Result<PreparedVault, VaultError> {
     let vault_key = VaultKey::generate()?;
     let mut raw_recovery_key = Zeroizing::new([0_u8; 32]);
     fill_random(&mut *raw_recovery_key)?;
@@ -214,16 +279,15 @@ fn initialize(vault_root: &Path) -> Result<InitializedVault, VaultError> {
         recovery_wrapped_key,
         local_wrapped_key: Some(local_wrapped_key),
     };
-    persist_metadata(vault_root, &metadata.encode()?)?;
-
-    Ok(InitializedVault {
+    Ok(PreparedVault {
         vault_key,
         recovery_key,
+        encoded_metadata: Zeroizing::new(metadata.encode()?),
     })
 }
 
 #[cfg(not(windows))]
-fn initialize(_vault_root: &Path) -> Result<InitializedVault, VaultError> {
+fn prepare() -> Result<PreparedVault, VaultError> {
     Err(VaultError::UnsupportedPlatform)
 }
 

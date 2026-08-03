@@ -14,4 +14,4 @@ Windows 桌面壳采用 Tauri 2，界面使用 React 与 TypeScript，本地可�
 
 ## Consequences
 
-Rust Core 是唯一特权组件；UI 不持有密钥或直接打开保险库，浏览器扩展独立构建，具体库版本在项目骨架切片锁定。
+Rust Core 是唯一特权组件；UI 不持有 Vault Key 或直接打开保险库。首次创建时 Recovery Key 载体可按 [ADR-0052](0052-one-time-recovery-key-webview-ceremony.md) 经一次性仪式短暂显示；浏览器扩展独立构建，具体库版本在项目骨架切片锁定。
