@@ -4,6 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use eam_capture_browser::{
+    BrowserCaptureReceipt, BrowserCaptureRepository, BrowserSubmission, BrowserSubmissionPayload,
+    BrowserVisit, BrowserVisitId, PageContentPayload, UntrustedPageContent,
+};
 use eam_capture_windows::{
     ActivitySnapshot, ActivityTimelineRepository, CaptureCheckpoint, CaptureGapReason, CaptureMode,
     CaptureRecovery, CaptureSpan, CaptureSpanId, CaptureSpanKind, IdleState,
@@ -100,6 +104,7 @@ pub struct VaultRepository {
     next_shared_agreement_candidate_id: u64,
     next_reflection_invitation_id: u64,
     next_archive_id: u64,
+    next_browser_visit_id: u64,
 }
 
 impl VaultRepository {
@@ -146,6 +151,7 @@ impl VaultRepository {
             "archived_evidence",
             FORGET_TARGET_ARCHIVED_EVIDENCE,
         )?;
+        let next_browser_visit_id = next_identifier(&connection, "browser_visits")?;
 
         Ok(Self {
             connection: Some(connection),
@@ -158,6 +164,7 @@ impl VaultRepository {
             next_shared_agreement_candidate_id,
             next_reflection_invitation_id,
             next_archive_id,
+            next_browser_visit_id,
         })
     }
 
@@ -699,6 +706,118 @@ impl VaultRepository {
         })
     }
 
+    fn record_browser_submission_with_hook<F>(
+        &mut self,
+        host_session_id: HostSessionId,
+        submission: &BrowserSubmission,
+        before_commit: F,
+    ) -> Result<BrowserCaptureReceipt, RepositoryError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), RepositoryError>,
+    {
+        require_current_open_host_session(self.connection(), host_session_id)?;
+        if let Some(existing) = load_browser_visit_by_submission(self, submission.submission_id())?
+        {
+            if existing.submission() != submission {
+                return Err(RepositoryError::new(
+                    "browser submission identifier conflicts with an existing event",
+                ));
+            }
+            return Ok(BrowserCaptureReceipt::new(
+                existing.id(),
+                existing.content_archive_id(),
+                true,
+            ));
+        }
+
+        let stored_content = submission
+            .page_content()
+            .map(|content| self.object_store.store(content.body_text().as_bytes()))
+            .transpose()
+            .map_err(repository_error)?;
+        let visit_id = BrowserVisitId::from_raw(self.next_browser_visit_id);
+        let content_archive_id = stored_content.as_ref().map(|_| self.next_archive_id);
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        require_current_open_host_session(&transaction, host_session_id)?;
+
+        if let (Some(content), Some(stored), Some(archive_id)) = (
+            submission.page_content(),
+            stored_content.as_ref(),
+            content_archive_id,
+        ) {
+            let source_locator = format!("browser/{}.txt", submission.submission_id());
+            let (status, reason) = encode_archive_status(ArchiveStatus::ArchivedUnparsed(
+                UnparsedReason::UnsupportedFormat,
+            ));
+            transaction
+                .execute(
+                    "INSERT INTO archived_evidence
+                     (id, source_kind, source_locator, object_id, content_length,
+                      status, unparsed_reason, archived_at)
+                     VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        to_sql_id(archive_id)?,
+                        source_locator,
+                        stored.id,
+                        i64::try_from(content.body_text().len()).map_err(repository_error)?,
+                        status,
+                        reason,
+                        content.captured_at().as_millis(),
+                    ],
+                )
+                .map_err(repository_error)?;
+            ensure_source_record_version(&transaction, &source_locator, to_sql_id(archive_id)?)
+                .map_err(repository_error)?;
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO browser_visits
+                 (id, host_session_id, submission_id, url, title, visited_at, dwell_millis,
+                  content_evidence_id, content_captured_at, content_authorized_origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    to_sql_id(visit_id.get())?,
+                    to_sql_id(host_session_id.get())?,
+                    submission.submission_id(),
+                    submission.url(),
+                    submission.title(),
+                    submission.visited_at().as_millis(),
+                    submission.dwell_millis(),
+                    content_archive_id.map(to_sql_id).transpose()?,
+                    submission
+                        .page_content()
+                        .map(|content| content.captured_at().as_millis()),
+                    submission
+                        .page_content()
+                        .map(UntrustedPageContent::authorized_origin),
+                ],
+            )
+            .map_err(repository_error)?;
+        before_commit(&transaction)?;
+        transaction.commit().map_err(repository_error)?;
+
+        self.next_browser_visit_id = visit_id
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| RepositoryError::new("browser visit identifier space exhausted"))?;
+        if let Some(archive_id) = content_archive_id {
+            self.next_archive_id = archive_id.checked_add(1).ok_or_else(|| {
+                RepositoryError::new("browser content archive identifier space exhausted")
+            })?;
+        }
+        Ok(BrowserCaptureReceipt::new(
+            visit_id,
+            content_archive_id,
+            false,
+        ))
+    }
+
     fn commit_extraction_with_hook<F>(
         &mut self,
         extraction: &ValidatedExtraction,
@@ -890,6 +1009,20 @@ impl ArchiveRepository for VaultRepository {
 
     fn archive(&mut self, input: ArchiveInput<'_>) -> Result<ArchiveReceipt, Self::Error> {
         self.archive_with_hook(&input, |_| Ok(()))
+    }
+}
+
+impl BrowserCaptureRepository for VaultRepository {
+    fn record_browser_submission(
+        &mut self,
+        host_session_id: HostSessionId,
+        submission: &BrowserSubmission,
+    ) -> Result<BrowserCaptureReceipt, RepositoryError> {
+        self.record_browser_submission_with_hook(host_session_id, submission, |_| Ok(()))
+    }
+
+    fn all_browser_visits(&self) -> Result<Vec<BrowserVisit>, RepositoryError> {
+        load_all_browser_visits(self)
     }
 }
 
@@ -10823,6 +10956,154 @@ fn repository_error(error: impl std::fmt::Display) -> RepositoryError {
     RepositoryError::new(error.to_string())
 }
 
+struct StoredBrowserVisit {
+    id: i64,
+    host_session_id: i64,
+    submission_id: String,
+    url: String,
+    title: String,
+    visited_at_millis: i64,
+    dwell_millis: i64,
+    content_archive_id: Option<i64>,
+    content_captured_at_millis: Option<i64>,
+    content_authorized_origin: Option<String>,
+    content_status: Option<i64>,
+    content_reason: Option<i64>,
+}
+
+fn stored_browser_visit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBrowserVisit> {
+    Ok(StoredBrowserVisit {
+        id: row.get(0)?,
+        host_session_id: row.get(1)?,
+        submission_id: row.get(2)?,
+        url: row.get(3)?,
+        title: row.get(4)?,
+        visited_at_millis: row.get(5)?,
+        dwell_millis: row.get(6)?,
+        content_archive_id: row.get(7)?,
+        content_captured_at_millis: row.get(8)?,
+        content_authorized_origin: row.get(9)?,
+        content_status: row.get(10)?,
+        content_reason: row.get(11)?,
+    })
+}
+
+fn load_all_browser_visits(
+    repository: &VaultRepository,
+) -> Result<Vec<BrowserVisit>, RepositoryError> {
+    let mut statement = repository
+        .connection()
+        .prepare(
+            "SELECT v.id, v.host_session_id, v.submission_id, v.url, v.title,
+                    v.visited_at, v.dwell_millis, v.content_evidence_id,
+                    v.content_captured_at, v.content_authorized_origin,
+                    a.status, a.unparsed_reason
+             FROM browser_visits v
+             LEFT JOIN archived_evidence a ON a.id = v.content_evidence_id
+             ORDER BY v.id",
+        )
+        .map_err(repository_error)?;
+    let rows = statement
+        .query_map([], stored_browser_visit_from_row)
+        .map_err(repository_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_error)?;
+    drop(statement);
+    rows.into_iter()
+        .map(|stored| restore_browser_visit(repository, stored))
+        .collect()
+}
+
+fn load_browser_visit_by_submission(
+    repository: &VaultRepository,
+    submission_id: &str,
+) -> Result<Option<BrowserVisit>, RepositoryError> {
+    let stored = repository
+        .connection()
+        .query_row(
+            "SELECT v.id, v.host_session_id, v.submission_id, v.url, v.title,
+                    v.visited_at, v.dwell_millis, v.content_evidence_id,
+                    v.content_captured_at, v.content_authorized_origin,
+                    a.status, a.unparsed_reason
+             FROM browser_visits v
+             LEFT JOIN archived_evidence a ON a.id = v.content_evidence_id
+             WHERE v.submission_id = ?1",
+            [submission_id],
+            stored_browser_visit_from_row,
+        )
+        .optional()
+        .map_err(repository_error)?;
+    stored
+        .map(|stored| restore_browser_visit(repository, stored))
+        .transpose()
+}
+
+fn restore_browser_visit(
+    repository: &VaultRepository,
+    stored: StoredBrowserVisit,
+) -> Result<BrowserVisit, RepositoryError> {
+    let id = u64::try_from(stored.id).map_err(repository_error)?;
+    let host_session_id = u64::try_from(stored.host_session_id).map_err(repository_error)?;
+    if id == 0 || host_session_id == 0 {
+        return Err(RepositoryError::new(
+            "persisted browser visit identifiers are invalid",
+        ));
+    }
+    let (page_content, content_archive_id) = match (
+        stored.content_archive_id,
+        stored.content_captured_at_millis,
+        stored.content_authorized_origin,
+        stored.content_status,
+        stored.content_reason,
+    ) {
+        (None, None, None, None, None) => (None, None),
+        (Some(archive_id), Some(captured_at_millis), Some(origin), Some(status), reason) => {
+            if decode_archive_status(status, reason).map_err(repository_error)?
+                != ArchiveStatus::ArchivedUnparsed(UnparsedReason::UnsupportedFormat)
+            {
+                return Err(RepositoryError::new(
+                    "browser page content is not stored as untrusted evidence",
+                ));
+            }
+            let archive_id = u64::try_from(archive_id).map_err(repository_error)?;
+            let body_text = String::from_utf8(
+                repository
+                    .read_archived_content(archive_id)
+                    .map_err(repository_error)?,
+            )
+            .map_err(repository_error)?;
+            (
+                Some(PageContentPayload {
+                    body_text,
+                    captured_at_millis,
+                    authorized_origin: origin,
+                }),
+                Some(archive_id),
+            )
+        }
+        _ => {
+            return Err(RepositoryError::new(
+                "persisted browser page content relation is invalid",
+            ));
+        }
+    };
+    let submission = BrowserSubmission::from_payload(BrowserSubmissionPayload {
+        submission_id: stored.submission_id,
+        url: stored.url,
+        title: stored.title,
+        visited_at_millis: stored.visited_at_millis,
+        dwell_millis: stored.dwell_millis,
+        page_content,
+    })
+    .map_err(repository_error)?;
+    Ok(BrowserVisit::restore(
+        BrowserVisitId::from_raw(id),
+        HostSessionId::from_raw(host_session_id),
+        submission,
+        content_archive_id,
+    ))
+}
+
 const fn encode_launch_mode(mode: LaunchMode) -> i64 {
     match mode {
         LaunchMode::Foreground => 0,
@@ -11671,6 +11952,47 @@ mod tests {
 
         let repository =
             VaultRepository::open(directory.path(), VaultKey::new([0x29; 32])).unwrap();
+        assert!(repository.archived_evidence().unwrap().is_empty());
+        assert_eq!(repository.object_store.object_file_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn browser_capture_failure_rolls_back_visit_and_content_reference_across_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let key = [0x2a; 32];
+        let mut repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        let session = repository
+            .begin_host_session(Timestamp::from_millis(1), LaunchMode::Foreground)
+            .unwrap()
+            .session()
+            .id();
+        let submission = BrowserSubmission::from_payload(BrowserSubmissionPayload {
+            submission_id: "browser-interrupted".to_owned(),
+            url: "https://example.test/interrupted".to_owned(),
+            title: "Interrupted".to_owned(),
+            visited_at_millis: 10,
+            dwell_millis: 5,
+            page_content: Some(PageContentPayload {
+                body_text: "untrusted interrupted content".to_owned(),
+                captured_at_millis: 15,
+                authorized_origin: "https://example.test".to_owned(),
+            }),
+        })
+        .unwrap();
+
+        let result = repository.record_browser_submission_with_hook(session, &submission, |_| {
+            Err(RepositoryError::new("browser capture interrupted"))
+        });
+
+        assert!(result.is_err());
+        assert!(repository.all_browser_visits().unwrap().is_empty());
+        assert!(repository.archived_evidence().unwrap().is_empty());
+        assert_eq!(repository.object_store.object_file_count().unwrap(), 1);
+        repository.close().unwrap();
+
+        let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        assert!(repository.all_browser_visits().unwrap().is_empty());
         assert!(repository.archived_evidence().unwrap().is_empty());
         assert_eq!(repository.object_store.object_file_count().unwrap(), 0);
     }

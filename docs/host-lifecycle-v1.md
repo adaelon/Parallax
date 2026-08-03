@@ -90,6 +90,8 @@ set_capture_paused(paused) -> CaptureStatusView
 
 采集查询只返回有界活动元数据和有原因空缺；暂停/恢复不能获得 Win32、数据库或密钥句柄。
 
+S29 不新增 WebView command。浏览扩展只访问固定来源、仅环回、当前进程令牌保护的独立 HTTP 入口；入口线程调用 `ManagedHost` 的当前开放宿主会话，不进入主窗口 invoke handler 或 capability。
+
 命令参数和返回值只能是有界结构化数据。WebView 不接收 Vault Key、Recovery Key、数据库或 repository 句柄、模型 bearer token、任意路径、通用文件 API、shell、HTTP 或进程能力。
 
 ## 6. Windows 测试方案
@@ -105,5 +107,7 @@ set_capture_paused(paused) -> CaptureStatusView
 | WebView 边界 | capability 与 invoke handler 均不存在通用文件、shell、HTTP、数据库、密钥或运行时凭据入口。 |
 | 活动采集 | 连续同活动合并；空闲、窗口切换、暂停、锁屏、源不可用和退出产生确定性边界，且只返回最小元数据。 |
 | 采集恢复 | 崩溃后活动只保留至最后观测点，之后为 `CRASH` 空缺；关窗隐藏期间采集线程与宿主会话继续。 |
+| 浏览器采集 | 环回服务只接受 manifest 公钥派生的固定扩展来源和当前进程令牌；相同提交幂等、冲突和陈旧会话拒绝，绑定或扩展断开不影响 Core，主窗口 capability 不扩张。 |
+| 扩展权限与恢复 | manifest 权限与实际 API 集合相等；正文只在本人按来源授权时读取，撤销清理未提交正文；失败队列跨浏览器重启保留且满足去重、128 项与 4 MiB 上限。 |
 
 纯生命周期转换和 SQLCipher 重启/故障注入由 Rust 自动化测试覆盖；Tauri 窗口、托盘、单实例与自启动在 Windows 上使用打包后的 smoke harness 验证，前端使用类型检查与组件测试验证 command 调用和错误呈现。

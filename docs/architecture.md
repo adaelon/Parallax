@@ -34,6 +34,7 @@ flowchart LR
         Commands[白名单 Tauri Commands]
         subgraph LocalCore[内嵌本地可信 Rust Core]
             WinCollector[Rust Windows 活动采集器]
+            BrowserCapture[固定来源环回浏览采集器]
             ObsidianSource[Obsidian 资料源适配器]
             Intake[摄取协调器]
             MarkdownParser[纯 Rust Markdown 解析器]
@@ -72,7 +73,9 @@ flowchart LR
     Intake --> MarkdownParser
     MarkdownParser --> Intake
     WinCollector --> Intake
-    Browser --> Intake
+    Browser -->|固定来源 + 进程令牌| BrowserCapture
+    BrowserCapture --> HostLifecycle
+    BrowserCapture --> Vault
     Commands --> Intake
     Intake --> Vault
     Intake --> Ledgers
@@ -282,6 +285,8 @@ S19 将 `self.db` schema 升至 v16：`deletion_intents` 以目标种类和目�
 S20～S22 将 `self.db` schema 依次升至 v17～v19：共同约定候选与共同经历、不可变版本双签边界、关系约束偏离及其原约定 Claim/理由均在 SQLCipher 事务中持久化。S23 升至 v20：`shared_agreement_candidate_supersessions` 以有序外键把新候选绑定到被整份取代的旧 Agreement Claim；候选暂存、本人修订和最终签署均校验目标，确认事务会拒绝已被其他新约定取代或在新约定生效时不再有效的目标。旧约定 Claim、签署和已入账违约历史不改写；遗忘旧约定支持时沿取代边递归删除依赖候选与确认 Claim，避免悬空或复活。
 
 S28 将 `self.db` schema 升至 v24：`capture_spans` 在同一有序时间线中保存活动区间和有原因采集空缺，并限制全库至多一个开放区间。连续同活动只推进 `observed_until`；状态变化原子闭合前区间并开启后区间；崩溃恢复在最后观测点闭合活动，再追加 `CRASH` 空缺，绝不延长未观测活动。
+
+S29-2 将 `self.db` schema 升至 v25：`browser_visits` 以不可改写行保存当前开放宿主会话下的 URL、标题、访问时间和停留时长，`submission_id` 提供跨重试幂等键。可选页面正文先进入认证密文对象与 `archived_evidence(ARCHIVED_UNPARSED)`，再由同一 SQLCipher 事务把浏览记录绑定到正文证据；失败时访问行和引用一起回滚，零引用对象由重启清理。
 
 ### 4.2 逻辑数据模型
 
@@ -608,7 +613,7 @@ Obsidian 校准
 ### 5.3 Windows 与浏览器活动采集
 
 ```text
-前台窗口或浏览事件
+前台窗口事件
   -> 采集最小元数据
   -> CaptureStateMachine 区分活动、空闲、暂停、锁屏与源不可用
   -> 同活动推进 SQLCipher 开放区间的 observed_until
@@ -619,6 +624,21 @@ Obsidian 校准
 ```
 
 活动时长由事件区间派生，不作为不可修正的原始事实。正文和截图不属于默认采集路径。
+
+```text
+固定来源 MV3 扩展
+  -> GET /v1/session：取得仅存于当前宿主进程的随机令牌
+  -> POST /v1/browser-events：令牌 + 有界 URL/标题/访问与停留区间
+  -> 独立环回线程校验来源、令牌、HTTP/JSON 上限和页面来源授权
+  -> ManagedHost 只选择当前开放 HostSession
+  -> metadata-only：SQLCipher browser_visits
+  -> authorized page text：认证密文对象 + ARCHIVED_UNPARSED 不可信证据
+  -> 同一事务绑定正文证据与不可改写访问行
+```
+
+同一 `submission_id` 的相同重试返回原收据，不同内容重试和陈旧宿主会话拒绝。环回绑定、扩展连接或单次请求失败不停止 Core、Windows 采集或对话；浏览扩展负责保留有界重试队列。
+
+扩展只把当前聚焦窗口中的活动 HTTP(S) 标签页视为一次访问；非 Web URL、带凭据 URL 与隐身标签页不采集。活动访问仅保存在 `storage.session`，避免浏览器重启时伪造跨停机停留时间；提交失败事件以稳定 `submission_id` 进入 `storage.local`，按 128 项/4 MiB 双上限淘汰最旧项并定时幂等重试。正文权限由 popup 在本人点击时按精确来源申请 `optional_host_permissions`，service worker 每次执行 `scripting.executeScript` 前复核权限；撤销来源会清除活动访问和尚未提交队列中的该来源正文，但保留浏览元数据。
 
 ### 5.4 第二自我醒来和对话
 
@@ -959,6 +979,9 @@ self.db + objects + deletion state
 - 本地文件以及未来新增的任何 IPC 必须显式限制到当前登录会话并拒绝远程访问，不能依赖操作系统默认权限。
 - 磁盘上的对象名、目录结构和明文引导元数据不得暴露个人内容或普通内容哈希。
 - 外部模型和浏览器扩展不能直接读取保险库。
+- 浏览器入口只绑定 IPv4 环回固定端口，必须同时匹配 manifest 公钥派生的固定扩展来源与当前宿主进程随机令牌；令牌不落盘、不进入响应以外的日志或状态。
+- 浏览器正文只在本人按精确 HTTP(S) 来源授予可选 host permission 后由 `chrome.scripting` 读取；来源撤销必须停止后续读取并移除尚未提交的对应正文。
+- 浏览器活动访问只保存在浏览器会话内；持久失败队列限制为 128 项与 4 MiB，且不得持久化宿主令牌、Vault 数据或其他个人上下文。
 - Obsidian 资料源适配器只能读取本人选择目录内的普通文件，不能写回、执行插件或自动获取外部链接。
 - Core Markdown 解析入口只能接收 UTF-8 原文和资源上限，不能获得路径、数据库、网络、模型运行时或工具句柄；HTML、脚本、链接、嵌入和插件语法不得触发执行或获取。
 - Markdown 原文字节数、块数量、嵌套深度、元数据总量和链接数量必须有硬上限；越限结果不得进入权威存储、检索或记忆。
@@ -996,6 +1019,7 @@ self.db + objects + deletion state
 | 记忆维护失败 | 保留待处理事件；不回滚已写入证据。 |
 | 本机密钥不可用 | 使用恢复密钥恢复；两者皆失则无法解密。 |
 | 云端网络不可用 | 切换可用本地运行时或保持休眠，不上传重试队列中的额外数据。 |
+| 浏览器扩展或环回入口不可用 | Core、Windows 采集与对话继续；扩展保留有界重试队列，恢复后按 `submission_id` 幂等提交。 |
 
 ## 8. 决策反向索引
 
@@ -1011,6 +1035,7 @@ self.db + objects + deletion state
 | Windows 桌面壳、本地核心、浏览器扩展 | [ADR-0008：Tauri、React 和 Rust](adr/0008-tauri-react-rust-desktop-stack.md) |
 | `self.db`、加密对象库、密钥派生与活动存储遗忘边界 | [ADR-0009：混合加密保险库存储](adr/0009-hybrid-encrypted-vault-storage.md) |
 | 本地文件、IPC、主机入侵与安全声明边界 | [ADR-0011：信任当前 Windows 登录会话](adr/0011-trust-current-windows-logon-session.md) |
+| `crates/capture-browser`、固定扩展来源、环回会话令牌与浏览提交 | [ADR-0050：浏览器采集采用固定来源环回会话通道](adr/0050-pinned-origin-loopback-browser-capture.md) |
 | 托盘常驻宿主、窗口关闭语义和内嵌 Core | [ADR-0012：托盘常驻 Tauri 宿主](adr/0012-tray-resident-tauri-host.md) |
 | Context Inbox 归档状态、延迟解析与重处理 | [ADR-0013：先归档后理解](adr/0013-archive-before-understanding.md) |
 | Obsidian 笔记库适配器、只读边界与结构提取 | [ADR-0015：只读 Obsidian 资料源](adr/0015-read-only-obsidian-source.md) |
@@ -1949,3 +1974,45 @@ WebView -> get_capture_status | list_activity_timeline | set_capture_paused
 ```
 
 原生边界只调用前台窗口、进程映像名、窗口标题、输入空闲计时和输入桌面可切换性 API；不读取输入内容、屏幕像素、密码字段或任意文件。应用名只保留可执行文件名，不保存进程路径；窗口标题按固定上限截断。活动时长由可修正区间派生，采集空缺与宿主运行空缺分别保存。该实现沿用 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md) 与 [ADR-0012](adr/0012-tray-resident-tauri-host.md)，没有新增难以逆转的架构权衡。
+
+### 9.29 S29 浏览器采集当前实现边界
+
+```text
+crates/capture-browser/src/
+  domain.rs / ports.rs              # 有界浏览提交、不可信正文与持久化端口
+  http.rs                           # 固定扩展来源、随机进程令牌和仅环回 HTTP
+crates/vault/src/
+  schema.rs / repository.rs         # schema v25、幂等访问记录与正文证据归档
+apps/desktop/src-tauri/src/
+  state.rs / lib.rs                 # 当前 HostSession 提交与独立环回服务线程
+apps/browser-extension/
+  public/manifest.json              # 固定 ID、最小 API 权限、环回 host 与可选来源权限
+  src/contracts.ts                  # 访问区间、来源授权、队列去重与双上限纯契约
+  src/service-worker.ts             # 聚焦标签页状态机、持久失败队列与幂等提交
+  src/popup.ts                      # 本人按当前来源授权或撤销正文
+```
+
+```text
+fixed extension origin -> GET /v1/session -> process-lifetime token
+POST /v1/browser-events + bearer token
+  -> bounded BrowserSubmission
+  -> require current open HostSession
+  -> optional page text -> authenticated object + archived_evidence
+  -> same SQLCipher transaction -> immutable browser_visits row
+retry same submission -> same receipt
+conflicting retry | stale session -> reject
+```
+
+```text
+focused HTTP(S) tab -> storage.session ActiveVisit
+tab/window boundary -> finalize URL + title + visited_at + dwell
+  -> storage.local retry queue (submission_id dedupe, 128 items / 4 MiB)
+  -> GET session token -> POST browser event
+source-authorized complete page
+  -> permissions.contains(exact origin)
+  -> scripting.executeScript(document.body.innerText, 512 KiB)
+source permission removed
+  -> active and queued page text cleared; metadata retained
+```
+
+S29 已完成固定来源协议、环回适配器、加密持久化、桌面 `ManagedHost` 独立线程和可直接加载的 Manifest V3 TypeScript 扩展。manifest 只声明代码实际使用的 `alarms/scripting/storage/tabs`，环回 host permission 固定到 `127.0.0.1:43129`，HTTP(S) 页面权限仅为运行时按来源申请；扩展不读取 Vault、不调用模型、不自动打开或下载外链。主窗口 capability 与 invoke handler 未增加浏览器入口，环回绑定或扩展断开也不阻断 Core。环回通道的难逆权衡见 [ADR-0050](adr/0050-pinned-origin-loopback-browser-capture.md)。

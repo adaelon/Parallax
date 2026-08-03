@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use eam_capture_browser::{BrowserCaptureReceipt, BrowserCaptureRepository, BrowserSubmission};
 use eam_capture_windows::{
     ActivityTimelineRepository, CaptureCheckpoint, CaptureGapReason, CaptureMode, CaptureSpan,
     CaptureSpanKind, CaptureStateMachine, DEFAULT_IDLE_THRESHOLD, NativeCaptureSample,
@@ -570,6 +571,27 @@ impl ManagedHost {
                     approve_oversized,
                     archived_at_millis,
                 )
+            }
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn record_browser_submission(
+        &self,
+        submission: &BrowserSubmission,
+    ) -> Result<BrowserCaptureReceipt, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                let session_id = host
+                    .lifecycle
+                    .session_id()
+                    .ok_or_else(|| "running host has no lifecycle session".to_owned())?;
+                host.core
+                    .repository_mut()
+                    .record_browser_submission(session_id, submission)
+                    .map_err(|error| error.to_string())
             }
             HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
             HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
@@ -1646,6 +1668,7 @@ mod tests {
         sync::{Mutex, MutexGuard},
     };
 
+    use eam_capture_browser::BrowserSubmissionPayload;
     use eam_core::{
         ClaimOwner, IdentityProfileSnapshot, IdentityRuntimeContext, IdentityStateSnapshot,
         InMemoryRepository, IncrementingClock, PersonTurnClassification,
@@ -1744,6 +1767,59 @@ mod tests {
         assert_eq!(timeline.len(), 1);
         assert_eq!(timeline[0].kind, "activity");
         assert_eq!(timeline[0].ended_at_millis, None);
+    }
+
+    #[test]
+    fn browser_submission_uses_only_the_managed_current_host_session() {
+        let _guard = sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let mut repository =
+            VaultRepository::open(directory.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+        let mut clock = SystemClock;
+        let started_at = clock.now();
+        let start = repository
+            .begin_host_session(started_at, LaunchMode::Foreground)
+            .unwrap();
+        let recovery = repository
+            .recover_capture_timeline(start.session().id(), started_at, None)
+            .unwrap();
+        let mut lifecycle = HostLifecycle::new();
+        lifecycle.begin_recovery().unwrap();
+        lifecycle
+            .complete_recovery(start.session().id(), LaunchMode::Foreground)
+            .unwrap();
+        let runtime: AppRuntime = Box::new(ScriptedRuntime::new([], []));
+        let managed = ManagedHost {
+            inner: Mutex::new(HostSlot::Ready(HostCore {
+                core: MemoryCore::new(repository, runtime, SystemClock),
+                lifecycle,
+                capture: CaptureStateMachine::restore(&recovery),
+                host_clock: SystemClock,
+            })),
+            vault_root: directory.path().to_path_buf(),
+            updater_configured: false,
+        };
+        let submission = BrowserSubmission::from_payload(BrowserSubmissionPayload {
+            submission_id: "desktop-host-browser-event".to_owned(),
+            url: "https://example.test/article".to_owned(),
+            title: "Desktop host".to_owned(),
+            visited_at_millis: started_at.as_millis(),
+            dwell_millis: 0,
+            page_content: None,
+        })
+        .unwrap();
+
+        let first = managed.record_browser_submission(&submission).unwrap();
+        let retried = managed.record_browser_submission(&submission).unwrap();
+
+        assert!(!first.reused());
+        assert!(retried.reused());
+        assert_eq!(first.visit_id(), retried.visit_id());
+        managed.shutdown(ExitReason::Explicit).unwrap();
+        assert_eq!(
+            managed.record_browser_submission(&submission).unwrap_err(),
+            "desktop host is already stopped"
+        );
     }
 
     #[test]

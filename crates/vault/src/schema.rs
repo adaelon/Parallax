@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 24;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 25;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1497,6 +1497,46 @@ CREATE INDEX capture_spans_host_session
     ON capture_spans(started_in_host_session_id);
 ";
 
+const MIGRATION_25: &str = r"
+CREATE TABLE browser_visits (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    host_session_id INTEGER NOT NULL
+        REFERENCES host_sessions(id) ON DELETE RESTRICT,
+    submission_id TEXT NOT NULL UNIQUE
+        CHECK (length(submission_id) BETWEEN 1 AND 64),
+    url TEXT NOT NULL CHECK (length(url) BETWEEN 1 AND 16384),
+    title TEXT NOT NULL CHECK (length(title) <= 16384),
+    visited_at INTEGER NOT NULL CHECK (visited_at >= 0),
+    dwell_millis INTEGER NOT NULL CHECK (dwell_millis BETWEEN 0 AND 86400000),
+    content_evidence_id INTEGER
+        REFERENCES archived_evidence(id) ON DELETE CASCADE,
+    content_captured_at INTEGER,
+    content_authorized_origin TEXT,
+    CHECK (
+        (
+            content_evidence_id IS NULL
+            AND content_captured_at IS NULL
+            AND content_authorized_origin IS NULL
+        )
+        OR
+        (
+            content_evidence_id IS NOT NULL
+            AND content_captured_at BETWEEN visited_at AND visited_at + dwell_millis
+            AND length(content_authorized_origin) > 0
+        )
+    )
+) STRICT;
+
+CREATE INDEX browser_visits_time ON browser_visits(visited_at, dwell_millis);
+CREATE INDEX browser_visits_host_session ON browser_visits(host_session_id);
+
+CREATE TRIGGER browser_visits_immutable
+BEFORE UPDATE ON browser_visits
+BEGIN
+    SELECT RAISE(ABORT, 'browser visits are immutable');
+END;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1538,6 +1578,7 @@ where
             22 => transaction.execute_batch(MIGRATION_22)?,
             23 => transaction.execute_batch(MIGRATION_23)?,
             24 => transaction.execute_batch(MIGRATION_24)?,
+            25 => transaction.execute_batch(MIGRATION_25)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -2759,6 +2800,53 @@ mod tests {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema
                  WHERE name = 'capture_spans')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_exists);
+    }
+
+    #[test]
+    fn interrupted_browser_capture_migration_keeps_v24_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 25 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(25))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            24
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'browser_visits')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'browser_visits')",
                 [],
                 |row| row.get(0),
             )

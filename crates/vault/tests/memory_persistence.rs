@@ -87,7 +87,7 @@ fn explicit_versions_survive_reopen_and_only_current_memory_sources_are_recalled
 
     let mut repository =
         VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 24);
+    assert_eq!(repository.schema_version().unwrap(), 25);
     let versions = repository.memory_versions(first.id()).unwrap();
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].status(), MemoryStatus::Superseded);
@@ -194,7 +194,7 @@ fn maintained_dispute_survives_reopen_and_freezes_only_as_a_complete_relevant_pa
 
     let mut repository =
         VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 24);
+    assert_eq!(repository.schema_version().unwrap(), 25);
     assert_eq!(
         repository
             .current_memory(memory.id())
@@ -552,7 +552,7 @@ fn assert_complete_maturity_record(
     pattern: &MemoryVersion,
     matured: &MemoryVersion,
 ) {
-    assert_eq!(repository.schema_version().unwrap(), 24);
+    assert_eq!(repository.schema_version().unwrap(), 25);
     let current = repository.current_memory(pattern.id()).unwrap().unwrap();
     assert_eq!(&current, matured);
     assert_eq!(current.status(), MemoryStatus::SupportedCounterpartView);

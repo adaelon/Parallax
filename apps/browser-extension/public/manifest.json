@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "evrything-about-me browser capture",
+  "short_name": "EAM capture",
+  "version": "0.1.0",
+  "description": "Records bounded browsing metadata and source-authorized page text to the local evrything-about-me host.",
+  "minimum_chrome_version": "120",
+  "incognito": "not_allowed",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAl1xGS4YnPbVkwuO/ENIwyTStdcwuDIjrj+6U1iw2UP+AuyMrNK2pjw7Tw4KfFGcybU93/t9wh6SnSncl0Vdb0FEbH+XAb8V0XcQif41RUQwTwKFr6AR4cv9rWn4Axr3MRDr0/Kws8Fmkt6y9li3ZjLSWaX0AWKEVBqFIc2UwpafzhdIxAjApS8uaU6eKnTvBAggb2Y06YdLq1bLzO/90MsAYj6kqujLDxy3smwV93frTTDDAHb5JNy8AhEBLI434O1QwcwXRbV1/GNQGVgHTnCILTHnNZNnQhcyrRwMplQwVsr7rIpEHvwvx7vWay6seJQRf8Qqcr+/vdjJN1g4UOwIDAQAB",
+  "permissions": ["alarms", "scripting", "storage", "tabs"],
+  "host_permissions": ["http://127.0.0.1:43129/*"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "evrything-about-me capture",
+    "default_popup": "popup.html"
+  }
+}

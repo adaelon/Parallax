@@ -1,4 +1,4 @@
-//! Thin Tauri host for S07 lifecycle and S28 Windows activity capture.
+//! Thin Tauri host for lifecycle, Windows activity, and S29 browser capture.
 
 mod state;
 
@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use eam_capture_browser::{BrowserCaptureSession, bind_loopback, serve_loopback};
 use eam_capture_windows::{DEFAULT_IDLE_THRESHOLD, sample_foreground_activity};
 use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
@@ -369,6 +370,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             }
             spawn_heartbeat(app.handle().clone())?;
             spawn_capture(app.handle().clone())?;
+            let _ = spawn_browser_capture(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -553,6 +555,25 @@ fn spawn_capture(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 thread::sleep(CAPTURE_INTERVAL);
             }
+        })?;
+    Ok(())
+}
+
+fn spawn_browser_capture(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    thread::Builder::new()
+        .name("eam-browser-capture".to_owned())
+        .spawn(move || {
+            let Ok(listener) = bind_loopback() else {
+                return;
+            };
+            let Ok(session) = BrowserCaptureSession::new_random() else {
+                return;
+            };
+            let _ = serve_loopback(&listener, &session, &EXIT_ALLOWED, |submission| {
+                app.try_state::<ManagedHost>()
+                    .ok_or_else(|| "desktop host is unavailable".to_owned())?
+                    .record_browser_submission(&submission)
+            });
         })?;
     Ok(())
 }

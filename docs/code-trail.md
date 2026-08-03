@@ -1,5 +1,48 @@
 # 代码链路
 
+## 2026-08-03 S29-4 权限审计与全仓收口
+
+**触达**:
+- `apps/browser-extension/tests/manifest.test.ts:Manifest V3 permission and origin audit`、`scripts/verify-dist.mjs` — 逐项比对实际 `chrome.*` API、manifest 权限、固定扩展 ID 与生产入口资源。
+- `crates/capture-browser/src/http.rs:loopback_origin_is_pinned_to_the_manifest_public_key_id` — 把环回来源锁到 manifest 公钥派生 ID，拒绝生产扩展与宿主常量漂移。
+- `crates/vault/tests/{capture_persistence,claim_correction_persistence,encrypted_repository,identity_persistence,memory_persistence,reflection_persistence,self_bundle_persistence,shared_experience_persistence,windows_unlock}.rs` — 随 schema v25 更新既有重启测试的新鲜度断言，不放宽业务行为。
+- `docs/architecture.md:§5.3/§6.2/§9.29`、`docs/host-lifecycle-v1.md:§5/§6` — 对齐扩展存储、授权撤销、环回边界与不新增 WebView command 的最终实现。
+
+**入口**：S29-1～S29-3 的完整 diff 经协议、持久化、扩展行为、权限/API、生产目录和全仓门禁后进入提交。
+**测试**：Rust 全仓 281/281；fmt、workspace Clippy `-D warnings`、desktop all-targets check；桌面 13/13、扩展 10/10、两套 TypeScript 与生产构建全部通过；独立 Chrome profile 以 unpacked `dist` 启动，CDP 观察到固定 ID 的 `service-worker.js` target。
+
+## 2026-08-03 S29-3 Manifest V3 TypeScript 扩展
+
+**触达**:
+- `apps/browser-extension/public/manifest.json` — 固定扩展 ID，只声明 `alarms/scripting/storage/tabs`、环回 host permission 与 HTTP(S) 可选来源权限。
+- `apps/browser-extension/src/contracts.ts:webTabSnapshot/finalizeVisit/retainAuthorizedPageContent/enqueueBounded` — 约束浏览元数据、精确来源正文授权/撤销、稳定去重与 128 项/4 MiB 队列上限。
+- `apps/browser-extension/src/service-worker.ts:transitionToTab/reconcileStoredAuthorizations/flushQueue` — 会话内追踪聚焦标签页，以本地持久队列承接失败并按宿主收据幂等出队。
+- `apps/browser-extension/src/popup.ts`、`tests/contracts.test.ts` — 本人按当前来源显式授权或撤销正文，并覆盖元数据、授权正文、来源撤销、去重和上限。
+
+**入口**：加载 `apps/browser-extension/dist` 后，service worker 监听标签页/窗口边界；popup 只管理当前 HTTP(S) 来源的可选正文权限。
+**测试**：Vitest 10/10、TypeScript 通过；Vite 生产构建及 `verify-dist.mjs` 通过，可直接以 unpacked extension 加载 `dist`。
+
+## 2026-08-03 S29-2 浏览事件加密持久化
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_25` — 新增不可改写的浏览访问元数据、当前宿主会话外键与可选正文证据引用。
+- `crates/vault/src/repository.rs:VaultRepository::record_browser_submission_with_hook` — 在当前开放宿主会话下原子、幂等写入访问记录，并把授权正文先归档为不可信证据。
+- `apps/desktop/src-tauri/src/state.rs:ManagedHost::record_browser_submission`、`src/lib.rs:spawn_browser_capture` — 独立环回线程只借用当前开放宿主会话提交，绑定或扩展断开不阻断 Core。
+- `crates/vault/tests/browser_capture_persistence.rs` — 覆盖 SQLCipher 重启、相同提交重试、冲突重试、正文归档和陈旧会话拒绝。
+
+**入口**：桌面宿主独立线程运行固定来源环回适配器，把已校验事件交给 `ManagedHost` 和 `BrowserCaptureRepository`；本片不新增 WebView command，也不接扩展代码。
+**测试**：Vault 持久化 2/2、Vault lib 41/41、桌面 Rust 23/23，相关 Clippy 与 desktop all-targets check 通过；覆盖事务回滚/孤儿回收、宿主关闭拒绝和 `core:default` capability 不扩张。
+
+## 2026-08-03 S29-1 固定来源环回会话协议
+
+**触达**:
+- `crates/capture-browser/src/domain.rs:BrowserSubmission::from_payload` — 约束 URL、标题、访问/停留区间及按来源授权的不可信页面正文。
+- `crates/capture-browser/src/http.rs:handle_http_request/serve_loopback` — 固定扩展来源、仅环回地址与随机宿主会话令牌共同守住有界提交入口。
+- `docs/adr/0050-pinned-origin-loopback-browser-capture.md` — 冻结环回会话通道并否决 WebView command、无认证 localhost 与首版 Native Messaging。
+
+**入口**：固定 ID 的 Manifest V3 扩展先从 `/v1/session` 取得仅存于当前宿主进程的令牌，再向 `/v1/browser-events` 提交结构化浏览事件。
+**测试**：`cargo test -p capture-browser` 7/7；`cargo clippy -p capture-browser --all-targets -- -D warnings` 通过，覆盖远程、错误来源、伪造令牌、越限、未授权正文拒绝和固定 ID 一致性。
+
 ## 2026-08-03 S28-4 全仓门禁与实现级收口
 
 **触达**:

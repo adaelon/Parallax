@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Browser capture</title>
+    <link rel="stylesheet" href="/src/popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Browser capture</h1>
+      <p class="summary">URL, title, visit time, and dwell time are recorded for web pages.</p>
+      <section aria-live="polite">
+        <span class="label">Current source</span>
+        <strong id="origin">Unavailable</strong>
+        <p id="status">Open an HTTP or HTTPS page to manage optional page text.</p>
+      </section>
+      <button id="authorize" type="button" disabled>Allow page text for this source</button>
+      <button id="revoke" class="secondary" type="button" disabled>Stop page text for this source</button>
+      <p class="privacy">Page text is never collected without this source permission. The extension never reads the vault or calls a model.</p>
+    </main>
+    <script type="module" src="/src/popup.ts"></script>
+  </body>
+</html>
