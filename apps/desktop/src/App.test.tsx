@@ -6,6 +6,7 @@ import { Root, createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ActivityTimelineEntry,
   App,
   ConversationTurn,
   IdentityStateVersion,
@@ -105,6 +106,70 @@ describe("S07 continuous conversation", () => {
     });
     expect(listCalls).toBe(2);
     expect(ceremonyCalls).toBe(2);
+  });
+});
+
+describe("S28 Windows activity timeline", () => {
+  it("shows explicit gaps and pauses through whitelisted commands", async () => {
+    const timeline: ActivityTimelineEntry[] = [
+      {
+        id: 1,
+        kind: "activity",
+        application: "code.exe",
+        windowTitle: "S28",
+        idle: false,
+        gapReason: null,
+        startedAtMillis: 1_785_000_000_000,
+        observedUntilMillis: 1_785_000_001_000,
+        endedAtMillis: 1_785_000_001_000,
+      },
+      {
+        id: 2,
+        kind: "gap",
+        application: null,
+        windowTitle: null,
+        idle: null,
+        gapReason: "crash",
+        startedAtMillis: 1_785_000_001_000,
+        observedUntilMillis: 1_785_000_002_000,
+        endedAtMillis: null,
+      },
+    ];
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (
+        command === "list_conversation" ||
+        command === "list_shared_experience_ceremonies"
+      ) {
+        return [] as T;
+      }
+      if (command === "get_capture_status") {
+        return { state: "collecting" } as T;
+      }
+      if (command === "list_activity_timeline") {
+        return timeline as T;
+      }
+      if (command === "set_capture_paused") {
+        return { state: "paused" } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("从此刻继续认识彼此"));
+    await clickButton("活动时间线");
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("code.exe · 活跃");
+      expect(document.body.textContent).toContain("采集空缺 · 宿主崩溃");
+      expect(document.body.textContent).toContain("不会推测或填补");
+    });
+
+    await clickButton("暂停记录");
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_capture_paused", {
+        paused: true,
+      }),
+    );
+    expect(document.body.textContent).toContain("当前状态：本人已暂停");
   });
 });
 

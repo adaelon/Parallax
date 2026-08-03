@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/capture-windows",
     "apps/desktop/src-tauri",
     "crates/core",
     "crates/desktop-host",

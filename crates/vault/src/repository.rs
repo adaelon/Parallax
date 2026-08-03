@@ -4,6 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use eam_capture_windows::{
+    ActivitySnapshot, ActivityTimelineRepository, CaptureCheckpoint, CaptureGapReason, CaptureMode,
+    CaptureRecovery, CaptureSpan, CaptureSpanId, CaptureSpanKind, IdleState,
+};
 use eam_core::{
     AgreementWithdrawal, AgreementWithdrawalActor, ApplicableTime, Claim, ClaimCorrectionReceipt,
     ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, ConversationEvidence,
@@ -5005,6 +5009,150 @@ impl HostLifecycleRepository for VaultRepository {
             .map_err(repository_error)?
             .into_iter()
             .map(StoredHostGap::decode)
+            .collect()
+    }
+}
+
+impl ActivityTimelineRepository for VaultRepository {
+    fn recover_capture_timeline(
+        &mut self,
+        host_session_id: HostSessionId,
+        started_at: Timestamp,
+        recovered_host_gap: Option<HostGapReason>,
+    ) -> Result<CaptureRecovery, RepositoryError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        require_current_open_host_session(&transaction, host_session_id)?;
+        let Some(open) = current_capture_span(&transaction)? else {
+            transaction.commit().map_err(repository_error)?;
+            return Ok(CaptureRecovery::new(CaptureMode::Collecting, None));
+        };
+
+        let recovery = match open.kind() {
+            CaptureSpanKind::Activity(_) => {
+                transaction
+                    .execute(
+                        "UPDATE capture_spans SET ended_at = observed_until WHERE id = ?1",
+                        [to_sql_id(open.id().get())?],
+                    )
+                    .map_err(repository_error)?;
+                let reason =
+                    recovered_host_gap.map_or(CaptureGapReason::Crash, CaptureGapReason::from);
+                let gap_started_at = std::cmp::min(open.observed_until(), started_at);
+                let gap = insert_capture_span(
+                    &transaction,
+                    host_session_id,
+                    CaptureSpanKind::Gap(reason),
+                    gap_started_at,
+                    started_at,
+                )?;
+                CaptureRecovery::new(CaptureMode::Collecting, Some(gap.kind().clone()))
+            }
+            CaptureSpanKind::Gap(reason) => {
+                let observed_until = std::cmp::max(open.observed_until(), started_at);
+                transaction
+                    .execute(
+                        "UPDATE capture_spans SET observed_until = ?1 WHERE id = ?2",
+                        params![observed_until.as_millis(), to_sql_id(open.id().get())?],
+                    )
+                    .map_err(repository_error)?;
+                let mode = match reason {
+                    CaptureGapReason::Paused => CaptureMode::Paused,
+                    CaptureGapReason::SessionLocked => CaptureMode::Locked,
+                    CaptureGapReason::ExplicitExit
+                    | CaptureGapReason::Update
+                    | CaptureGapReason::Crash
+                    | CaptureGapReason::SourceUnavailable => CaptureMode::Collecting,
+                };
+                CaptureRecovery::new(mode, Some(open.kind().clone()))
+            }
+        };
+        transaction.commit().map_err(repository_error)?;
+        Ok(recovery)
+    }
+
+    fn record_capture_checkpoint(
+        &mut self,
+        host_session_id: HostSessionId,
+        checkpoint: &CaptureCheckpoint,
+    ) -> Result<CaptureSpan, RepositoryError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        require_current_open_host_session(&transaction, host_session_id)?;
+        let persisted = match current_capture_span(&transaction)? {
+            None => insert_capture_span(
+                &transaction,
+                host_session_id,
+                checkpoint.kind().clone(),
+                checkpoint.observed_at(),
+                checkpoint.observed_at(),
+            )?,
+            Some(current) if current.kind() == checkpoint.kind() => {
+                let observed_until =
+                    std::cmp::max(current.observed_until(), checkpoint.observed_at());
+                transaction
+                    .execute(
+                        "UPDATE capture_spans SET observed_until = ?1 WHERE id = ?2",
+                        params![observed_until.as_millis(), to_sql_id(current.id().get())?,],
+                    )
+                    .map_err(repository_error)?;
+                CaptureSpan::restore(
+                    current.id(),
+                    current.started_in_host_session(),
+                    current.kind().clone(),
+                    current.started_at(),
+                    observed_until,
+                    None,
+                )
+            }
+            Some(current) => {
+                let transition_at =
+                    std::cmp::max(current.observed_until(), checkpoint.observed_at());
+                transaction
+                    .execute(
+                        "UPDATE capture_spans
+                         SET observed_until = ?1, ended_at = ?1 WHERE id = ?2",
+                        params![transition_at.as_millis(), to_sql_id(current.id().get())?],
+                    )
+                    .map_err(repository_error)?;
+                insert_capture_span(
+                    &transaction,
+                    host_session_id,
+                    checkpoint.kind().clone(),
+                    transition_at,
+                    transition_at,
+                )?
+            }
+        };
+        transaction.commit().map_err(repository_error)?;
+        Ok(persisted)
+    }
+
+    fn all_capture_spans(&self) -> Result<Vec<CaptureSpan>, RepositoryError> {
+        let mut statement = self
+            .connection()
+            .prepare(
+                "SELECT id, started_in_host_session_id, kind, application,
+                        window_title, idle_state, gap_reason, started_at,
+                        observed_until, ended_at
+                 FROM capture_spans ORDER BY id",
+            )
+            .map_err(repository_error)?;
+        statement
+            .query_map([], stored_capture_span_from_row)
+            .map_err(repository_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_error)?
+            .into_iter()
+            .map(StoredCaptureSpan::decode)
             .collect()
     }
 }
@@ -10741,6 +10889,127 @@ fn recovered_gap_spec(
     }
 }
 
+fn require_current_open_host_session(
+    connection: &Connection,
+    session_id: HostSessionId,
+) -> Result<(), RepositoryError> {
+    let current = current_host_session(connection)?
+        .ok_or_else(|| RepositoryError::new("host session is not initialized"))?;
+    if current.id() != session_id || current.ended_at().is_some() {
+        return Err(RepositoryError::new(
+            "capture checkpoint must target the current open host session",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_capture_span(
+    transaction: &rusqlite::Transaction<'_>,
+    host_session_id: HostSessionId,
+    kind: CaptureSpanKind,
+    started_at: Timestamp,
+    observed_until: Timestamp,
+) -> Result<CaptureSpan, RepositoryError> {
+    let id = CaptureSpanId::from_raw(next_host_identifier(transaction, "capture_spans")?);
+    let (kind_code, application, window_title, idle_state, gap_reason) = match &kind {
+        CaptureSpanKind::Activity(snapshot) => (
+            0,
+            Some(snapshot.application()),
+            Some(snapshot.window_title()),
+            Some(encode_idle_state(snapshot.idle_state())),
+            None,
+        ),
+        CaptureSpanKind::Gap(reason) => (
+            1,
+            None,
+            None,
+            None,
+            Some(encode_capture_gap_reason(*reason)),
+        ),
+    };
+    transaction
+        .execute(
+            "INSERT INTO capture_spans
+             (id, started_in_host_session_id, kind, application, window_title,
+              idle_state, gap_reason, started_at, observed_until, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            params![
+                to_sql_id(id.get())?,
+                to_sql_id(host_session_id.get())?,
+                kind_code,
+                application,
+                window_title,
+                idle_state,
+                gap_reason,
+                started_at.as_millis(),
+                observed_until.as_millis(),
+            ],
+        )
+        .map_err(repository_error)?;
+    Ok(CaptureSpan::restore(
+        id,
+        host_session_id,
+        kind,
+        started_at,
+        observed_until,
+        None,
+    ))
+}
+
+fn current_capture_span(connection: &Connection) -> Result<Option<CaptureSpan>, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT id, started_in_host_session_id, kind, application,
+                    window_title, idle_state, gap_reason, started_at,
+                    observed_until, ended_at
+             FROM capture_spans WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1",
+            [],
+            stored_capture_span_from_row,
+        )
+        .optional()
+        .map_err(repository_error)?
+        .map(StoredCaptureSpan::decode)
+        .transpose()
+}
+
+const fn encode_idle_state(value: IdleState) -> i64 {
+    match value {
+        IdleState::Active => 0,
+        IdleState::Idle => 1,
+    }
+}
+
+fn decode_idle_state(value: i64) -> Result<IdleState, RepositoryError> {
+    match value {
+        0 => Ok(IdleState::Active),
+        1 => Ok(IdleState::Idle),
+        _ => Err(RepositoryError::new("invalid persisted idle state")),
+    }
+}
+
+const fn encode_capture_gap_reason(value: CaptureGapReason) -> i64 {
+    match value {
+        CaptureGapReason::Paused => 0,
+        CaptureGapReason::SessionLocked => 1,
+        CaptureGapReason::ExplicitExit => 2,
+        CaptureGapReason::Update => 3,
+        CaptureGapReason::Crash => 4,
+        CaptureGapReason::SourceUnavailable => 5,
+    }
+}
+
+fn decode_capture_gap_reason(value: i64) -> Result<CaptureGapReason, RepositoryError> {
+    match value {
+        0 => Ok(CaptureGapReason::Paused),
+        1 => Ok(CaptureGapReason::SessionLocked),
+        2 => Ok(CaptureGapReason::ExplicitExit),
+        3 => Ok(CaptureGapReason::Update),
+        4 => Ok(CaptureGapReason::Crash),
+        5 => Ok(CaptureGapReason::SourceUnavailable),
+        _ => Err(RepositoryError::new("invalid persisted capture gap reason")),
+    }
+}
+
 fn current_host_session(connection: &Connection) -> Result<Option<HostSession>, RepositoryError> {
     connection
         .query_row(
@@ -10753,6 +11022,80 @@ fn current_host_session(connection: &Connection) -> Result<Option<HostSession>, 
         .map_err(repository_error)?
         .map(StoredHostSession::decode)
         .transpose()
+}
+
+struct StoredCaptureSpan {
+    id: i64,
+    started_in_host_session: i64,
+    kind: i64,
+    application: Option<String>,
+    window_title: Option<String>,
+    idle_state: Option<i64>,
+    gap_reason: Option<i64>,
+    started_at: i64,
+    observed_until: i64,
+    ended_at: Option<i64>,
+}
+
+impl StoredCaptureSpan {
+    fn decode(self) -> Result<CaptureSpan, RepositoryError> {
+        if self.id <= 0
+            || self.started_in_host_session <= 0
+            || self.observed_until < self.started_at
+            || self
+                .ended_at
+                .is_some_and(|ended| ended < self.observed_until)
+        {
+            return Err(RepositoryError::new("invalid persisted capture span"));
+        }
+        let kind = match (
+            self.kind,
+            self.application,
+            self.window_title,
+            self.idle_state,
+            self.gap_reason,
+        ) {
+            (0, Some(application), Some(window_title), Some(idle_state), None) => {
+                CaptureSpanKind::Activity(
+                    ActivitySnapshot::new(
+                        application,
+                        window_title,
+                        decode_idle_state(idle_state)?,
+                    )
+                    .map_err(|error| RepositoryError::new(error.to_string()))?,
+                )
+            }
+            (1, None, None, None, Some(reason)) => {
+                CaptureSpanKind::Gap(decode_capture_gap_reason(reason)?)
+            }
+            _ => return Err(RepositoryError::new("invalid persisted capture span kind")),
+        };
+        Ok(CaptureSpan::restore(
+            CaptureSpanId::from_raw(u64::try_from(self.id).map_err(repository_error)?),
+            HostSessionId::from_raw(
+                u64::try_from(self.started_in_host_session).map_err(repository_error)?,
+            ),
+            kind,
+            Timestamp::from_millis(self.started_at),
+            Timestamp::from_millis(self.observed_until),
+            self.ended_at.map(Timestamp::from_millis),
+        ))
+    }
+}
+
+fn stored_capture_span_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCaptureSpan> {
+    Ok(StoredCaptureSpan {
+        id: row.get(0)?,
+        started_in_host_session: row.get(1)?,
+        kind: row.get(2)?,
+        application: row.get(3)?,
+        window_title: row.get(4)?,
+        idle_state: row.get(5)?,
+        gap_reason: row.get(6)?,
+        started_at: row.get(7)?,
+        observed_until: row.get(8)?,
+        ended_at: row.get(9)?,
+    })
 }
 
 struct StoredHostSession {

@@ -1,5 +1,46 @@
 # 代码链路
 
+## 2026-08-03 S28-4 全仓门禁与实现级收口
+
+**触达**:
+- `crates/capture-windows/src/native.rs:imp` — 按 rustfmt 收拢唯一 Win32 unsafe 适配器的导入排版，不改变采样行为。
+- `docs/architecture.md:§4.1/§5.3/§9.28`、`docs/host-lifecycle-v1.md:§5/§6` — 复核 schema v24、采集恢复、白名单 command 与当前代码一致且无需新增 ADR。
+- `docs/code-trail.md:S28-1～S28-4` — 以文件、符号、入口和确定性验证结果闭合 S28 三段实现链路。
+
+**入口**：S28-1～S28-3 的完整 diff 经行为测试、静态检查、桌面/前端构建、capability 与本地文档链接审计后进入提交。
+**测试**：Rust 全仓 269/269；fmt、Clippy `-D warnings`、桌面 all-targets；React 13/13、TypeScript 与生产构建；5 个变更 Markdown 的 113 个本地文件链接和 `core:default` capability 审计通过。
+
+## 2026-08-03 S28-3 Win32 采样、宿主接线与活动时间线
+
+**触达**:
+- `crates/capture-windows/src/native.rs:sample_foreground_activity` — 在唯一 unsafe 边界读取可执行文件名、窗口标题、输入空闲计时与会话锁定状态，不读取输入内容或屏幕。
+- `apps/desktop/src-tauri/src/state.rs:record_capture_sample/set_capture_paused/shutdown`、`lib.rs:spawn_capture` — 恢复采集状态、每秒检查点、关窗继续、暂停/恢复及退出空缺进入同一加密时间线。
+- `apps/desktop/src/App.tsx:ActivityTimelineEntry/activityTimelineOpen/toggleCapturePause`、`App.test.tsx:S28 Windows activity timeline` — 通过白名单 command 展示活动与有原因空缺，并提供显式暂停/继续。
+- `docs/host-lifecycle-v1.md:§5/§6`、`docs/architecture.md:§5.3/§9.28` — 对齐新增 command、Win32 最小权限边界、宿主恢复与端到端数据流。
+
+**入口**：托盘宿主启动 `eam-windows-capture` 线程，将 Win32 最小元数据转换为 `CaptureCheckpoint`；WebView 只能查询投影或切换本人暂停状态。
+**测试**：Capture 6/6、Vault capture 4/4、Vault lib 39/39、桌面 Rust 22/22、React 13/13；TypeScript 与生产构建通过。
+
+## 2026-08-03 S28-2 schema v24 活动时间线与崩溃恢复
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_24` — 新增单开放段约束的 `capture_spans`，区分活动元数据与六类采集空缺。
+- `crates/vault/src/repository.rs:ActivityTimelineRepository` — 原子合并连续检查点、拒绝陈旧宿主会话，并从最后观测点恢复崩溃空缺。
+- `crates/vault/tests/capture_persistence.rs` — 覆盖连续合并、空闲切段、暂停跨重启、崩溃边界与陈旧会话拒绝。
+
+**入口**：宿主先建立加密 `HostSession`，再恢复采集开放段；每个 `CaptureCheckpoint` 只由当前开放宿主会话写入 SQLCipher。
+**测试**：`cargo test -p vault --test capture_persistence` 3/3，通过真实关闭、重开与 schema v24 迁移。
+
+## 2026-08-03 S28-1 Windows 活动采集状态机
+
+**触达**:
+- `crates/capture-windows/src/domain.rs:ActivitySnapshot/CaptureSpanKind/CaptureGapReason` — 冻结有界前台元数据、活动区间与六类显式采集空缺。
+- `crates/capture-windows/src/engine.rs:CaptureStateMachine` — 以确定性转换处理连续活动、窗口切换、空闲、暂停、锁屏、源不可用与退出。
+- `crates/capture-windows/tests/state_machine.rs` — 覆盖连续合并边界、空闲切段、暂停拒收、锁屏恢复与停止拒绝。
+
+**入口**：Windows 适配器或确定性测试向 `CaptureStateMachine` 提交前台观测与生命周期信号，得到带边界判定的 `CaptureCheckpoint`。
+**测试**：`cargo test -p capture-windows --test state_machine` 5/5；`cargo clippy -p capture-windows --all-targets -- -D warnings` 通过。
+
 ## 2026-08-02 S27-4 全仓门禁与实现级收口
 
 **触达**:

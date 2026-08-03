@@ -1,4 +1,4 @@
-//! Thin Tauri host for S07.
+//! Thin Tauri host for S07 lifecycle and S28 Windows activity capture.
 
 mod state;
 
@@ -11,13 +11,14 @@ use std::{
     time::Duration,
 };
 
+use eam_capture_windows::{DEFAULT_IDLE_THRESHOLD, sample_foreground_activity};
 use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
 use state::{
-    ActiveSharedAgreementView, ConversationTurnResult, ConversationTurnView, HostStatusView,
-    IdentityStateView, ImportContextFileView, ManagedHost, ReflectionInvitationDecisionView,
-    ReflectionInvitationView, SharedAgreementResolutionView, SharedAgreementRevisionView,
-    SharedExperienceCeremonyView,
+    ActiveSharedAgreementView, ActivityTimelineEntryView, CaptureStatusView,
+    ConversationTurnResult, ConversationTurnView, HostStatusView, IdentityStateView,
+    ImportContextFileView, ManagedHost, ReflectionInvitationDecisionView, ReflectionInvitationView,
+    SharedAgreementResolutionView, SharedAgreementRevisionView, SharedExperienceCeremonyView,
 };
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
@@ -30,6 +31,7 @@ use tauri_plugin_updater::UpdaterExt;
 use url::Url;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const CAPTURE_INTERVAL: Duration = Duration::from_secs(1);
 static EXIT_ALLOWED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
@@ -50,6 +52,29 @@ struct UpdateAvailability {
 #[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
 fn get_host_status(host: tauri::State<'_, ManagedHost>) -> HostStatusView {
     host.status()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn get_capture_status(host: tauri::State<'_, ManagedHost>) -> Result<CaptureStatusView, String> {
+    host.capture_status()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn list_activity_timeline(
+    host: tauri::State<'_, ManagedHost>,
+) -> Result<Vec<ActivityTimelineEntryView>, String> {
+    host.list_activity_timeline()
+}
+
+#[tauri::command]
+async fn set_capture_paused(app: AppHandle, paused: bool) -> Result<CaptureStatusView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>().set_capture_paused(paused)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -343,6 +368,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                 window.hide()?;
             }
             spawn_heartbeat(app.handle().clone())?;
+            spawn_capture(app.handle().clone())?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -356,6 +382,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         })
         .invoke_handler(tauri::generate_handler![
             get_host_status,
+            get_capture_status,
+            list_activity_timeline,
+            set_capture_paused,
             list_conversation,
             list_shared_experience_ceremonies,
             list_active_shared_agreements,
@@ -505,6 +534,24 @@ fn spawn_heartbeat(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(host) = app.try_state::<ManagedHost>() {
                     let _ = host.heartbeat();
                 }
+            }
+        })?;
+    Ok(())
+}
+
+fn spawn_capture(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    thread::Builder::new()
+        .name("eam-windows-capture".to_owned())
+        .spawn(move || {
+            loop {
+                if EXIT_ALLOWED.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Some(host) = app.try_state::<ManagedHost>() {
+                    let sample = sample_foreground_activity(DEFAULT_IDLE_THRESHOLD);
+                    let _ = host.record_capture_sample(sample);
+                }
+                thread::sleep(CAPTURE_INTERVAL);
             }
         })?;
     Ok(())

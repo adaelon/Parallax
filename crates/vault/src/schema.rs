@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 23;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 24;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1456,6 +1456,47 @@ CREATE INDEX pattern_maturity_evidence_source
     ON pattern_maturity_evidence(evidence_id);
 ";
 
+const MIGRATION_24: &str = r"
+CREATE TABLE capture_spans (
+    id INTEGER PRIMARY KEY CHECK (id > 0),
+    started_in_host_session_id INTEGER NOT NULL
+        REFERENCES host_sessions(id) ON DELETE RESTRICT,
+    kind INTEGER NOT NULL CHECK (kind IN (0, 1)),
+    application TEXT,
+    window_title TEXT,
+    idle_state INTEGER CHECK (idle_state IS NULL OR idle_state IN (0, 1)),
+    gap_reason INTEGER CHECK (gap_reason IS NULL OR gap_reason BETWEEN 0 AND 5),
+    started_at INTEGER NOT NULL,
+    observed_until INTEGER NOT NULL CHECK (observed_until >= started_at),
+    ended_at INTEGER CHECK (ended_at IS NULL OR ended_at >= observed_until),
+    CHECK (
+        (
+            kind = 0
+            AND application IS NOT NULL
+            AND length(trim(application)) > 0
+            AND window_title IS NOT NULL
+            AND idle_state IS NOT NULL
+            AND gap_reason IS NULL
+        )
+        OR
+        (
+            kind = 1
+            AND application IS NULL
+            AND window_title IS NULL
+            AND idle_state IS NULL
+            AND gap_reason IS NOT NULL
+        )
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX one_open_capture_span
+    ON capture_spans((1)) WHERE ended_at IS NULL;
+CREATE INDEX capture_spans_time
+    ON capture_spans(started_at, observed_until);
+CREATE INDEX capture_spans_host_session
+    ON capture_spans(started_in_host_session_id);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1496,6 +1537,7 @@ where
             21 => transaction.execute_batch(MIGRATION_21)?,
             22 => transaction.execute_batch(MIGRATION_22)?,
             23 => transaction.execute_batch(MIGRATION_23)?,
+            24 => transaction.execute_batch(MIGRATION_24)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -2670,6 +2712,53 @@ mod tests {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema
                  WHERE name = 'pattern_maturity_records')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_exists);
+    }
+
+    #[test]
+    fn interrupted_capture_migration_keeps_v23_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 24 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(24))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            23
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'capture_spans')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'capture_spans')",
                 [],
                 |row| row.get(0),
             )

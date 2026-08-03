@@ -80,6 +80,16 @@ install_update() -> never | UpdateInstallError
 exit_application() -> never | ShutdownError
 ```
 
+S28 只在同一白名单边界追加：
+
+```text
+get_capture_status() -> CaptureStatusView
+list_activity_timeline() -> ActivityTimelineEntryView[]
+set_capture_paused(paused) -> CaptureStatusView
+```
+
+采集查询只返回有界活动元数据和有原因空缺；暂停/恢复不能获得 Win32、数据库或密钥句柄。
+
 命令参数和返回值只能是有界结构化数据。WebView 不接收 Vault Key、Recovery Key、数据库或 repository 句柄、模型 bearer token、任意路径、通用文件 API、shell、HTTP 或进程能力。
 
 ## 6. Windows 测试方案
@@ -93,5 +103,7 @@ exit_application() -> never | ShutdownError
 | 升级 | 只有已签名下载和本人确认可进入 `EXITING_UPDATE`；重启后产生 `UPDATE` 空缺。 |
 | 对话重启 | 双方逐字发言重启后仍可读取；普通问答不自动产生任何账本 Claim。 |
 | WebView 边界 | capability 与 invoke handler 均不存在通用文件、shell、HTTP、数据库、密钥或运行时凭据入口。 |
+| 活动采集 | 连续同活动合并；空闲、窗口切换、暂停、锁屏、源不可用和退出产生确定性边界，且只返回最小元数据。 |
+| 采集恢复 | 崩溃后活动只保留至最后观测点，之后为 `CRASH` 空缺；关窗隐藏期间采集线程与宿主会话继续。 |
 
 纯生命周期转换和 SQLCipher 重启/故障注入由 Rust 自动化测试覆盖；Tauri 窗口、托盘、单实例与自启动在 Windows 上使用打包后的 smoke harness 验证，前端使用类型检查与组件测试验证 command 调用和错误呈现。

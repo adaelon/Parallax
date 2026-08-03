@@ -281,6 +281,8 @@ S19 将 `self.db` schema 升至 v16：`deletion_intents` 以目标种类和目�
 
 S20～S22 将 `self.db` schema 依次升至 v17～v19：共同约定候选与共同经历、不可变版本双签边界、关系约束偏离及其原约定 Claim/理由均在 SQLCipher 事务中持久化。S23 升至 v20：`shared_agreement_candidate_supersessions` 以有序外键把新候选绑定到被整份取代的旧 Agreement Claim；候选暂存、本人修订和最终签署均校验目标，确认事务会拒绝已被其他新约定取代或在新约定生效时不再有效的目标。旧约定 Claim、签署和已入账违约历史不改写；遗忘旧约定支持时沿取代边递归删除依赖候选与确认 Claim，避免悬空或复活。
 
+S28 将 `self.db` schema 升至 v24：`capture_spans` 在同一有序时间线中保存活动区间和有原因采集空缺，并限制全库至多一个开放区间。连续同活动只推进 `observed_until`；状态变化原子闭合前区间并开启后区间；崩溃恢复在最后观测点闭合活动，再追加 `CRASH` 空缺，绝不延长未观测活动。
+
 ### 4.2 逻辑数据模型
 
 以下是架构契约，不是最终数据库模式：
@@ -608,8 +610,11 @@ Obsidian 校准
 ```text
 前台窗口或浏览事件
   -> 采集最小元数据
-  -> 合并连续且相同的活动区间
-  -> 追加 Event
+  -> CaptureStateMachine 区分活动、空闲、暂停、锁屏与源不可用
+  -> 同活动推进 SQLCipher 开放区间的 observed_until
+  -> 状态变化原子闭合前区间并开启活动或有原因空缺
+  -> 崩溃重启从最后观测点追加 CRASH 空缺，不填补活动
+  -> 投影为 Event
   -> 更新时间和关系索引
 ```
 
@@ -1271,7 +1276,7 @@ React restore -> list_conversation -> SQLCipher evidence -> exact turn views
 explicit exit -> finish_host_session -> close Vault -> zeroize key -> release lock -> process exit
 ```
 
-主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater 和持续对话只能经宿主白名单 command 使用。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。当前界面不实现采集、时间线或 Personal Library；该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) 和 [ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)。
+主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater 和持续对话只能经宿主白名单 command 使用。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md) 和 [ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)。
 
 ### 9.8 S08 Context Inbox 先归档当前实现边界
 
@@ -1915,3 +1920,32 @@ explicit PatternCandidate proposal
 ```
 
 Core 的 `MemoryRepository` 对没有长期记忆适配器的实现默认关闭成熟提交；生产 `VaultRepository` 才把提议交给 `eam_memory::commit_pattern_maturity`，避免 `core -> memory` 反向依赖和资格矩阵复制。该路径不新增桌面 command 或仪式，落实 [ADR-0035](adr/0035-counterpart-explicitly-proposes-long-term-memory.md)、[ADR-0042](adr/0042-pattern-reflection-requires-three-independent-events.md)、[ADR-0043](adr/0043-pattern-may-mature-into-supported-counterpart-view.md) 与 [ADR-0044](adr/0044-counterpart-explicitly-proposes-pattern-maturity.md)。
+
+### 9.28 S28 Windows 活动采集与宿主恢复当前实现边界
+
+```text
+crates/capture-windows/src/
+  domain.rs / engine.rs             # 活动区间、采集空缺与确定性转换
+  native.rs                         # 唯一 Win32 unsafe 边界与最小元数据采样
+  ports.rs                          # 加密时间线持久化端口
+crates/vault/src/
+  schema.rs / repository.rs         # schema v24、连续合并与崩溃恢复
+apps/desktop/src-tauri/src/
+  state.rs / lib.rs                 # 宿主恢复、1 秒采样与白名单 command
+apps/desktop/src/
+  App.tsx                           # 活动/空缺查询与暂停恢复界面
+```
+
+```text
+host start -> begin_host_session -> recover_capture_timeline
+native sample -> foreground app + title + idle | session locked | source unavailable
+  -> CaptureStateMachine -> CaptureCheckpoint
+  -> Vault merges identical open activity or atomically changes span
+window close -> hide only -> capture thread and open HostSession continue
+pause -> PAUSED gap; resume requires an immediately readable foreground sample
+explicit exit | update -> reasoned open gap before secure Vault close
+crash reopen -> close activity at observed_until -> CRASH gap -> first new sample
+WebView -> get_capture_status | list_activity_timeline | set_capture_paused
+```
+
+原生边界只调用前台窗口、进程映像名、窗口标题、输入空闲计时和输入桌面可切换性 API；不读取输入内容、屏幕像素、密码字段或任意文件。应用名只保留可执行文件名，不保存进程路径；窗口标题按固定上限截断。活动时长由可修正区间派生，采集空缺与宿主运行空缺分别保存。该实现沿用 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md) 与 [ADR-0012](adr/0012-tray-resident-tauri-host.md)，没有新增难以逆转的架构权衡。

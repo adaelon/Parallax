@@ -95,6 +95,31 @@ export interface IdentityStateVersion {
   formedAtMillis: number;
 }
 
+type CaptureState = "collecting" | "paused" | "locked" | "stopped";
+
+interface CaptureStatus {
+  state: CaptureState;
+}
+
+export interface ActivityTimelineEntry {
+  id: number;
+  kind: "activity" | "gap";
+  application: string | null;
+  windowTitle: string | null;
+  idle: boolean | null;
+  gapReason:
+    | "paused"
+    | "sessionLocked"
+    | "explicitExit"
+    | "update"
+    | "crash"
+    | "sourceUnavailable"
+    | null;
+  startedAtMillis: number;
+  observedUntilMillis: number;
+  endedAtMillis: number | null;
+}
+
 interface WithdrawalDraft {
   agreement: ActiveSharedAgreement;
   reason: string;
@@ -126,6 +151,12 @@ export function App() {
   const [activeAgreements, setActiveAgreements] = useState<ActiveSharedAgreement[]>([]);
   const [identityHistory, setIdentityHistory] = useState<IdentityStateVersion[]>([]);
   const [identityHistoryOpen, setIdentityHistoryOpen] = useState(false);
+  const [captureStatus, setCaptureStatus] = useState<CaptureStatus>({
+    state: "collecting",
+  });
+  const [activityTimeline, setActivityTimeline] = useState<ActivityTimelineEntry[]>([]);
+  const [activityTimelineOpen, setActivityTimelineOpen] = useState(false);
+  const [captureAction, setCaptureAction] = useState(false);
   const [agreementManagerOpen, setAgreementManagerOpen] = useState(false);
   const [agreementLoading, setAgreementLoading] = useState(false);
   const [withdrawalDraft, setWithdrawalDraft] = useState<WithdrawalDraft | null>(null);
@@ -145,13 +176,26 @@ export function App() {
       invoke<ReflectionInvitationCeremony[]>(
         "list_offered_reflection_invitations",
       ).catch(() => []),
+      invoke<CaptureStatus>("get_capture_status").catch(() => ({
+        state: "collecting" as const,
+      })),
+      invoke<ActivityTimelineEntry[]>("list_activity_timeline").catch(() => []),
     ])
-      .then(([restored, restoredCeremonies, restoredIdentity, restoredReflections]) => {
+      .then(([
+        restored,
+        restoredCeremonies,
+        restoredIdentity,
+        restoredReflections,
+        restoredCaptureStatus,
+        restoredTimeline,
+      ]) => {
         if (active) {
           setTurns(restored);
           setCeremonies(restoredCeremonies);
           setIdentityHistory(restoredIdentity);
           setReflectionInvitations(restoredReflections);
+          setCaptureStatus(restoredCaptureStatus);
+          setActivityTimeline(restoredTimeline);
           setError(null);
         }
       })
@@ -282,6 +326,44 @@ export function App() {
       setError(errorMessage(reason));
     } finally {
       setCeremonyAction(null);
+    }
+  }
+
+  async function openActivityTimeline() {
+    setActivityTimelineOpen(true);
+    setError(null);
+    try {
+      const [status, timeline] = await Promise.all([
+        invoke<CaptureStatus>("get_capture_status"),
+        invoke<ActivityTimelineEntry[]>("list_activity_timeline"),
+      ]);
+      setCaptureStatus(status);
+      setActivityTimeline(timeline);
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+      setActivityTimelineOpen(false);
+    }
+  }
+
+  async function toggleCapturePause() {
+    if (captureAction || captureStatus.state === "locked") {
+      return;
+    }
+    setCaptureAction(true);
+    setError(null);
+    const paused = captureStatus.state !== "paused";
+    try {
+      const status = await invoke<CaptureStatus>("set_capture_paused", {
+        paused,
+      });
+      setCaptureStatus(status);
+      setActivityTimeline(
+        await invoke<ActivityTimelineEntry[]>("list_activity_timeline"),
+      );
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setCaptureAction(false);
     }
   }
 
@@ -420,6 +502,13 @@ export function App() {
         <div className="topbar-actions">
           <button
             className="agreement-manager-trigger"
+            onClick={() => void openActivityTimeline()}
+            type="button"
+          >
+            活动时间线
+          </button>
+          <button
+            className="agreement-manager-trigger"
             onClick={() => setIdentityHistoryOpen(true)}
             type="button"
           >
@@ -470,6 +559,79 @@ export function App() {
         ) : null}
         <div ref={conversationEnd} />
       </section>
+
+      {activityTimelineOpen ? (
+        <div className="ceremony-layer">
+          <article
+            aria-labelledby="activity-timeline-title"
+            aria-modal="true"
+            className="ceremony-card"
+            role="dialog"
+          >
+            <p className="eyebrow">Windows 最小元数据</p>
+            <h2 id="activity-timeline-title">活动时间线</h2>
+            <p className="ceremony-note">
+              当前状态：{captureStateLabel(captureStatus.state)}。这里只记录前台应用、窗口标题、空闲状态和有原因空缺，不记录屏幕或键盘内容。
+            </p>
+            {activityTimeline.length === 0 ? (
+              <p className="ceremony-note">尚无已确认的活动区间。</p>
+            ) : (
+              <div className="agreement-list activity-timeline-list">
+                {[...activityTimeline].reverse().slice(0, 50).map((entry) => (
+                  <section className="agreement-list-item" key={entry.id}>
+                    {entry.kind === "activity" ? (
+                      <>
+                        <strong>
+                          {entry.application} · {entry.idle ? "空闲" : "活跃"}
+                        </strong>
+                        <p>{entry.windowTitle || "无窗口标题"}</p>
+                      </>
+                    ) : (
+                      <>
+                        <strong>采集空缺 · {gapReasonLabel(entry.gapReason)}</strong>
+                        <p>该区间没有活动元数据，系统不会推测或填补。</p>
+                      </>
+                    )}
+                    <p className="ceremony-note">
+                      {new Date(entry.startedAtMillis).toLocaleString("zh-CN")}
+                      {" → "}
+                      {new Date(
+                        entry.endedAtMillis ?? entry.observedUntilMillis,
+                      ).toLocaleString("zh-CN")}
+                      {entry.endedAtMillis === null ? "（开放）" : ""}
+                    </p>
+                  </section>
+                ))}
+              </div>
+            )}
+            <div className="ceremony-actions">
+              <button
+                className="primary-action"
+                disabled={
+                  captureAction ||
+                  captureStatus.state === "locked" ||
+                  captureStatus.state === "stopped"
+                }
+                onClick={() => void toggleCapturePause()}
+                type="button"
+              >
+                {captureStatus.state === "paused"
+                  ? "继续记录"
+                  : captureStatus.state === "locked"
+                    ? "会话锁定中"
+                    : "暂停记录"}
+              </button>
+              <button
+                className="secondary-action"
+                onClick={() => setActivityTimelineOpen(false)}
+                type="button"
+              >
+                关闭
+              </button>
+            </div>
+          </article>
+        </div>
+      ) : null}
 
       {identityHistoryOpen ? (
         <div className="ceremony-layer">
@@ -1096,6 +1258,40 @@ function mergeTurns(
     byId.set(turn.id, turn);
   }
   return [...byId.values()].sort((left, right) => left.id - right.id);
+}
+
+function captureStateLabel(state: CaptureState): string {
+  switch (state) {
+    case "collecting":
+      return "持续记录中";
+    case "paused":
+      return "本人已暂停";
+    case "locked":
+      return "Windows 会话已锁定";
+    case "stopped":
+      return "宿主已停止";
+  }
+}
+
+function gapReasonLabel(
+  reason: ActivityTimelineEntry["gapReason"],
+): string {
+  switch (reason) {
+    case "paused":
+      return "本人暂停";
+    case "sessionLocked":
+      return "Windows 会话锁定";
+    case "explicitExit":
+      return "显式退出";
+    case "update":
+      return "签名升级";
+    case "crash":
+      return "宿主崩溃";
+    case "sourceUnavailable":
+      return "采集源不可用";
+    case null:
+      return "未知原因";
+  }
 }
 
 function errorMessage(reason: unknown): string {

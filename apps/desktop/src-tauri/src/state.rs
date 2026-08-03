@@ -5,6 +5,11 @@ use std::{
     time::Duration,
 };
 
+use eam_capture_windows::{
+    ActivityTimelineRepository, CaptureCheckpoint, CaptureGapReason, CaptureMode, CaptureSpan,
+    CaptureSpanKind, CaptureStateMachine, DEFAULT_IDLE_THRESHOLD, NativeCaptureSample,
+    ShutdownReason, sample_foreground_activity,
+};
 use eam_core::{
     AgreementWithdrawalActor, ClaimId, Clock, ConversationEvidence, CounterpartRuntime,
     EvidenceCitation, EvidenceId, IdentityEvolutionRepository, IdentityStateSnapshot, MemoryCore,
@@ -12,8 +17,8 @@ use eam_core::{
     ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationRepository,
     ReflectionInvitationState, ReflectionOpportunity, SessionId, SharedAgreementCandidateStatus,
     SharedAgreementDecision, SharedAgreementResolution, SharedAgreementRevision,
-    SharedExperienceKind, SharedExperienceRepository, Speaker, SystemClock, WorkingContext,
-    agreement_is_active_at,
+    SharedExperienceKind, SharedExperienceRepository, Speaker, SystemClock, Timestamp,
+    WorkingContext, agreement_is_active_at,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_ingestion::{
@@ -58,6 +63,7 @@ enum HostSlot {
 struct HostCore {
     core: AppCore,
     lifecycle: HostLifecycle,
+    capture: CaptureStateMachine,
     host_clock: SystemClock,
 }
 
@@ -68,6 +74,26 @@ pub struct HostStatusView {
     vault_ready: bool,
     updater_configured: bool,
     detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureStatusView {
+    state: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityTimelineEntryView {
+    id: u64,
+    kind: &'static str,
+    application: Option<String>,
+    window_title: Option<String>,
+    idle: Option<bool>,
+    gap_reason: Option<&'static str>,
+    started_at_millis: i64,
+    observed_until_millis: i64,
+    ended_at_millis: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -290,6 +316,96 @@ impl ManagedHost {
         }
     }
 
+    pub fn capture_status(&self) -> Result<CaptureStatusView, String> {
+        match &*self.lock() {
+            HostSlot::Ready(host) => Ok(CaptureStatusView {
+                state: encode_capture_mode(host.capture.mode()),
+            }),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn list_activity_timeline(&self) -> Result<Vec<ActivityTimelineEntryView>, String> {
+        match &*self.lock() {
+            HostSlot::Ready(host) => host
+                .core
+                .repository()
+                .all_capture_spans()
+                .map_err(|error| error.to_string())
+                .map(|spans| spans.iter().map(ActivityTimelineEntryView::from).collect()),
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn record_capture_sample(&self, sample: NativeCaptureSample) -> Result<(), String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                let at = host.host_clock.now();
+                let checkpoint = match sample {
+                    NativeCaptureSample::Foreground(snapshot)
+                        if host.capture.mode() == CaptureMode::Locked =>
+                    {
+                        Some(
+                            host.capture
+                                .session_unlocked(snapshot, at)
+                                .map_err(|error| error.to_string())?,
+                        )
+                    }
+                    NativeCaptureSample::Foreground(snapshot) => host
+                        .capture
+                        .observe(snapshot, at)
+                        .map_err(|error| error.to_string())?,
+                    NativeCaptureSample::SessionLocked => Some(
+                        host.capture
+                            .session_locked(at)
+                            .map_err(|error| error.to_string())?,
+                    ),
+                    NativeCaptureSample::SourceUnavailable => host
+                        .capture
+                        .source_unavailable(at)
+                        .map_err(|error| error.to_string())?,
+                };
+                persist_capture_checkpoint(host, checkpoint.as_ref())
+            }
+            HostSlot::Locked(_) | HostSlot::FailedClosed(_) => Ok(()),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
+    pub fn set_capture_paused(&self, paused: bool) -> Result<CaptureStatusView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                let at = host.host_clock.now();
+                let checkpoint = if paused {
+                    host.capture.pause(at).map_err(|error| error.to_string())?
+                } else {
+                    let NativeCaptureSample::Foreground(snapshot) =
+                        sample_foreground_activity(DEFAULT_IDLE_THRESHOLD)
+                    else {
+                        return Err(
+                            "capture cannot resume until the Windows session and foreground source are available"
+                                .to_owned(),
+                        );
+                    };
+                    host.capture
+                        .resume(snapshot, at)
+                        .map_err(|error| error.to_string())?
+                };
+                persist_capture_checkpoint(host, Some(&checkpoint))?;
+                Ok(CaptureStatusView {
+                    state: encode_capture_mode(host.capture.mode()),
+                })
+            }
+            HostSlot::Locked(detail) => Err(format!("vault is locked: {detail}")),
+            HostSlot::FailedClosed(detail) => Err(format!("Core is closed: {detail}")),
+            HostSlot::Closed => Err("desktop host is already stopped".to_owned()),
+        }
+    }
+
     pub fn list_conversation(&self) -> Result<Vec<ConversationTurnView>, String> {
         match &*self.lock() {
             HostSlot::Ready(host) => list_conversation_from_core(&host.core),
@@ -477,6 +593,17 @@ impl ManagedHost {
             }
         };
         let ended_at = host.host_clock.now();
+        let capture_result = host
+            .capture
+            .stop(
+                match exit_plan.reason() {
+                    ExitReason::Explicit => ShutdownReason::ExplicitExit,
+                    ExitReason::Update => ShutdownReason::Update,
+                },
+                ended_at,
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|checkpoint| persist_capture_checkpoint(&mut host, Some(&checkpoint)));
         let finish_result = host
             .core
             .repository_mut()
@@ -490,7 +617,7 @@ impl ManagedHost {
             .lifecycle
             .mark_stopped()
             .map_err(|error| error.to_string());
-        collect_shutdown_errors(finish_result, close_result, state_result)
+        collect_shutdown_errors(capture_result, finish_result, close_result, state_result)
     }
 
     pub fn reopen_after_update_failure(&self) -> Result<(), String> {
@@ -534,12 +661,27 @@ impl HostCore {
                 return Err(message);
             }
         };
+        let capture_recovery = match repository.recover_capture_timeline(
+            start.session().id(),
+            started_at,
+            start
+                .recovered_gap()
+                .map(eam_desktop_host::HostRuntimeGap::reason),
+        ) {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                let message = error.to_string();
+                let _ = repository.close();
+                return Err(message);
+            }
+        };
         lifecycle
             .complete_recovery(start.session().id(), launch_mode)
             .map_err(|error| error.to_string())?;
         Ok(Self {
             core: MemoryCore::new(repository, runtime, SystemClock),
             lifecycle,
+            capture: CaptureStateMachine::restore(&capture_recovery),
             host_clock,
         })
     }
@@ -1398,12 +1540,62 @@ impl From<&ConversationEvidence> for ConversationTurnView {
     }
 }
 
+impl From<&CaptureSpan> for ActivityTimelineEntryView {
+    fn from(value: &CaptureSpan) -> Self {
+        let (application, window_title, idle, gap_reason) = match value.kind() {
+            CaptureSpanKind::Activity(snapshot) => (
+                Some(snapshot.application().to_owned()),
+                Some(snapshot.window_title().to_owned()),
+                Some(matches!(
+                    snapshot.idle_state(),
+                    eam_capture_windows::IdleState::Idle
+                )),
+                None,
+            ),
+            CaptureSpanKind::Gap(reason) => (None, None, None, Some(encode_capture_gap(*reason))),
+        };
+        Self {
+            id: value.id().get(),
+            kind: match value.kind() {
+                CaptureSpanKind::Activity(_) => "activity",
+                CaptureSpanKind::Gap(_) => "gap",
+            },
+            application,
+            window_title,
+            idle,
+            gap_reason,
+            started_at_millis: value.started_at().as_millis(),
+            observed_until_millis: value.observed_until().as_millis(),
+            ended_at_millis: value.ended_at().map(Timestamp::as_millis),
+        }
+    }
+}
+
+fn persist_capture_checkpoint(
+    host: &mut HostCore,
+    checkpoint: Option<&CaptureCheckpoint>,
+) -> Result<(), String> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+    let session_id = host
+        .lifecycle
+        .session_id()
+        .ok_or_else(|| "running host has no lifecycle session".to_owned())?;
+    host.core
+        .repository_mut()
+        .record_capture_checkpoint(session_id, checkpoint)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn collect_shutdown_errors(
+    capture: Result<(), String>,
     finish: Result<(), String>,
     close: Result<(), String>,
     state: Result<(), String>,
 ) -> Result<(), Vec<String>> {
-    let errors: Vec<_> = [finish, close, state]
+    let errors: Vec<_> = [capture, finish, close, state]
         .into_iter()
         .filter_map(Result::err)
         .collect();
@@ -1411,6 +1603,26 @@ fn collect_shutdown_errors(
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+const fn encode_capture_mode(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::Collecting => "collecting",
+        CaptureMode::Paused => "paused",
+        CaptureMode::Locked => "locked",
+        CaptureMode::Stopped => "stopped",
+    }
+}
+
+const fn encode_capture_gap(reason: CaptureGapReason) -> &'static str {
+    match reason {
+        CaptureGapReason::Paused => "paused",
+        CaptureGapReason::SessionLocked => "sessionLocked",
+        CaptureGapReason::ExplicitExit => "explicitExit",
+        CaptureGapReason::Update => "update",
+        CaptureGapReason::Crash => "crash",
+        CaptureGapReason::SourceUnavailable => "sourceUnavailable",
     }
 }
 
@@ -1458,6 +1670,7 @@ mod tests {
     #[test]
     fn shutdown_collects_every_stage_failure_in_order() {
         let result = collect_shutdown_errors(
+            Err("capture failed".to_owned()),
             Err("finish failed".to_owned()),
             Err("close failed".to_owned()),
             Err("state failed".to_owned()),
@@ -1465,6 +1678,7 @@ mod tests {
         assert_eq!(
             result,
             Err(vec![
+                "capture failed".to_owned(),
                 "finish failed".to_owned(),
                 "close failed".to_owned(),
                 "state failed".to_owned(),
@@ -1474,7 +1688,62 @@ mod tests {
 
     #[test]
     fn shutdown_success_requires_all_stages() {
-        assert_eq!(collect_shutdown_errors(Ok(()), Ok(()), Ok(())), Ok(()));
+        assert_eq!(
+            collect_shutdown_errors(Ok(()), Ok(()), Ok(()), Ok(())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn hiding_the_window_keeps_the_same_capture_interval_open() {
+        let _guard = sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let mut repository =
+            VaultRepository::open(directory.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+        let mut clock = SystemClock;
+        let started_at = clock.now();
+        let start = repository
+            .begin_host_session(started_at, LaunchMode::Foreground)
+            .unwrap();
+        let recovery = repository
+            .recover_capture_timeline(start.session().id(), started_at, None)
+            .unwrap();
+        let mut lifecycle = HostLifecycle::new();
+        lifecycle.begin_recovery().unwrap();
+        lifecycle
+            .complete_recovery(start.session().id(), LaunchMode::Foreground)
+            .unwrap();
+        let runtime: AppRuntime = Box::new(ScriptedRuntime::new([], []));
+        let managed = ManagedHost {
+            inner: Mutex::new(HostSlot::Ready(HostCore {
+                core: MemoryCore::new(repository, runtime, SystemClock),
+                lifecycle,
+                capture: CaptureStateMachine::restore(&recovery),
+                host_clock: SystemClock,
+            })),
+            vault_root: directory.path().to_path_buf(),
+            updater_configured: false,
+        };
+        let snapshot = eam_capture_windows::ActivitySnapshot::new(
+            "code.exe",
+            "S28",
+            eam_capture_windows::IdleState::Active,
+        )
+        .unwrap();
+
+        managed
+            .record_capture_sample(NativeCaptureSample::Foreground(snapshot.clone()))
+            .unwrap();
+        managed.mark_hidden().unwrap();
+        managed
+            .record_capture_sample(NativeCaptureSample::Foreground(snapshot))
+            .unwrap();
+
+        assert_eq!(managed.status().state, "backgroundRunning");
+        let timeline = managed.list_activity_timeline().unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].kind, "activity");
+        assert_eq!(timeline[0].ended_at_millis, None);
     }
 
     #[test]
