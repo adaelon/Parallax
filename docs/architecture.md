@@ -51,7 +51,7 @@ flowchart LR
             Policy[宪法与写入策略]
             RuntimeGateway[模型运行时网关]
             HostLifecycle[宿主生命周期与运行空缺]
-            Backup[密钥与备份管理器]
+            Backup[备份协议 + Vault 可信适配器<br/>crates/backup + crates/vault]
         end
     end
 
@@ -934,26 +934,30 @@ S19 当前实现由 `MemoryCore::forget` 固定本人确认门禁，`ForgetRepos
 ### 5.8 备份与恢复
 
 ```text
-bundle.meta + RecoveryKey
-  -> 校验 eamrecovery Bech32m 载体
-  -> 忽略 DPAPI 字段，以 HKDF-SHA256 派生 RecoveryWrapKey
-  -> XChaCha20-Poly1305 认证解封 VaultKey
-  -> VaultRepository::open(vault_root, VaultKey)
+VaultBackup::create(repository, recovery_set)
+  -> SQLite online backup -> 一致 self.db
+  -> 认证读取 referenced objects/*
+  -> Snapshot{set_id, generation, deletion_watermark, files}
+  -> XChaCha20-Poly1305(BackupKey, portable recovery metadata as AAD)
+  -> 原子发布 deletion-head.eam，再发布不可变 backup-<generation>.eambak
+  -> 只保留最近 3 个快照
 
-self.db + objects + deletion state
-  -> 创建一致性快照
-  -> 使用派生 Backup Key 封装
-  -> 写入用户指定备份位置
+VaultBackup::synchronize_deletions(repository, recovery_set)
+  -> deletion_intents ORDER BY id
+  -> 原子覆盖同组认证加密删除头
 
-恢复归档
-  -> 使用 Recovery Key 解封 Vault Key
-  -> 验证完整性
-  -> 恢复权威数据
-  -> 应用删除状态
-  -> 重建索引
+VaultBackup::restore(snapshot, deletion_head, empty_destination, RecoveryKey)
+  -> 分别认证解封快照与最新删除头
+  -> 校验 set_id、代次、水位、路径、摘要和精确文件集合
+  -> staging 中以旧 VaultKey 打开 SQLCipher 并认证全部对象
+  -> 顺序重放快照水位后的 S19 删除意图；缺失目标写 tombstone
+  -> 清空并从剩余权威状态重建检索索引
+  -> 生成新 VaultKey，SQLCipher rekey，重加密对象并更新 opaque ID
+  -> 用原 Recovery Key 写新恢复封装和当前用户 DPAPI 副本
+  -> 认证重开后原子发布 destination
 ```
 
-外部备份位置只接触密文。全文、向量、时间和关系索引均可由权威数据重建。
+外部位置只接触密文。历史快照不能脱离同组最新删除头恢复；恢复期间 Recovery Set 字节不变，恢复后的新 Vault 必须创建新集合，旧集合只读，避免跨目录伪原子发布和双写分叉。可信调用方必须把 `synchronize_deletions` 纳入遗忘完成路径；桌面目录选择与进度 UI 不属于 S30。完整协议和矩阵见 [G09](backup-recovery-v1.md)，删除头权衡见 [ADR-0051](adr/0051-recovery-set-deletion-head.md)。
 
 ## 6. 安全不变量
 
@@ -997,6 +1001,9 @@ self.db + objects + deletion state
 - 本人事实、第二自我判断和共同经历不能跨账本静默转换。
 - 每次发往云端模型的工作上下文可供本人事后检查。
 - 遗忘必须传播到所有活跃派生数据，不能只做界面隐藏。
+- 历史备份恢复必须同时认证同组最新删除头；缺失、损坏、代次倒退或组 ID 不匹配不得降级为独立快照恢复。
+- Backup Key 只能由 Vault Key 以 `info="backup"` 派生；可移植恢复元数据只作 AEAD AAD，外部位置不得看到 DPAPI 字段或个人元数据。
+- 恢复只发布到不存在的目标目录，并须在 staging 中完成遗忘重放、索引重建、Vault Key/对象轮换和 Recovery Key 认证重开。
 
 ## 7. 降级与恢复
 
@@ -1018,6 +1025,9 @@ self.db + objects + deletion state
 | 单个索引损坏 | 从保险库和账本重建，不修改权威数据。 |
 | 记忆维护失败 | 保留待处理事件；不回滚已写入证据。 |
 | 本机密钥不可用 | 使用恢复密钥恢复；两者皆失则无法解密。 |
+| 备份或删除头截断、篡改、错组 | 统一拒绝恢复，不发布目标目录，也不暴露是密钥还是内容错误。 |
+| 历史快照引用对象缺失 | 在 staging 中失败关闭，不返回缺原件的半成品保险库。 |
+| 恢复发布前中断 | 删除 staging，保留原备份和目标路径原状态；不得原地覆盖已有保险库。 |
 | 云端网络不可用 | 切换可用本地运行时或保持休眠，不上传重试队列中的额外数据。 |
 | 浏览器扩展或环回入口不可用 | Core、Windows 采集与对话继续；扩展保留有界重试队列，恢复后按 `submission_id` 幂等提交。 |
 
@@ -1031,6 +1041,7 @@ self.db + objects + deletion state
 | Context Builder、云端数据出口 | [ADR-0004：核心访问边界](adr/0004-trusted-core-access-boundary.md) |
 | 唤醒调度、休眠持久化 | [ADR-0005：事件驱动存在](adr/0005-event-driven-presence.md) |
 | 保险库密钥、备份与恢复 | [ADR-0006：本人自持恢复密钥](adr/0006-user-held-recovery-keys.md) |
+| `crates/backup`、Recovery Set、历史快照与最新删除头 | [ADR-0051：历史备份恢复必须携带最新删除头](adr/0051-recovery-set-deletion-head.md) |
 | Context Inbox、显式遗忘 | [ADR-0007：Inbox 导入语义](adr/0007-context-inbox-import-semantics.md) |
 | Windows 桌面壳、本地核心、浏览器扩展 | [ADR-0008：Tauri、React 和 Rust](adr/0008-tauri-react-rust-desktop-stack.md) |
 | `self.db`、加密对象库、密钥派生与活动存储遗忘边界 | [ADR-0009：混合加密保险库存储](adr/0009-hybrid-encrypted-vault-storage.md) |
@@ -2016,3 +2027,26 @@ source permission removed
 ```
 
 S29 已完成固定来源协议、环回适配器、加密持久化、桌面 `ManagedHost` 独立线程和可直接加载的 Manifest V3 TypeScript 扩展。manifest 只声明代码实际使用的 `alarms/scripting/storage/tabs`，环回 host permission 固定到 `127.0.0.1:43129`，HTTP(S) 页面权限仅为运行时按来源申请；扩展不读取 Vault、不调用模型、不自动打开或下载外链。主窗口 capability 与 invoke handler 未增加浏览器入口，环回绑定或扩展断开也不阻断 Core。环回通道的难逆权衡见 [ADR-0050](adr/0050-pinned-origin-loopback-browser-capture.md)。
+
+### 9.30 S30 加密备份、恢复与遗忘重放当前实现边界
+
+```text
+crates/backup/src/lib.rs
+  # 有界认证 envelope、快照/删除头精确编码、路径/摘要/顺序校验
+crates/vault/src/
+  backup.rs       # Recovery Set 发布、保留、恢复 staging、重放和轮换编排
+  repository.rs   # SQLite online backup、删除 tombstone、索引重建、SQLCipher/对象 rekey
+  key_store.rs    # 可移植恢复元数据与恢复后新双解锁封装
+```
+
+```text
+create -> deletion-head.eam + backup-<generation>.eambak -> retain latest 3
+forget -> trusted caller synchronize_deletions -> atomic encrypted head replace
+restore old generation + latest head
+  -> replay target closures/tombstones before retrieval
+  -> rebuild eam-retrieval-v2
+  -> rotate DbKey/ObjectKey/BackupKey under fresh VaultKey
+  -> preserve the person's Recovery Key and refresh local DPAPI wrapper
+```
+
+S30 不新增 schema：删除重放消费 S19 schema v16 的 `deletion_intents`，快照覆盖当前 v25 权威库，派生索引在恢复时清空重建。实现拒绝保险库内备份位置、独立快照恢复、未知/重复/遍历路径、缺对象、现有目标覆盖以及跨组拼接；加密 envelope 当前有 1 GiB 硬上限。恢复不会改写历史 Recovery Set；新 Vault 必须创建新集合，旧集合仅用于再次恢复，不能由原设备与恢复设备继续双写。

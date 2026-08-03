@@ -6,6 +6,7 @@ pub enum VaultError {
     AlreadyOpen,
     AlreadyInitialized,
     ArchiveInterrupted,
+    BackupDestinationExists,
     CipherUnavailable,
     EntropyUnavailable,
     ExistingVaultWithoutKeyMetadata,
@@ -13,6 +14,7 @@ pub enum VaultError {
     ForgetInterrupted,
     LineageInterrupted,
     InvalidKeyOrCorrupt,
+    InvalidBackup,
     KeyProtectionFailed,
     UnlockFailed,
     UnsupportedKeyMetadata(u16),
@@ -30,6 +32,9 @@ impl fmt::Display for VaultError {
             Self::AlreadyInitialized => formatter.write_str("vault key metadata already exists"),
             Self::ArchiveInterrupted => {
                 formatter.write_str("archive database commit was interrupted")
+            }
+            Self::BackupDestinationExists => {
+                formatter.write_str("backup restore destination already exists")
             }
             Self::CipherUnavailable => {
                 formatter.write_str("the SQLite binding does not expose SQLCipher")
@@ -52,6 +57,7 @@ impl fmt::Display for VaultError {
             Self::InvalidKeyOrCorrupt => {
                 formatter.write_str("vault key is incorrect or encrypted data is corrupt")
             }
+            Self::InvalidBackup => formatter.write_str("encrypted backup is invalid"),
             Self::KeyProtectionFailed => {
                 formatter.write_str("vault key protection could not be completed")
             }
@@ -88,6 +94,7 @@ impl Error for VaultError {
             Self::AlreadyOpen
             | Self::AlreadyInitialized
             | Self::ArchiveInterrupted
+            | Self::BackupDestinationExists
             | Self::CipherUnavailable
             | Self::EntropyUnavailable
             | Self::ExistingVaultWithoutKeyMetadata
@@ -95,6 +102,7 @@ impl Error for VaultError {
             | Self::ForgetInterrupted
             | Self::LineageInterrupted
             | Self::InvalidKeyOrCorrupt
+            | Self::InvalidBackup
             | Self::KeyProtectionFailed
             | Self::UnlockFailed
             | Self::UnsupportedKeyMetadata(_)

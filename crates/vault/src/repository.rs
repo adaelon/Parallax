@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use eam_capture_browser::{
@@ -79,7 +80,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    VaultError, VaultKey, crypto::sqlcipher_key_pragma, object_store::ObjectStore, schema::migrate,
+    VaultError, VaultKey,
+    crypto::{sqlcipher_key_pragma, sqlcipher_rekey_pragma},
+    object_store::ObjectStore,
+    schema::migrate,
 };
 
 const DATABASE_FILE: &str = "self.db";
@@ -92,6 +96,13 @@ const MAX_UNDERSTANDING_CANDIDATES: usize = 128;
 const MAX_LONG_TERM_MEMORY_CANDIDATES: usize = 128;
 const FORGET_TARGET_CONVERSATION_EVIDENCE: i64 = 0;
 const FORGET_TARGET_ARCHIVED_EVIDENCE: i64 = 1;
+
+pub(crate) struct BackupDeletionRecord {
+    pub intent_id: u64,
+    pub target_kind: u8,
+    pub target_id: u64,
+    pub requested_at_millis: i64,
+}
 
 pub struct VaultRepository {
     connection: Option<Connection>,
@@ -173,6 +184,16 @@ impl VaultRepository {
         &self.database_path
     }
 
+    pub(crate) fn vault_root(&self) -> Result<&Path, VaultError> {
+        self.database_path
+            .parent()
+            .ok_or(VaultError::InvalidKeyOrCorrupt)
+    }
+
+    pub(crate) fn backup_key(&self) -> Result<eam_backup::BackupKey, VaultError> {
+        self.vault_key.backup_key()
+    }
+
     /// Reports the linked `SQLCipher` version after the connection is keyed.
     ///
     /// # Errors
@@ -239,6 +260,173 @@ impl VaultRepository {
     /// Returns an error when encrypted intent state is malformed or unreadable.
     pub fn deletion_intents(&self) -> Result<Vec<ForgetReceipt>, VaultError> {
         load_deletion_intents(self.connection())
+    }
+
+    pub(crate) fn backup_deletion_records(&self) -> Result<Vec<BackupDeletionRecord>, VaultError> {
+        let mut statement = self.connection().prepare(
+            "SELECT id, target_kind, target_id, requested_at
+             FROM deletion_intents ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(intent_id, target_kind, target_id, requested_at_millis)| {
+                Ok(BackupDeletionRecord {
+                    intent_id: u64::try_from(intent_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    target_kind: u8::try_from(target_kind)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    target_id: u64::try_from(target_id)
+                        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?,
+                    requested_at_millis,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn create_backup_snapshot(
+        &mut self,
+        database_snapshot: &Path,
+    ) -> Result<Vec<(String, Vec<u8>)>, VaultError> {
+        if database_snapshot.exists() {
+            return Err(VaultError::InvalidBackup);
+        }
+        let mut destination = Connection::open_with_flags(
+            database_snapshot,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )?;
+        key_connection(&destination, &self.vault_key)?;
+        verify_sqlcipher(&destination)?;
+        configure_connection(&destination)?;
+        {
+            let backup = rusqlite::backup::Backup::new(self.connection(), &mut destination)?;
+            backup.run_to_completion(128, Duration::ZERO, None)?;
+        }
+        destination.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        destination
+            .close()
+            .map_err(|(_, error)| VaultError::Sqlite(error))?;
+
+        let mut files = vec![("self.db".to_owned(), fs::read(database_snapshot)?)];
+        for object_id in referenced_object_ids(self.connection())? {
+            self.object_store
+                .read(&object_id)
+                .map_err(|_| VaultError::InvalidBackup)?;
+            let bytes = fs::read(self.object_store.root().join(&object_id))
+                .map_err(|_| VaultError::InvalidBackup)?;
+            files.push((format!("objects/{object_id}"), bytes));
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(files)
+    }
+
+    pub(crate) fn replay_backup_deletion(
+        &mut self,
+        intent_id: u64,
+        target: ForgetTarget,
+        requested_at: Timestamp,
+    ) -> Result<(), VaultError> {
+        if let Some(existing) = load_deletion_intent(self.connection(), target)? {
+            if existing.deletion_intent_id() > intent_id {
+                return Err(VaultError::InvalidBackup);
+            }
+            return Ok(());
+        }
+        if forget_target_exists(self.connection(), target)? {
+            let receipt = self
+                .forget_with_hook(target, requested_at, |_| Ok(()))?
+                .ok_or(VaultError::InvalidBackup)?;
+            if receipt.deletion_intent_id() != intent_id {
+                return Err(VaultError::InvalidBackup);
+            }
+            return Ok(());
+        }
+
+        let expected = next_identifier(self.connection(), "deletion_intents")?;
+        if expected != intent_id {
+            return Err(VaultError::InvalidBackup);
+        }
+        let receipt = ForgetReceipt::new(intent_id, target, 0, 0, 0);
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        insert_deletion_intent(&transaction, receipt, requested_at)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn rebuild_retrieval_after_restore(&mut self) -> Result<(), VaultError> {
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        clear_retrieval_index(&transaction)?;
+        transaction.commit()?;
+        <Self as RetrievalRepository>::ensure_retrieval_index(self)?;
+        Ok(())
+    }
+
+    pub(crate) fn rotate_after_restore(&mut self, new_key: &VaultKey) -> Result<(), VaultError> {
+        let objects_root = self.object_store.root().to_path_buf();
+        let parent = objects_root.parent().ok_or(VaultError::InvalidBackup)?;
+        let rotating_root = parent.join("objects.rotating");
+        let previous_root = parent.join("objects.previous");
+        if rotating_root.exists() || previous_root.exists() {
+            return Err(VaultError::InvalidBackup);
+        }
+        let new_store = ObjectStore::open_directory(rotating_root.clone(), new_key.objects_key()?)?;
+        let mut replacements = Vec::new();
+        for old_id in referenced_object_ids(self.connection())? {
+            let plaintext = self
+                .object_store
+                .read(&old_id)
+                .map_err(|_| VaultError::InvalidBackup)?;
+            let stored = new_store.store(&plaintext)?;
+            replacements.push((old_id, stored.id));
+        }
+
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        for (old_id, new_id) in &replacements {
+            transaction.execute(
+                "UPDATE archived_evidence SET object_id = ?1 WHERE object_id = ?2",
+                params![new_id, old_id],
+            )?;
+        }
+        transaction.commit()?;
+
+        self.connection().execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             PRAGMA journal_mode = DELETE;",
+        )?;
+        let new_database_key = new_key.database_key()?;
+        let rekey = sqlcipher_rekey_pragma(&new_database_key);
+        self.connection().execute_batch(&rekey)?;
+        verify_key_and_pages(self.connection())?;
+        self.connection()
+            .execute_batch("PRAGMA journal_mode = WAL;")?;
+
+        fs::rename(&objects_root, &previous_root)?;
+        if let Err(error) = fs::rename(&rotating_root, &objects_root) {
+            let _ = fs::rename(&previous_root, &objects_root);
+            return Err(VaultError::Io(error));
+        }
+        fs::remove_dir_all(previous_root)?;
+        Ok(())
     }
 
     fn forget_with_hook<F>(

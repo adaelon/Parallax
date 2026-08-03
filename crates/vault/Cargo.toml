@@ -9,6 +9,7 @@ name = "eam_vault"
 [dependencies]
 bech32 = "=0.12.0"
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
+eam_backup = { package = "backup", path = "../backup" }
 eam_capture_browser = { package = "capture-browser", path = "../capture-browser" }
 eam_capture_windows = { package = "capture-windows", path = "../capture-windows" }
 eam_core = { package = "core", path = "../core" }
@@ -24,16 +25,14 @@ fs4 = "=1.1.0"
 getrandom = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = "=0.13.0"
-rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "=0.40.1", default-features = false, features = ["backup", "bundled-sqlcipher-vendored-openssl"] }
 sha2 = "=0.11.0"
 serde_json = "=1.0.151"
+tempfile = "=3.27.0"
 zeroize = "=1.9.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
-
-[dev-dependencies]
-tempfile = "=3.27.0"
 
 [lints.rust]
 unsafe_code = "deny"

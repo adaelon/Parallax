@@ -1,5 +1,46 @@
 # 代码链路
 
+## 2026-08-03 S30-4 全仓门禁与实现级收口
+
+**触达**:
+- `crates/vault/src/backup.rs:VaultBackup::restore`、`tests/backup_recovery.rs:encrypted_snapshot_round_trips_authority_and_rebuilds_indexes` — 收窄恢复发布边界：历史 Recovery Set 保持字节不变，新 Vault 使用新集合，消除跨目录伪原子窗口。
+- `docs/backup-recovery-v1.md:§3/§4`、`docs/architecture.md:§5.8/§6.2/§7/§9.30` — 对齐三代保留、删除头、恢复重放、轮换、安全不变量和失败降级。
+- `docs/code-trail.md:S30-1～S30-4` — 以 G09、红测试、加密快照、恢复轮换和全仓验证闭合 S30。
+
+**入口**：S30-1～S30-3 的完整 diff 经恢复攻击矩阵、全仓行为测试、静态检查、桌面/扩展构建和文档链接审计后进入提交。
+**测试**：Rust workspace 287/287；Vault 全套 109/109；fmt、workspace Clippy `-D warnings`、desktop all-targets check；桌面 React 13/13、浏览扩展 10/10、两套 TypeScript 与生产构建全部通过；5 个变更 Markdown 的本地链接和 `git diff --check` 通过。
+
+## 2026-08-03 S30-3 恢复重放与 Vault Key 轮换
+
+**触达**:
+- `crates/vault/src/backup.rs:VaultBackup::restore` — 在同卷 staging 中认证快照/删除头、校验组和水位、重放新删除意图，只向空目标原子发布且不改写历史 Recovery Set。
+- `crates/vault/src/repository.rs:replay_backup_deletion/rebuild_retrieval_after_restore/rotate_after_restore` — 对存在目标执行 S19 闭包、对缺失目标写水位 tombstone，重建检索后 SQLCipher rekey 并重加密对象 ID。
+- `crates/vault/src/key_store.rs:install_rotated_metadata` — 用本人原 Recovery Key 包装新 Vault Key，并刷新当前 Windows 用户 DPAPI 副本。
+- `crates/vault/tests/backup_recovery.rs:latest_deletion_head_prevents_an_old_backup_from_reviving_forgotten_evidence` — 覆盖旧快照内目标删除、快照外目标 tombstone、current/historical 拒绝和 ID 不复用。
+
+**入口**：可信 Core 以 `snapshot + deletion-head.eam + RecoveryKey + 空目标目录` 调用 `VaultBackup::restore`；本片不新增桌面目录选择 UI。
+**测试**：S30 恢复矩阵 4/4、Vault 全套 109/109；正常、snapshot/head 截断与篡改、旧备份、缺对象、外部明文扫描、三代保留、索引重建和轮换均通过。
+
+## 2026-08-03 S30-2 一致性加密快照与删除头
+
+**触达**:
+- `crates/backup/src/lib.rs:seal_envelope/encode_snapshot/encode_deletion_head` — 固定有界 XChaCha20-Poly1305 envelope、精确文件摘要、组 ID、代次和有序删除记录协议。
+- `crates/vault/src/backup.rs:VaultBackup::create/synchronize_deletions` — 以 SQLite online backup 获取一致数据库，认证所有引用对象，原子发布删除头和不可变快照并保留最近三代。
+- `crates/vault/src/repository.rs:create_backup_snapshot/backup_deletion_records`、`crypto.rs:VaultKey::backup_key` — 在单写者边界导出加密数据库/对象，并以 HKDF `info="backup"` 隔离外层密钥。
+
+**入口**：可信 Core 向保险库外的专用 Recovery Set 调用 `VaultBackup::create`；确认遗忘后调用 `synchronize_deletions` 刷新同组删除头。
+**测试**：`cargo test -p backup` 2/2；`cargo test -p vault --test backup_recovery` 4/4；相关 Clippy `-D warnings` 通过。
+
+## 2026-08-03 S30-1 G09 恢复协议与攻击矩阵
+
+**触达**:
+- `docs/backup-recovery-v1.md:§1～§5` — 冻结三代保留、Backup Key 派生、Recovery Set、删除顺序重放、staging 发布和恢复即轮换。
+- `docs/adr/0051-recovery-set-deletion-head.md` — 固定历史快照必须携带同组最新加密删除头，否决独立旧快照与明文墓碑。
+- `crates/vault/tests/backup_recovery.rs:S30 recovery matrix` — 先以缺少 `VaultBackup`/`InvalidBackup` 的编译失败锁定新行为，再由实现转绿。
+
+**入口**：S30 实现只能使用 G09 已冻结术语和矩阵，不扩展到平台托管恢复、丢钥匙绕过、增量归档或法证级擦除。
+**测试**：红阶段 `cargo test -p vault --test backup_recovery` 按预期因新 API 缺失失败；实现后同命令 4/4 通过。
+
 ## 2026-08-03 S29-4 权限审计与全仓收口
 
 **触达**:

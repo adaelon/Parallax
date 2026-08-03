@@ -1,5 +1,6 @@
 //! SQLCipher-backed persistence inside the trusted local Core boundary.
 
+mod backup;
 mod crypto;
 #[cfg(windows)]
 mod dpapi;
@@ -9,6 +10,7 @@ mod object_store;
 mod repository;
 mod schema;
 
+pub use backup::{BackupReceipt, RestoreReceipt, VaultBackup};
 pub use crypto::VaultKey;
 pub use error::VaultError;
 pub use key_store::{InitializedVault, RecoveryKey, VaultKeyStore};

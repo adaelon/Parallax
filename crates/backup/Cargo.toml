@@ -1,0 +1,20 @@
+[package]
+name = "backup"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "eam_backup"
+
+[dependencies]
+chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
+getrandom = "=0.4.3"
+sha2 = "=0.11.0"
+zeroize = "=1.9.0"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

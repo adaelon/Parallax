@@ -9,7 +9,6 @@ use crate::VaultError;
 const KDF_SALT: &[u8] = b"evrything-about-me/v1/vault-subkeys";
 const DATABASE_INFO: &[u8] = b"database";
 const OBJECTS_INFO: &[u8] = b"objects";
-#[cfg(test)]
 const BACKUP_INFO: &[u8] = b"backup";
 
 /// A high-entropy 256-bit key owned by the trusted vault boundary.
@@ -46,6 +45,10 @@ impl VaultKey {
         derive_subkey(&self.0, OBJECTS_INFO)
     }
 
+    pub(crate) fn backup_key(&self) -> Result<eam_backup::BackupKey, VaultError> {
+        derive_subkey(&self.0, BACKUP_INFO).map(eam_backup::BackupKey::new)
+    }
+
     pub(crate) fn zeroize(&mut self) {
         self.0.zeroize();
     }
@@ -67,6 +70,16 @@ fn derive_subkey(vault_key: &[u8; 32], purpose: &[u8]) -> Result<Zeroizing<[u8; 
 pub(crate) fn sqlcipher_key_pragma(key: &[u8; 32]) -> Zeroizing<String> {
     let mut statement = Zeroizing::new(String::with_capacity(82));
     statement.push_str("PRAGMA key = \"x'");
+    for byte in key {
+        write!(&mut *statement, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    statement.push_str("'\";");
+    statement
+}
+
+pub(crate) fn sqlcipher_rekey_pragma(key: &[u8; 32]) -> Zeroizing<String> {
+    let mut statement = Zeroizing::new(String::with_capacity(84));
+    statement.push_str("PRAGMA rekey = \"x'");
     for byte in key {
         write!(&mut *statement, "{byte:02x}").expect("writing to a string cannot fail");
     }

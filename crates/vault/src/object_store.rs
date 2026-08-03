@@ -34,9 +34,19 @@ pub(crate) struct StoredObject {
 
 impl ObjectStore {
     pub(crate) fn open(vault_root: &Path, key: Zeroizing<[u8; 32]>) -> Result<Self, VaultError> {
-        let root = vault_root.join(OBJECTS_DIRECTORY);
+        Self::open_directory(vault_root.join(OBJECTS_DIRECTORY), key)
+    }
+
+    pub(crate) fn open_directory(
+        root: PathBuf,
+        key: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, VaultError> {
         fs::create_dir_all(&root)?;
         Ok(Self { root, key })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn store(&self, plaintext: &[u8]) -> Result<StoredObject, VaultError> {

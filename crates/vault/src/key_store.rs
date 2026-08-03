@@ -120,6 +120,63 @@ impl VaultKeyStore {
         let raw_recovery_key = decode_recovery_key(recovery_key.expose_secret())?;
         unwrap_recovery_key(&metadata, &raw_recovery_key)
     }
+
+    pub(crate) fn portable_metadata(vault_root: &Path) -> Result<Vec<u8>, VaultError> {
+        let mut metadata = read_metadata(vault_root)?;
+        metadata.local_wrapped_key = None;
+        metadata.encode()
+    }
+
+    pub(crate) fn unlock_recovery_metadata(
+        encoded: &[u8],
+        recovery_key: &RecoveryKey,
+    ) -> Result<VaultKey, VaultError> {
+        let metadata = BundleMetadata::decode(encoded)?;
+        let raw_recovery_key = decode_recovery_key(recovery_key.expose_secret())?;
+        unwrap_recovery_key(&metadata, &raw_recovery_key)
+    }
+
+    pub(crate) fn install_rotated_metadata(
+        vault_root: &Path,
+        vault_key: &VaultKey,
+        recovery_key: &RecoveryKey,
+    ) -> Result<(), VaultError> {
+        let raw_recovery_key = decode_recovery_key(recovery_key.expose_secret())?;
+        let metadata = metadata_for_vault_key(vault_key, &raw_recovery_key)?;
+        persist_metadata(vault_root, &metadata.encode()?)
+    }
+}
+
+fn metadata_for_vault_key(
+    vault_key: &VaultKey,
+    raw_recovery_key: &[u8; 32],
+) -> Result<BundleMetadata, VaultError> {
+    let mut recovery_salt = [0_u8; RECOVERY_SALT_LENGTH];
+    let mut recovery_nonce = [0_u8; RECOVERY_NONCE_LENGTH];
+    fill_random(&mut recovery_salt)?;
+    fill_random(&mut recovery_nonce)?;
+    let recovery_wrapped_key = wrap_recovery_key(
+        vault_key.expose_secret(),
+        raw_recovery_key,
+        &recovery_salt,
+        &recovery_nonce,
+    )?;
+    Ok(BundleMetadata {
+        recovery_salt,
+        recovery_nonce,
+        recovery_wrapped_key,
+        local_wrapped_key: local_wrap_for_restore(vault_key)?,
+    })
+}
+
+#[cfg(windows)]
+fn local_wrap_for_restore(vault_key: &VaultKey) -> Result<Option<Vec<u8>>, VaultError> {
+    crate::dpapi::protect_current_user(vault_key.expose_secret()).map(Some)
+}
+
+#[cfg(not(windows))]
+fn local_wrap_for_restore(_vault_key: &VaultKey) -> Result<Option<Vec<u8>>, VaultError> {
+    Ok(None)
 }
 
 #[cfg(windows)]
