@@ -8,7 +8,7 @@
 - `target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe` — 生成供 S32 冻结使用的本地 NSIS 安装程序，不把安装包或本机结果 JSON 纳入 Git。
 
 **入口**：仓库根目录执行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-system-acceptance.ps1 -Mode Full`；结果写入被忽略的 `.local/system-acceptance/latest.json`。
-**测试**：完整 runner 18/18；Rust workspace、fmt、Clippy、desktop all-targets、React 14/14、浏览扩展 10/10、两套 TypeScript/生产构建、矩阵/隐私/链接、NSIS 构建及安装/启动/关窗保活/退出清理/卸载烟测全部通过；安装包 `0.1.0`、5,423,168 bytes、SHA-256 `0dac55330d748d74b314c6e184972eaa40467d097d068b83b23f915a0ba84c6b`。
+**测试**：针对 S31 构建来源 `425f5ffa3af679818c9fafa6992ec58192282906` 的完整 runner 18/18；Rust workspace、fmt、Clippy、desktop all-targets、React 14/14、浏览扩展 10/10、两套 TypeScript/生产构建、矩阵/隐私/链接、NSIS 构建及安装/启动/关窗保活/退出清理/卸载烟测全部通过；安装包 `0.1.0`、5,424,551 bytes、SHA-256 `8adbb4d0ef0a2880caca62ec40f370d5ec6766eacf801c2c30a01c1f5c02baed`。
 
 ## 2026-08-03 S31-1 首次启动 Vault 闭环与烟测纠偏
 

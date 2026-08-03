@@ -182,13 +182,14 @@
 | 字段 | 结果 |
 | --- | --- |
 | 状态 | `PASS`（`Full` 模式，18/18 步骤通过） |
-| 执行时间 | 2026-08-03 22:01:40～22:05:40 `+08:00`（240.210 秒） |
+| Git head | `425f5ffa3af679818c9fafa6992ec58192282906`（S31 构建来源） |
+| 执行时间 | 2026-08-03 22:13:38～22:17:22 `+08:00`（223.669 秒） |
 | Rust workspace | `cargo fmt`、workspace Clippy `-D warnings`、`cargo test --workspace --no-fail-fast`、desktop all-targets check 全部通过 |
 | Desktop React | 14/14，通过 TypeScript 检查与生产构建 |
 | Browser extension | 10/10，通过 TypeScript 检查与生产构建 |
 | 静态/隐私/矩阵 | 33 个确定性判据、FR-01～FR-12、49 个 accepted ADR、8 个威胁边界、5 个迁移契约完整；252 个文本文件隐私扫描零违规，259 个本地链接零缺失 |
-| NSIS 版本 | `0.1.0`；`target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe`；5,423,168 bytes |
-| NSIS SHA-256 | `0dac55330d748d74b314c6e184972eaa40467d097d068b83b23f915a0ba84c6b` |
+| NSIS 版本 | `0.1.0`；`target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe`；5,424,551 bytes |
+| NSIS SHA-256 | `8adbb4d0ef0a2880caca62ec40f370d5ec6766eacf801c2c30a01c1f5c02baed` |
 | 安装/启动/退出/卸载 | 隔离目录静默安装、启动、关窗保留托盘宿主、进程清理与静默卸载全部通过；仅预置 `bundle.meta` 后，安装版实际创建 `self.db` |
 
 S31 不执行第 6.2 节的十四天纵向验收。该过程只能使用 [S32 观察模板](longitudinal-observation-template.md) 在同一个冻结安装包上完成。
