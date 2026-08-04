@@ -64,6 +64,7 @@ use eam_retrieval::{
     VECTOR_DIMENSIONS, VECTOR_MIN_SCORE_BPS, VectorEmbedding, cosine_similarity_bps, embed_text,
     search_terms,
 };
+use eam_runtime_gateway::{RuntimeTarget, validate_responses_bearer_token};
 use eam_source_obsidian::{
     ObsidianSourceRepository, SourceArchiveInput, SourceArchiveReceipt, SourceAvailability,
     SourceDocumentProjection, SourceFileKind, SourceRecord, SourceRecordState, SourceRelation,
@@ -78,6 +79,7 @@ use eam_understanding::{
 use fs4::{FileExt, TryLockError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::{
     VaultError, VaultKey,
@@ -96,6 +98,79 @@ const MAX_UNDERSTANDING_CANDIDATES: usize = 128;
 const MAX_LONG_TERM_MEMORY_CANDIDATES: usize = 128;
 const FORGET_TARGET_CONVERSATION_EVIDENCE: i64 = 0;
 const FORGET_TARGET_ARCHIVED_EVIDENCE: i64 = 1;
+const RUNTIME_PROFILE_SINGLETON_ID: i64 = 1;
+
+pub const DEFAULT_RUNTIME_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+pub const DEFAULT_RUNTIME_MODEL: &str = "gpt-oss-20b";
+
+/// The only allowed mutation of the persisted bearer key.
+///
+/// This type intentionally omits `Debug` so a replacement key cannot be
+/// emitted by routine request logging.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeProfileKeyAction<'a> {
+    Keep,
+    Replace(&'a str),
+    Clear,
+}
+
+/// Complete trusted-host view of the singleton runtime profile.
+///
+/// The bearer key is zeroized with this value and the type intentionally
+/// omits `Clone`, `Debug`, and serialization traits.
+pub struct RuntimeProfile {
+    base_url: String,
+    model: String,
+    bearer_key: Option<Zeroizing<String>>,
+}
+
+impl RuntimeProfile {
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    #[must_use]
+    pub fn bearer_key(&self) -> Option<&str> {
+        self.bearer_key.as_ref().map(|key| key.as_str())
+    }
+}
+
+/// Command-safe runtime profile view that can never contain the complete key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeProfileView {
+    base_url: String,
+    model: String,
+    api_key_configured: bool,
+    api_key_last_four: Option<String>,
+}
+
+impl RuntimeProfileView {
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    #[must_use]
+    pub const fn api_key_configured(&self) -> bool {
+        self.api_key_configured
+    }
+
+    #[must_use]
+    pub fn api_key_last_four(&self) -> Option<&str> {
+        self.api_key_last_four.as_deref()
+    }
+}
 
 pub(crate) struct BackupDeletionRecord {
     pub intent_id: u64,
@@ -212,6 +287,106 @@ impl VaultRepository {
         Ok(self
             .connection()
             .pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// Reads the complete singleton runtime profile for trusted host wiring.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if the singleton is missing, malformed, or no longer
+    /// satisfies the frozen Responses v2 target and bearer boundaries.
+    pub fn runtime_profile(&self) -> Result<RuntimeProfile, VaultError> {
+        load_runtime_profile(self.connection())
+    }
+
+    /// Reads a command-safe view containing only key presence and, when that
+    /// cannot reveal the complete key, its last four Unicode scalar values.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same fail-closed storage errors as [`Self::runtime_profile`].
+    pub fn runtime_profile_view(&self) -> Result<RuntimeProfileView, VaultError> {
+        let profile = self.runtime_profile()?;
+        Ok(runtime_profile_view(&profile))
+    }
+
+    /// Atomically replaces the target fields and applies one explicit bearer
+    /// key action.
+    ///
+    /// Base URL and model normalization reuse [`RuntimeTarget::new`]; bearer
+    /// replacement reuses the exact Responses v2 transport field validator.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid candidates before opening a transaction and fails
+    /// closed if the singleton row cannot be updated exactly once.
+    pub fn update_runtime_profile(
+        &mut self,
+        base_url: &str,
+        model: &str,
+        key_action: RuntimeProfileKeyAction<'_>,
+    ) -> Result<RuntimeProfileView, VaultError> {
+        self.update_runtime_profile_with_hook(base_url, model, key_action, |_| Ok(()))
+    }
+
+    fn update_runtime_profile_with_hook<F>(
+        &mut self,
+        base_url: &str,
+        model: &str,
+        key_action: RuntimeProfileKeyAction<'_>,
+        before_commit: F,
+    ) -> Result<RuntimeProfileView, VaultError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), VaultError>,
+    {
+        let target =
+            RuntimeTarget::new(base_url, model).map_err(|_| VaultError::InvalidRuntimeProfile)?;
+        if let RuntimeProfileKeyAction::Replace(key) = key_action {
+            validate_responses_bearer_token(Some(key))
+                .map_err(|_| VaultError::InvalidRuntimeProfile)?;
+        }
+
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        let changed = match key_action {
+            RuntimeProfileKeyAction::Keep => transaction.execute(
+                "UPDATE runtime_profiles SET base_url = ?1, model = ?2
+                 WHERE singleton_id = ?3",
+                params![
+                    target.base_url(),
+                    target.model(),
+                    RUNTIME_PROFILE_SINGLETON_ID
+                ],
+            )?,
+            RuntimeProfileKeyAction::Replace(key) => transaction.execute(
+                "UPDATE runtime_profiles SET base_url = ?1, model = ?2, bearer_key = ?3
+                 WHERE singleton_id = ?4",
+                params![
+                    target.base_url(),
+                    target.model(),
+                    key,
+                    RUNTIME_PROFILE_SINGLETON_ID
+                ],
+            )?,
+            RuntimeProfileKeyAction::Clear => transaction.execute(
+                "UPDATE runtime_profiles SET base_url = ?1, model = ?2, bearer_key = NULL
+                 WHERE singleton_id = ?3",
+                params![
+                    target.base_url(),
+                    target.model(),
+                    RUNTIME_PROFILE_SINGLETON_ID
+                ],
+            )?,
+        };
+        if changed != 1 {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        before_commit(&transaction)?;
+        transaction.commit()?;
+        self.runtime_profile_view()
     }
 
     /// Lists archived Context Inbox evidence without exposing object keys.
@@ -6629,6 +6804,55 @@ fn acquire_writer_lock(path: &Path) -> Result<File, VaultError> {
     }
 }
 
+fn load_runtime_profile(connection: &Connection) -> Result<RuntimeProfile, VaultError> {
+    let (base_url, model, bearer_key) = connection
+        .query_row(
+            "SELECT base_url, model, bearer_key FROM runtime_profiles
+             WHERE singleton_id = ?1",
+            [RUNTIME_PROFILE_SINGLETON_ID],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+    let target =
+        RuntimeTarget::new(&base_url, &model).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    validate_responses_bearer_token(bearer_key.as_deref())
+        .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+    if target.base_url() != base_url || target.model() != model {
+        return Err(VaultError::InvalidKeyOrCorrupt);
+    }
+    Ok(RuntimeProfile {
+        base_url,
+        model,
+        bearer_key: bearer_key.map(Zeroizing::new),
+    })
+}
+
+fn runtime_profile_view(profile: &RuntimeProfile) -> RuntimeProfileView {
+    RuntimeProfileView {
+        base_url: profile.base_url.clone(),
+        model: profile.model.clone(),
+        api_key_configured: profile.bearer_key.is_some(),
+        api_key_last_four: profile.bearer_key().and_then(redacted_last_four_chars),
+    }
+}
+
+fn redacted_last_four_chars(value: &str) -> Option<String> {
+    let mut suffix = value.chars().rev().take(5).collect::<Vec<_>>();
+    if suffix.len() <= 4 {
+        return None;
+    }
+    suffix.truncate(4);
+    suffix.reverse();
+    Some(suffix.into_iter().collect())
+}
+
 fn key_connection(connection: &Connection, vault_key: &VaultKey) -> Result<(), VaultError> {
     let database_key = vault_key.database_key()?;
     let statement = sqlcipher_key_pragma(&database_key);
@@ -12103,6 +12327,45 @@ mod tests {
         assert!(repository.connection.is_none());
         assert!(repository.vault_key.is_zeroed());
         assert!(repository.writer_lock.is_none());
+    }
+
+    #[test]
+    fn interrupted_runtime_profile_update_rolls_back_every_field_across_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let key = [0x57; 32];
+        let mut repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        repository
+            .update_runtime_profile(
+                "https://runtime.example.test/v1",
+                "owner/model-v1",
+                RuntimeProfileKeyAction::Replace("synthetic-original-key"),
+            )
+            .unwrap();
+
+        let result = repository.update_runtime_profile_with_hook(
+            "http://127.0.0.1:11434/next/",
+            "owner/model-v2",
+            RuntimeProfileKeyAction::Replace("synthetic-interrupted-key"),
+            |_| Err(VaultError::RuntimeProfileUpdateInterrupted),
+        );
+
+        assert!(matches!(
+            result,
+            Err(VaultError::RuntimeProfileUpdateInterrupted)
+        ));
+        let profile = repository.runtime_profile().unwrap();
+        assert_eq!(profile.base_url(), "https://runtime.example.test/v1");
+        assert_eq!(profile.model(), "owner/model-v1");
+        assert_eq!(profile.bearer_key(), Some("synthetic-original-key"));
+        drop(profile);
+        repository.close().unwrap();
+
+        let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        let profile = repository.runtime_profile().unwrap();
+        assert_eq!(profile.base_url(), "https://runtime.example.test/v1");
+        assert_eq!(profile.model(), "owner/model-v1");
+        assert_eq!(profile.bearer_key(), Some("synthetic-original-key"));
     }
 
     #[test]

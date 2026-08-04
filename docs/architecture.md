@@ -212,7 +212,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 
 ### 3.6 模型运行时
 
-本地与远程模型实现同一 Responses 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v2](runtime-contract-v2.md)；Vault 单档案、宿主热切换和设置 UI 分别留给 S06R-2～S06R-4。
+本地与远程模型实现同一 Responses 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与供后续 WebView command 使用的脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v2](runtime-contract-v2.md)；宿主热切换和设置 UI 留给 S06R-3～S06R-4。
 
 ### 3.7 技术职责
 
@@ -1278,9 +1278,12 @@ Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用�
 
 ```text
 crates/runtime-gateway/src/
-  transport.rs          # 可配置 Base URL/模型、URL 拒绝矩阵、可选清零 bearer 与无重定向 HTTP
+  transport.rs          # 可复用 Base URL/模型/Key 校验、可选清零 bearer 与无重定向 HTTP
   adapter.rs            # 追加 /responses、Responses v2 最小负载、严格 schema、外发记录和错误分类
   fallback.rs           # S06 旧宿主仅 TIMEOUT/UNAVAILABLE 从 Cloud 降级到 Local；S06R-3 将移除固定双档案
+crates/vault/src/
+  schema.rs             # v26 单例 runtime_profiles 与默认本地档案
+  repository.rs         # 完整档案、脱敏视图及 KEEP/REPLACE/CLEAR 原子更新
 crates/core/src/
   ports.rs              # RuntimeErrorKind 确定错误语义
   domain.rs             # 未知结构化操作与 Core 拒绝结果
@@ -1300,9 +1303,15 @@ OpenAiResponsesRuntime::respond(RuntimeRequest)
   -> record exact response request without credentials
   -> parse free text, citations and propose_judgment
   -> preserve unknown operation name for Core rejection
+
+VaultRepository::update_runtime_profile(base_url, model, key_action)
+  -> RuntimeTarget::new(base_url, model)
+  -> validate_responses_bearer_token(REPLACE only)
+  -> transaction UPDATE singleton with KEEP | REPLACE | CLEAR
+  -> return RuntimeProfileView(api_key_configured + api_key_last_four only)
 ```
 
-任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 固定夹具继续产生等价领域输出。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v2](runtime-contract-v2.md)。结构化输出错误仍失败关闭，旧宿主只有超时和不可用进入本地 fallback；SQLCipher 集成测试继续证明运行时不可用不会回滚已提交的本人证据。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md) 和 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)。
+任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 固定夹具继续产生等价领域输出。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v2](runtime-contract-v2.md)。结构化输出错误仍失败关闭，旧宿主只有超时和不可用进入本地 fallback；schema v26 与 Repository 故障注入证明迁移/更新中断保持旧档案，Recovery Set 测试证明完整 Key 随加密数据库恢复且不出现在原始字节中。宿主尚未读取该档案或热切换运行时，留给 S06R-3。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md) 和 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)。
 
 ### 9.7 S07 桌面宿主与持续对话当前实现边界
 

@@ -14,7 +14,10 @@ pub use backup::{BackupReceipt, RestoreReceipt, VaultBackup};
 pub use crypto::VaultKey;
 pub use error::VaultError;
 pub use key_store::{InitializedVault, PreparedVault, RecoveryKey, VaultKeyStore};
-pub use repository::VaultRepository;
+pub use repository::{
+    DEFAULT_RUNTIME_BASE_URL, DEFAULT_RUNTIME_MODEL, RuntimeProfile, RuntimeProfileKeyAction,
+    RuntimeProfileView, VaultRepository,
+};
 
 #[cfg(test)]
 mod test_support {

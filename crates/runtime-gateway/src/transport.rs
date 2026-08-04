@@ -321,13 +321,7 @@ impl HttpResponsesTransport {
     ///
     /// Returns a transport error when the HTTP client cannot be constructed.
     pub fn new(bearer_token: Option<String>) -> Result<Self, TransportError> {
-        if bearer_token.as_ref().is_some_and(|token| {
-            token.trim().is_empty()
-                || token.len() > MAX_BEARER_TOKEN_BYTES
-                || token.chars().any(char::is_control)
-        }) {
-            return Err(TransportError::other("invalid Responses bearer token"));
-        }
+        validate_responses_bearer_token(bearer_token.as_deref())?;
         let remote_client = build_http_client(false)?;
         let loopback_client = build_http_client(true)?;
         Ok(Self {
@@ -336,6 +330,24 @@ impl HttpResponsesTransport {
             bearer_token: bearer_token.map(Zeroizing::new),
         })
     }
+}
+
+/// Applies the frozen Responses v2 bearer-token field boundary without
+/// constructing an HTTP client or retaining the secret.
+///
+/// # Errors
+///
+/// Rejects blank, control-containing, or over-limit tokens with a sanitized
+/// transport error that never includes the candidate value.
+pub fn validate_responses_bearer_token(bearer_token: Option<&str>) -> Result<(), TransportError> {
+    if bearer_token.is_some_and(|token| {
+        token.trim().is_empty()
+            || token.len() > MAX_BEARER_TOKEN_BYTES
+            || token.chars().any(char::is_control)
+    }) {
+        return Err(TransportError::other("invalid Responses bearer token"));
+    }
+    Ok(())
 }
 
 impl ResponsesTransport for HttpResponsesTransport {

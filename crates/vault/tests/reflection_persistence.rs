@@ -59,7 +59,7 @@ fn pending_invitation(
 fn deferred_invitation_reopens_with_exact_schedule_state() {
     let directory = tempdir().unwrap();
     let mut repository = VaultRepository::open(directory.path(), key()).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 25);
+    assert_eq!(repository.schema_version().unwrap(), 26);
     let evidence_id = append_person_evidence(&mut repository, EVIDENCE_TEXT);
     let pending = pending_invitation(&mut repository, evidence_id, TOPIC, 200);
     repository

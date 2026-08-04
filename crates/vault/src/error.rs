@@ -15,12 +15,14 @@ pub enum VaultError {
     LineageInterrupted,
     InvalidKeyOrCorrupt,
     InvalidBackup,
+    InvalidRuntimeProfile,
     KeyProtectionFailed,
     UnlockFailed,
     UnsupportedKeyMetadata(u16),
     UnsupportedPlatform,
     UnsupportedSchema(i64),
     MigrationInterrupted(i64),
+    RuntimeProfileUpdateInterrupted,
     Io(io::Error),
     Sqlite(rusqlite::Error),
 }
@@ -58,6 +60,7 @@ impl fmt::Display for VaultError {
                 formatter.write_str("vault key is incorrect or encrypted data is corrupt")
             }
             Self::InvalidBackup => formatter.write_str("encrypted backup is invalid"),
+            Self::InvalidRuntimeProfile => formatter.write_str("runtime profile is invalid"),
             Self::KeyProtectionFailed => {
                 formatter.write_str("vault key protection could not be completed")
             }
@@ -79,6 +82,9 @@ impl fmt::Display for VaultError {
                     formatter,
                     "vault migration to version {version} was interrupted"
                 )
+            }
+            Self::RuntimeProfileUpdateInterrupted => {
+                formatter.write_str("runtime profile update was interrupted")
             }
             Self::Io(error) => write!(formatter, "vault I/O error: {error}"),
             Self::Sqlite(error) => write!(formatter, "vault database error: {error}"),
@@ -103,12 +109,14 @@ impl Error for VaultError {
             | Self::LineageInterrupted
             | Self::InvalidKeyOrCorrupt
             | Self::InvalidBackup
+            | Self::InvalidRuntimeProfile
             | Self::KeyProtectionFailed
             | Self::UnlockFailed
             | Self::UnsupportedKeyMetadata(_)
             | Self::UnsupportedPlatform
             | Self::UnsupportedSchema(_)
-            | Self::MigrationInterrupted(_) => None,
+            | Self::MigrationInterrupted(_)
+            | Self::RuntimeProfileUpdateInterrupted => None,
         }
     }
 }

@@ -8,10 +8,13 @@ use eam_core::{
 };
 use eam_ingestion::{ArchiveInput, ArchiveRepository, ArchiveStatus};
 use eam_retrieval::{RetrievalQuery, SourceScope, retrieve};
-use eam_vault::{RecoveryKey, VaultBackup, VaultError, VaultKeyStore, VaultRepository};
+use eam_vault::{
+    RecoveryKey, RuntimeProfileKeyAction, VaultBackup, VaultError, VaultKeyStore, VaultRepository,
+};
 use tempfile::{TempDir, tempdir};
 
 const PRIVATE_TEXT: &str = "S30-private-aurora-evidence";
+const RUNTIME_KEY: &str = "S06R2-synthetic-recovery-secret-4826";
 
 fn initialized_repository() -> (TempDir, VaultRepository, RecoveryKey) {
     let vault = tempdir().unwrap();
@@ -40,7 +43,14 @@ fn record_person_fact(
 
 #[test]
 fn encrypted_snapshot_round_trips_authority_and_rebuilds_indexes() {
-    let (source, repository, recovery_key) = initialized_repository();
+    let (source, mut repository, recovery_key) = initialized_repository();
+    repository
+        .update_runtime_profile(
+            "https://runtime.example.test/openai/v1",
+            "owner/recovery-model",
+            RuntimeProfileKeyAction::Replace(RUNTIME_KEY),
+        )
+        .unwrap();
     let (mut core, evidence_id) = record_person_fact(repository);
     assert_eq!(
         retrieve(core.repository_mut(), &RetrievalQuery::lexical("aurora"))
@@ -68,12 +78,23 @@ fn encrypted_snapshot_round_trips_authority_and_rebuilds_indexes() {
             .any(|value| value == PRIVATE_TEXT.as_bytes())
     );
     assert!(
+        !snapshot_bytes
+            .windows(RUNTIME_KEY.len())
+            .any(|value| value == RUNTIME_KEY.as_bytes())
+    );
+    assert!(
         !deletion_head_bytes
             .windows(PRIVATE_TEXT.len())
             .any(|value| value == PRIVATE_TEXT.as_bytes())
     );
+    assert!(
+        !deletion_head_bytes
+            .windows(RUNTIME_KEY.len())
+            .any(|value| value == RUNTIME_KEY.as_bytes())
+    );
     let (repository, _, _) = core.into_parts();
     repository.close().unwrap();
+    assert_file_does_not_contain(&source.path().join("self.db"), RUNTIME_KEY);
 
     let destination_parent = tempdir().unwrap();
     let destination = destination_parent.path().join("restored-vault");
@@ -93,6 +114,14 @@ fn encrypted_snapshot_round_trips_authority_and_rebuilds_indexes() {
 
     let restored_key = VaultKeyStore::unlock_recovery(&destination, &recovery_key).unwrap();
     let mut repository = VaultRepository::open(&destination, restored_key).unwrap();
+    let runtime_profile = repository.runtime_profile().unwrap();
+    assert_eq!(
+        runtime_profile.base_url(),
+        "https://runtime.example.test/openai/v1"
+    );
+    assert_eq!(runtime_profile.model(), "owner/recovery-model");
+    assert_eq!(runtime_profile.bearer_key(), Some(RUNTIME_KEY));
+    drop(runtime_profile);
     assert!(
         MemoryRepository::evidence(&repository, evidence_id)
             .unwrap()
@@ -111,7 +140,20 @@ fn encrypted_snapshot_round_trips_authority_and_rebuilds_indexes() {
             .len(),
         1
     );
+    repository.close().unwrap();
+    assert_file_does_not_contain(&destination.join("self.db"), RUNTIME_KEY);
     drop(source);
+}
+
+fn assert_file_does_not_contain(path: &std::path::Path, needle: &str) {
+    let bytes = fs::read(path).unwrap();
+    assert!(
+        !bytes
+            .windows(needle.len())
+            .any(|value| value == needle.as_bytes()),
+        "{} contains a persisted secret in searchable bytes",
+        path.display()
+    );
 }
 
 #[test]

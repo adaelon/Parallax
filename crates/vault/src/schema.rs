@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 25;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 26;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1537,6 +1537,24 @@ BEGIN
 END;
 ";
 
+const MIGRATION_26: &str = r"
+CREATE TABLE runtime_profiles (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    base_url TEXT NOT NULL
+        CHECK (length(CAST(base_url AS BLOB)) BETWEEN 1 AND 2048),
+    model TEXT NOT NULL
+        CHECK (length(CAST(model AS BLOB)) BETWEEN 1 AND 256),
+    bearer_key TEXT
+        CHECK (
+            bearer_key IS NULL
+            OR length(CAST(bearer_key AS BLOB)) BETWEEN 1 AND 8192
+        )
+) STRICT;
+
+INSERT INTO runtime_profiles (singleton_id, base_url, model, bearer_key)
+VALUES (1, 'http://127.0.0.1:11434/v1', 'gpt-oss-20b', NULL);
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1579,6 +1597,7 @@ where
             23 => transaction.execute_batch(MIGRATION_23)?,
             24 => transaction.execute_batch(MIGRATION_24)?,
             25 => transaction.execute_batch(MIGRATION_25)?,
+            26 => transaction.execute_batch(MIGRATION_26)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -2852,5 +2871,87 @@ mod tests {
             )
             .unwrap();
         assert!(table_exists);
+    }
+
+    #[test]
+    fn runtime_profile_migration_seeds_one_local_default() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        let profile = connection
+            .query_row(
+                "SELECT base_url, model, bearer_key FROM runtime_profiles",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            profile,
+            (
+                "http://127.0.0.1:11434/v1".to_owned(),
+                "gpt-oss-20b".to_owned(),
+                None,
+            )
+        );
+        let row_count: i64 = connection
+            .query_row("SELECT count(*) FROM runtime_profiles", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn interrupted_runtime_profile_migration_keeps_v25_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 26 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(26))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            25
+        );
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE name = 'runtime_profiles')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let default_base_url: String = connection
+            .query_row(
+                "SELECT base_url FROM runtime_profiles WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(default_base_url, "http://127.0.0.1:11434/v1");
     }
 }

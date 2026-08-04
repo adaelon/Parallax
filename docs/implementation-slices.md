@@ -1,6 +1,6 @@
 # 首版完整实现切片方案
 
-状态：实施中；S01～S31 与 S06R-1 已完成，下一片为 S06R-2；S32 在新构建重验收前锁定
+状态：实施中；S01～S31 与 S06R-1～S06R-2 已完成，下一片为 S06R-3；S32 在新构建重验收前锁定
 
 本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 已形成旧边界下的可安装构建。ADR-0053 新增 S06R 修订系列，完成后必须重跑 S31，S32 只能使用重新冻结的构建。
 
@@ -461,7 +461,7 @@ S28 -> S29 -> S30 -> S31(旧边界证据)
 
 ### S06R 可配置运行时档案边界修订
 
-**状态**：已由 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 接受；S06R-1 已实现，S06R-2～S06R-5 待实施。保留 ADR-0048 的 Responses 严格 contract 与 Core 最小数据出口，逐步取代固定 Cloud/Local 档案、固定模型和环境变量配置。
+**状态**：已由 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 接受；S06R-1～S06R-2 已实现，S06R-3～S06R-5 待实施。保留 ADR-0048 的 Responses 严格 contract 与 Core 最小数据出口，逐步取代固定 Cloud/Local 档案、固定模型和环境变量配置。
 
 ```text
 RuntimeProfileDraft {
@@ -496,6 +496,8 @@ save(draft) -> validate/build -> Vault commit -> replace active runtime -> Runti
 **确定性完成**：自定义模型进入请求与外发记录；远程 HTTPS/环回 HTTP 接受矩阵及非法 URL 拒绝矩阵全绿；Bearer Key 不进入请求记录、错误、日志或夹具；v1 的严格结构化响应夹具继续产生等价领域值。
 
 #### S06R-2 SQLCipher 单档案与 write-only 密钥
+
+**状态**：已完成；schema v26 单例档案、完整/脱敏读取、显式三态 Key 更新、迁移/重启/恢复与原始字节不可搜索证据均已落地。
 
 **依赖/输入**：S06R-1、schema v25、S30 整库备份与恢复路径。
 

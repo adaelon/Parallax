@@ -4932,6 +4932,7 @@ dependencies = [
  "ingestion",
  "memory",
  "retrieval",
+ "runtime-gateway",
  "rusqlite",
  "serde_json",
  "sha2 0.11.0",

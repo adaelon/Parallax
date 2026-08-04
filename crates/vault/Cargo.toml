@@ -19,6 +19,7 @@ eam_ingestion = { package = "ingestion", path = "../ingestion" }
 eam_markdown = { package = "eam-markdown", path = "../markdown" }
 eam_memory = { package = "memory", path = "../memory" }
 eam_retrieval = { package = "retrieval", path = "../retrieval" }
+eam_runtime_gateway = { package = "runtime-gateway", path = "../runtime-gateway" }
 eam_source_obsidian = { package = "source-obsidian", path = "../source-obsidian" }
 eam_understanding = { package = "understanding", path = "../understanding" }
 fs4 = "=1.1.0"

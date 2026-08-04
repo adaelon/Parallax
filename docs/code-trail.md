@@ -1,5 +1,18 @@
 # 代码链路
 
+## 2026-08-04 S06R-2 SQLCipher 单档案与 write-only 密钥
+
+**触达**:
+- `crates/vault/src/schema.rs:MIGRATION_26/migrate_with_hook` — schema v26 创建单例 `runtime_profiles`，迁移默认环回 Base URL、`gpt-oss-20b` 与无 Key，并保持逐版事务回滚。
+- `crates/vault/src/repository.rs:RuntimeProfile/RuntimeProfileView/RuntimeProfileKeyAction/VaultRepository::{runtime_profile,runtime_profile_view,update_runtime_profile}` — 分离可信宿主完整读取与命令脱敏视图，以显式 `KEEP/REPLACE/CLEAR` 原子更新档案。
+- `crates/runtime-gateway/src/transport.rs:validate_responses_bearer_token` — 抽取 S06R-1 Key 边界；Vault 同时复用 `RuntimeTarget::new`，不复制 Base URL、模型或 Key 校验规则。
+- `crates/vault/tests/runtime_profile_persistence.rs:v25_reopens_through_v26_with_one_default_runtime_profile/replace_keep_and_clear_are_durable_while_the_view_stays_redacted` — 覆盖 v25→v26、重启、三态 Key、空白/控制/超限拒绝与视图不回显。
+- `crates/vault/tests/backup_recovery.rs:encrypted_snapshot_round_trips_authority_and_rebuilds_indexes` — 合成 Key 随加密 `self.db`/Recovery Set 恢复，且源/恢复数据库、快照与删除头原始字节不可搜索。
+- `crates/vault/tests/{capture_persistence,claim_correction_persistence,encrypted_repository,identity_persistence,memory_persistence,reflection_persistence,self_bundle_persistence,shared_experience_persistence,windows_unlock}.rs:schema_version assertions` — 既有重启/恢复路径的预期 schema 从 v25 精确推进到 v26，不改动行为断言。
+
+**入口**：可信宿主打开 `VaultRepository` 后可读取完整档案构造运行时；S06R-3 的 WebView command 必须只暴露 `RuntimeProfileView`，保存必须传入 Base URL、模型和一种显式密钥动作。
+**测试**：Vault 116/116、runtime-gateway 27/27；v26 迁移中断、档案事务中断、Recovery Set 恢复与原始字节扫描通过；两 crate all-targets Clippy `-D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 全绿。
+
 ## 2026-08-04 S06R-1 Responses Runtime Contract v2 与可配置目标
 
 **触达**:

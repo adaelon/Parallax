@@ -12,5 +12,5 @@ pub use fallback::FallbackRuntime;
 pub use transport::{
     HttpResponsesTransport, InvocationKind, OutboundContextSource, OutboundDisclosureRecord,
     ResponsesTransport, RuntimeTarget, RuntimeTargetError, RuntimeTargetKind, TransportError,
-    TransportErrorKind,
+    TransportErrorKind, validate_responses_bearer_token,
 };
