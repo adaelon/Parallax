@@ -11,6 +11,6 @@ status: accepted
 - 让 Core 理解供应商响应：会污染可信领域边界并扩大替换成本。
 - 依赖自由文本提取操作：无法形成可拒绝、可测试的状态修改白名单。
 
-**命门**：云端使用 `gpt-5.6-terra`，本地使用 `gpt-oss-20b`；两者只交换 G03 v1 contract。
+**命门**：两端只交换 G03 v1 contract；固定双档案与模型由 [ADR-0053](0053-vault-backed-configurable-responses-runtime-profile.md) 取代。
 **何时回头**：任一模型无法稳定实现同一严格结构化夹具，或 Responses 兼容层泄漏供应商状态时。
 **展开**：[G03 Runtime Contract v1](../runtime-contract-v1.md)

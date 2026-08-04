@@ -25,9 +25,9 @@ use eam_memory::{
     MemoryMaintenance, MemoryProposal, MemoryStatus, MemorySubject,
 };
 use eam_runtime_gateway::{
-    FallbackRuntime, HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL,
-    OPENAI_LOCAL_MODEL, OpenAiResponsesRuntime, OutboundContextSource, ResponsesTransport,
-    RuntimeTarget, RuntimeTargetKind, TransportError,
+    FallbackRuntime, HttpResponsesTransport, InvocationKind, OpenAiResponsesRuntime,
+    OutboundContextSource, ResponsesTransport, RuntimeTarget, RuntimeTargetKind, TransportError,
+    TransportErrorKind,
 };
 use eam_vault::{VaultKey, VaultRepository};
 use serde_json::Value;
@@ -64,10 +64,12 @@ const PATTERN_MATURITY_MALFORMED_RESPONSE: &str =
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
 const TIMEOUT: Duration = Duration::from_secs(30);
+const CLOUD_MODEL: &str = "gpt-5.6-terra";
+const LOCAL_MODEL: &str = "gpt-oss-20b";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SeenCall {
-    target: RuntimeTarget,
+    responses_endpoint: String,
     request_json: String,
     timeout: Duration,
 }
@@ -97,12 +99,13 @@ impl ScriptedTransport {
 impl ResponsesTransport for ScriptedTransport {
     fn send(
         &mut self,
-        target: &RuntimeTarget,
+        _target: &RuntimeTarget,
+        responses_endpoint: &str,
         request_json: &str,
         timeout: Duration,
     ) -> Result<String, TransportError> {
         self.seen.push(SeenCall {
-            target: target.clone(),
+            responses_endpoint: responses_endpoint.to_owned(),
             request_json: request_json.to_owned(),
             timeout,
         });
@@ -116,7 +119,7 @@ fn cloud_runtime(
     replies: impl IntoIterator<Item = Result<&'static str, TransportError>>,
 ) -> OpenAiResponsesRuntime<ScriptedTransport> {
     OpenAiResponsesRuntime::new(
-        RuntimeTarget::openai_cloud("https://api.openai.com/v1/responses"),
+        RuntimeTarget::new("https://api.openai.com/v1", CLOUD_MODEL).unwrap(),
         ScriptedTransport::new(replies),
         TIMEOUT,
     )
@@ -126,7 +129,7 @@ fn local_runtime(
     replies: impl IntoIterator<Item = Result<&'static str, TransportError>>,
 ) -> OpenAiResponsesRuntime<ScriptedTransport> {
     OpenAiResponsesRuntime::new(
-        RuntimeTarget::openai_local("http://127.0.0.1:11434/v1/responses"),
+        RuntimeTarget::new("http://127.0.0.1:11434/v1", LOCAL_MODEL).unwrap(),
         ScriptedTransport::new(replies),
         TIMEOUT,
     )
@@ -192,7 +195,29 @@ fn serve_one_response(
         .unwrap();
         stream.flush().unwrap();
     });
-    (format!("http://{address}/v1/responses"), handle)
+    (format!("http://{address}/v1"), handle)
+}
+
+fn serve_one_redirect() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = [0_u8; 4096];
+        let read = stream.read(&mut request).unwrap();
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.starts_with("POST /v1/responses HTTP/1.1\r\n"));
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/must-not-follow\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+    (format!("http://{address}/v1"), handle)
 }
 
 fn run_contract(
@@ -246,8 +271,8 @@ fn local_and_cloud_adapters_produce_equivalent_domain_results_from_fixed_fixture
     );
     assert_eq!(cloud.disclosures()[2].target(), RuntimeTargetKind::Cloud);
     assert_eq!(local.disclosures()[2].target(), RuntimeTargetKind::Local);
-    assert_eq!(cloud.disclosures()[2].model(), OPENAI_CLOUD_MODEL);
-    assert_eq!(local.disclosures()[2].model(), OPENAI_LOCAL_MODEL);
+    assert_eq!(cloud.disclosures()[2].model(), CLOUD_MODEL);
+    assert_eq!(local.disclosures()[2].model(), LOCAL_MODEL);
     assert_eq!(cloud.transport().seen().len(), 3);
     assert_eq!(local.transport().seen().len(), 3);
 
@@ -268,11 +293,11 @@ fn local_and_cloud_adapters_produce_equivalent_domain_results_from_fixed_fixture
 }
 
 #[test]
-fn concrete_http_transport_serves_local_and_rejects_cleartext_cloud_credentials() {
+fn concrete_http_transport_appends_responses_and_keeps_optional_bearer_out_of_records() {
     let (local_endpoint, local_server) = serve_one_response(CLASSIFICATION_RESPONSE, None);
-    let local_transport = HttpResponsesTransport::openai_local().unwrap();
+    let local_transport = HttpResponsesTransport::new(None).unwrap();
     let local_runtime = OpenAiResponsesRuntime::new(
-        RuntimeTarget::openai_local(local_endpoint),
+        RuntimeTarget::new(local_endpoint, LOCAL_MODEL).unwrap(),
         local_transport,
         TIMEOUT,
     );
@@ -287,32 +312,130 @@ fn concrete_http_transport_serves_local_and_rejects_cleartext_cloud_credentials(
     local_server.join().unwrap();
     assert_eq!(local_classification, PersonTurnClassification::Question);
 
-    assert!(HttpResponsesTransport::openai_cloud("   ").is_err());
-    let token = "fixture-cloud-secret";
-    let cloud_transport = HttpResponsesTransport::openai_cloud(token).unwrap();
-    let cloud_runtime = OpenAiResponsesRuntime::new(
-        RuntimeTarget::openai_cloud("http://127.0.0.1:9/v1/responses"),
-        cloud_transport,
+    assert!(HttpResponsesTransport::new(Some("   ".to_owned())).is_err());
+    let token = "synthetic-bearer-secret";
+    let (keyed_endpoint, keyed_server) = serve_one_response(CLASSIFICATION_RESPONSE, Some(token));
+    let keyed_transport = HttpResponsesTransport::new(Some(token.to_owned())).unwrap();
+    let keyed_runtime = OpenAiResponsesRuntime::new(
+        RuntimeTarget::new(keyed_endpoint, "custom-model-id").unwrap(),
+        keyed_transport,
         TIMEOUT,
     );
-    let mut cloud_core = MemoryCore::new(
+    let mut keyed_core = MemoryCore::new(
         InMemoryRepository::new(),
-        cloud_runtime,
+        keyed_runtime,
         IncrementingClock::new(1_600),
     );
-    let error = cloud_core
-        .record_person_turn(SessionId::new("cloud-http"), "云端传输")
-        .expect_err("cloud credentials must never be sent over cleartext HTTP");
-    assert!(matches!(
-        error,
-        CoreError::Runtime(ref runtime_error)
-            if runtime_error.kind() == RuntimeErrorKind::Other
-    ));
+    let (_, classification) = keyed_core
+        .record_person_turn(SessionId::new("keyed-loopback"), "带合成密钥的本地传输")
+        .unwrap();
+    keyed_server.join().unwrap();
+    assert_eq!(classification, PersonTurnClassification::Question);
     assert!(
-        !cloud_core.runtime().disclosures()[0]
+        !keyed_core.runtime().disclosures()[0]
             .request_json()
             .contains(token)
     );
+    assert_eq!(
+        keyed_core.runtime().disclosures()[0].model(),
+        "custom-model-id"
+    );
+}
+
+#[test]
+fn runtime_target_accepts_remote_https_and_loopback_http_only() {
+    let accepted = [
+        ("https://api.example.test/v1/", RuntimeTargetKind::Cloud),
+        ("https://192.0.2.10/runtime", RuntimeTargetKind::Cloud),
+        ("http://127.0.0.1:11434/v1/", RuntimeTargetKind::Local),
+        ("http://localhost:11434/v1", RuntimeTargetKind::Local),
+        ("http://[::1]:11434/v1", RuntimeTargetKind::Local),
+    ];
+    for (base_url, expected_kind) in accepted {
+        let target = RuntimeTarget::new(base_url, "custom-model").unwrap();
+        assert_eq!(target.kind(), expected_kind);
+        assert!(target.responses_endpoint().ends_with("/responses"));
+        assert!(!target.responses_endpoint().contains("//responses"));
+    }
+
+    for base_url in [
+        "http://api.example.test/v1",
+        "ftp://localhost/v1",
+        "https://user:password@example.test/v1",
+        "https://example.test/v1?tenant=one",
+        "https://example.test/v1#fragment",
+        "https://example.test/v1 responses",
+        "not-a-url",
+    ] {
+        assert!(
+            RuntimeTarget::new(base_url, "custom-model").is_err(),
+            "accepted invalid Base URL: {base_url}"
+        );
+    }
+    assert!(RuntimeTarget::new("https://example.test/v1", "   ").is_err());
+}
+
+#[test]
+fn custom_model_is_used_in_the_request_and_outbound_disclosure() {
+    let custom_model = "owner/model-with-custom-revision";
+    let runtime = OpenAiResponsesRuntime::new(
+        RuntimeTarget::new("https://runtime.example.test/openai/v1/", custom_model).unwrap(),
+        ScriptedTransport::new([Ok(CLASSIFICATION_RESPONSE)]),
+        TIMEOUT,
+    );
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(1_700),
+    );
+    let (_, classification) = core
+        .record_person_turn(SessionId::new("custom-model"), "只验证模型透传")
+        .unwrap();
+    assert_eq!(classification, PersonTurnClassification::Question);
+    let request: Value =
+        serde_json::from_str(core.runtime().disclosures()[0].request_json()).unwrap();
+    assert_eq!(request["model"], custom_model);
+    assert_eq!(core.runtime().disclosures()[0].model(), custom_model);
+    assert_eq!(
+        core.runtime().transport().seen()[0].responses_endpoint,
+        "https://runtime.example.test/openai/v1/responses"
+    );
+}
+
+#[test]
+fn redirect_is_rejected_without_exposing_the_bearer_secret() {
+    let token = "synthetic-redirect-secret";
+    let (base_url, server) = serve_one_redirect();
+    let target = RuntimeTarget::new(base_url, "redirect-test-model").unwrap();
+    let mut transport = HttpResponsesTransport::new(Some(token.to_owned())).unwrap();
+    let responses_endpoint = target.responses_endpoint();
+    let error = transport
+        .send(&target, &responses_endpoint, "{}", TIMEOUT)
+        .expect_err("3xx responses must not be followed or accepted");
+    server.join().unwrap();
+    assert_eq!(error.kind(), TransportErrorKind::Other);
+    assert!(error.to_string().contains("307"));
+    assert!(!error.to_string().contains(token));
+}
+
+#[test]
+fn concrete_transport_rejects_an_endpoint_not_derived_from_the_validated_target() {
+    let target = RuntimeTarget::new("http://127.0.0.1:11434/v1", "safe-model").unwrap();
+    let mut transport = HttpResponsesTransport::new(Some("synthetic-secret".to_owned())).unwrap();
+    let error = transport
+        .send(
+            &target,
+            "http://remote.example.test/v1/responses",
+            "{}",
+            TIMEOUT,
+        )
+        .expect_err("transport must not accept an unvalidated endpoint override");
+    assert_eq!(error.kind(), TransportErrorKind::Other);
+    assert_eq!(
+        error.to_string(),
+        "Responses endpoint does not match the validated target"
+    );
+    assert!(!error.to_string().contains("synthetic-secret"));
 }
 
 #[test]

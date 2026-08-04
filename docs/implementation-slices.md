@@ -1,12 +1,12 @@
 # 首版完整实现切片方案
 
-状态：实施中；S01～S31 已完成，下一片为 S32
+状态：实施中；S01～S31 与 S06R-1 已完成，下一片为 S06R-2；S32 在新构建重验收前锁定
 
-本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31～S32 负责自动化系统验收、可安装构建和真实纵向验收。
+本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 已形成旧边界下的可安装构建。ADR-0053 新增 S06R 修订系列，完成后必须重跑 S31，S32 只能使用重新冻结的构建。
 
 ## 1. 结论
 
-完整首版拆成 32 个可独立验收的纵向切片，而不是只做原方案中的三个核心切片：
+原首版拆成 32 个可独立验收的纵向切片；本次不重排已经完成的编号，而是在 S32 前插入五个 S06R 修订子片：
 
 ```text
 A. 核心与本地应用
@@ -23,7 +23,9 @@ S20 -> S21 -> S22 -> S23 -> S24
 S25 -> S26 -> S27
 
 E. 日常采集、恢复与发布
-S28 -> S29 -> S30 -> S31 -> S32
+S28 -> S29 -> S30 -> S31(旧边界证据)
+                         -> S06R-1 -> S06R-2 -> S06R-3 -> S06R-4 -> S06R-5
+                         -> S31(重验收并冻结新构建) -> S32
 ```
 
 数字顺序是推荐交付顺序。依赖允许的情况下可以并行准备测试夹具或技术 spike，但任何产品切片都必须从已提交的文件状态开始、独立跑绿，并且不得依赖会话记忆。
@@ -457,7 +459,85 @@ S28 -> S29 -> S30 -> S31 -> S32
 
 **主决策**：全部 accepted ADR 的系统级回归；不产生新的领域语义。
 
+### S06R 可配置运行时档案边界修订
+
+**状态**：已由 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 接受；S06R-1 已实现，S06R-2～S06R-5 待实施。保留 ADR-0048 的 Responses 严格 contract 与 Core 最小数据出口，逐步取代固定 Cloud/Local 档案、固定模型和环境变量配置。
+
+```text
+RuntimeProfileDraft {
+  base_url,
+  model,
+  api_key_change = KEEP | REPLACE(secret) | CLEAR
+}
+
+RuntimeProfileView {
+  base_url,
+  model,
+  api_key_configured,
+  api_key_last_four
+}
+
+test(draft) -> validate/build -> synthetic strict-contract request -> sanitized result
+save(draft) -> validate/build -> Vault commit -> replace active runtime -> RuntimeProfileView
+```
+
+`test` 不持久化、不切换运行时，也不发送个人上下文；`save` 不以测试成功为前提，允许先保存暂时离线的本地后端。所有运行时调用和保存仍由宿主单写锁串行化，保存成功后的下一次调用只使用新档案。
+
+#### S06R-1 Responses Runtime Contract v2 与可配置目标
+
+**状态**：已完成；[G03 Runtime Contract v2](runtime-contract-v2.md)、可配置目标、URL/重定向拒绝矩阵、可选 Bearer Key 隔离及 v1 严格夹具等价回归均已落地。
+
+**依赖/输入**：S06 固定夹具、ADR-0004、ADR-0048、ADR-0053。
+
+**新增/输出**：冻结 `runtime-contract-v2.md`；把目标改为自有字符串的 Base URL、模型 ID 与可选 Bearer Key；Base URL 规范化后由适配器追加 `/responses`。远程地址只允许 HTTPS，HTTP 只允许环回地址；拒绝 URL 凭据、query、fragment 和重定向。
+
+**明确不做**：Chat Completions、Anthropic 等第二协议族、供应商自动探测、Vault 持久化、宿主 command 或 UI。
+
+**确定性完成**：自定义模型进入请求与外发记录；远程 HTTPS/环回 HTTP 接受矩阵及非法 URL 拒绝矩阵全绿；Bearer Key 不进入请求记录、错误、日志或夹具；v1 的严格结构化响应夹具继续产生等价领域值。
+
+#### S06R-2 SQLCipher 单档案与 write-only 密钥
+
+**依赖/输入**：S06R-1、schema v25、S30 整库备份与恢复路径。
+
+**新增/输出**：schema v26 增加单例运行时档案，迁移默认值为 `http://127.0.0.1:11434/v1`、`gpt-oss-20b`、无密钥；Repository 提供内部完整读取和面向命令的脱敏视图，更新密钥必须显式 `KEEP/REPLACE/CLEAR`。
+
+**明确不做**：多个命名档案、密钥历史、独立明文配置文件、`.env` 回写或把档案并入自我包。
+
+**确定性完成**：v25→v26、迁移中断回滚、写入后重启、三种密钥动作、空白/超限字段拒绝测试全绿；WebView 读取模型永不包含完整 Key；合成 Key 随加密 `self.db`/Recovery Set 恢复且在数据库与备份原始字节中不可搜索。
+
+#### S06R-3 宿主热切换与严格测试连接
+
+**依赖/输入**：S06R-1～S06R-2、`ManagedHost` 单写锁、`MemoryCore` 运行时端口。
+
+**新增/输出**：宿主打开 Vault 后从单例档案构造运行时；新增 `get_runtime_profile`、`test_runtime_profile`、`save_runtime_profile` 白名单 command；测试连接只用合成输入走现有严格分类 contract，保存先构造候选运行时、再提交 Vault、最后无失败地替换内存运行时。
+
+**明确不做**：简单 ping、把响应正文/认证错误回传 WebView、后台健康轮询、自动回退旧档案或保留环境变量第二配置源。
+
+**确定性完成**：测试失败零持久化/零切换；保存失败保留旧档案；保存成功后的下一次分类和回应都使用新 URL/模型/Key；重启继续使用同一档案；运行时请求进行中时切换被串行化且不出现新旧档案混用。
+
+#### S06R-4 本地设置面板
+
+**依赖/输入**：S06R-3 的三个 command、现有本地 Tauri WebView。
+
+**新增/输出**：持续对话页增加运行时设置入口与模态表单；展示 Base URL、模型 ID、Key 已配置状态和可用末四位；Key 输入框初始永远为空，留空为 `KEEP`，输入为 `REPLACE`，单独确认才 `CLEAR`；提供“测试连接”和“保存并切换”。
+
+**明确不做**：完整 Key 回显、浏览器存储/剪贴板保存、多档案列表、供应商下拉、协议专属高级参数或在 Vault 未解锁时开放设置。
+
+**确定性完成**：React 测试覆盖读取不回显、KEEP/REPLACE/CLEAR、测试不保存、保存后清空输入、失败保留草稿、键盘关闭与焦点返回；TypeScript 检查和生产构建通过。
+
+#### S06R-5 系统重验收与新冻结构建
+
+**依赖/输入**：S06R-1～S06R-4 全绿、更新后的 Runtime Contract v2、schema 与桌面 UI。
+
+**新增/输出**：更新架构、代码链路、ADR/FR/威胁/迁移证据矩阵；把档案迁移、write-only Key、热切换、严格测试连接和恢复后的档案纳入自动化验收；生成新的版本化 NSIS 安装包和 SHA-256，替换 S32 候选构建。
+
+**明确不做**：沿用旧 S31 SHA、缩短十四日观察、把真实 Key/个人正文写入测试或报告、在重验收片新增产品行为。
+
+**确定性完成**：相关定向测试与 `scripts/run-system-acceptance.ps1 -Mode Full` 全绿；安装、首次创建、配置、热切换、重启和卸载烟测通过；S31 记录、checkpoint 与纵向模板指向同一个新构建，S32 门禁才重新打开。
+
 ### S32 冻结构建纵向验收与首版发布结论
+
+**状态**：锁定；不得使用 ADR-0053 之前的 S31 安装包开始或延续观察。
 
 **依赖/输入**：S31 已提交的自动验收结果、版本化 NSIS 安装程序和纵向观察模板；本人在仓库外准备的脱敏真实资料基准。
 
@@ -485,7 +565,9 @@ S01 -> S02 -> S03 -> S04 -> S05 -> S06 -> S07
 
 S07 -> S28 -> S29
 S03 + S19 -> S30
-S01..S30 -> S31 -> S32
+S01..S30 -> S31(旧边界证据)
+S06 + S07 + S30 -> S06R-1 -> S06R-2 -> S06R-3 -> S06R-4 -> S06R-5
+S06R-5 -> S31(重验收并冻结新构建) -> S32
 ```
 
 每片的回滚范围只包括该片新增的模块、migration、command 或策略。不得通过放宽上一片测试来让下一片变绿。若规格与测试冲突，先引用产品、架构或 ADR 说明冲突，再单独修改规格或测试。
@@ -548,6 +630,7 @@ S01..S30 -> S31 -> S32
 | [0050](adr/0050-pinned-origin-loopback-browser-capture.md) | accepted | S29 | 固定扩展来源、IPv4 环回、进程令牌与最小权限 |
 | [0051](adr/0051-recovery-set-deletion-head.md) | accepted | S30 | 不可变快照、同组最新删除头与失败关闭恢复 |
 | [0052](adr/0052-one-time-recovery-key-webview-ceremony.md) | accepted | S07、S31 | 确认前内存预生成、一次性展示与确认后落盘 |
+| [0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) | accepted | S06R | Vault 单档案、write-only Key、热切换与严格测试连接 |
 
 ## 11. 功能需求覆盖矩阵
 
@@ -559,12 +642,12 @@ S01..S30 -> S31 -> S32
 | FR-04 时间化事实账本 | S01、S18、S20～S24 | 三账本、修正、共同经历与约定生命周期 |
 | FR-05 全库检索与工作上下文 | S13～S15 | 多通道取证、动态窗口、冻结上下文 |
 | FR-06 长期记忆维护 | S16～S19、S27 | 提议、争议、纠错、遗忘、模式成熟 |
-| FR-07 第二自我运行时 | S05、S06、S25～S27 | 事件驱动、身份演化、主动反思 |
-| FR-08 持续对话界面 | S07、S17、S20～S24 | 持续对话、来源展开、仪式交互 |
+| FR-07 第二自我运行时 | S05、S06、S06R、S25～S27 | 可配置推理后端、事件驱动、身份演化、主动反思 |
+| FR-08 持续对话界面 | S07、S06R、S17、S20～S24 | 持续对话、运行时设置、来源展开、仪式交互 |
 | FR-09 纠错与遗忘 | S17～S19、S30 | 争议复核、传播删除、恢复防复活 |
-| FR-10 本地加密与恢复 | S02、S03、S30 | 加密 Vault、双解锁路径、密文备份恢复 |
+| FR-10 本地加密与恢复 | S02、S03、S06R、S30 | 加密 Vault、运行时密钥、双解锁路径、密文备份恢复 |
 | FR-11 不可信内容隔离 | S08～S10、S29 | 归档边界、受限解析、控制通道隔离 |
-| FR-12 首版威胁边界 | S02、S03、S07～S10、S28～S31 | 当前会话信任边界、最小权限、真实安全声明 |
+| FR-12 首版威胁边界 | S02、S03、S06R、S07～S10、S28～S31 | 当前会话信任边界、write-only 密钥、最小权限、真实安全声明 |
 
 ## 12. 实施纪律与完成判据
 

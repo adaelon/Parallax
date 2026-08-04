@@ -2,11 +2,13 @@ use std::{error::Error, fmt, time::Duration};
 
 use eam_core::{ClaimId, EvidenceId};
 use reqwest::{StatusCode, blocking::Client, redirect::Policy};
+use url::{Host, Url};
 use zeroize::Zeroizing;
 
-pub const OPENAI_CLOUD_MODEL: &str = "gpt-5.6-terra";
-pub const OPENAI_LOCAL_MODEL: &str = "gpt-oss-20b";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BASE_URL_BYTES: usize = 2 * 1024;
+const MAX_MODEL_BYTES: usize = 256;
+const MAX_BEARER_TOKEN_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeTargetKind {
@@ -17,27 +19,79 @@ pub enum RuntimeTargetKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeTarget {
     kind: RuntimeTargetKind,
-    endpoint: String,
-    model: &'static str,
+    base_url: Url,
+    model: String,
 }
 
 impl RuntimeTarget {
-    #[must_use]
-    pub fn openai_cloud(endpoint: impl Into<String>) -> Self {
-        Self {
-            kind: RuntimeTargetKind::Cloud,
-            endpoint: endpoint.into(),
-            model: OPENAI_CLOUD_MODEL,
+    /// Validates and normalizes one configurable Responses-compatible target.
+    ///
+    /// Remote targets require HTTPS. HTTP is accepted only for the literal
+    /// loopback hosts `localhost`, `127.0.0.0/8`, and `::1`. Credentials,
+    /// query strings, and fragments are rejected before any request exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized configuration error for an invalid Base URL or
+    /// model identifier.
+    pub fn new(
+        base_url: impl AsRef<str>,
+        model: impl Into<String>,
+    ) -> Result<Self, RuntimeTargetError> {
+        let base_url = base_url.as_ref();
+        if base_url.is_empty()
+            || base_url.len() > MAX_BASE_URL_BYTES
+            || base_url.trim() != base_url
+            || base_url.chars().any(char::is_whitespace)
+            || base_url.chars().any(char::is_control)
+        {
+            return Err(RuntimeTargetError::new("invalid Responses Base URL"));
         }
-    }
+        let mut parsed = Url::parse(base_url)
+            .map_err(|_| RuntimeTargetError::new("invalid Responses Base URL"))?;
+        if parsed.cannot_be_a_base()
+            || parsed.host().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(RuntimeTargetError::new("invalid Responses Base URL"));
+        }
 
-    #[must_use]
-    pub fn openai_local(endpoint: impl Into<String>) -> Self {
-        Self {
-            kind: RuntimeTargetKind::Local,
-            endpoint: endpoint.into(),
-            model: OPENAI_LOCAL_MODEL,
+        let is_loopback = match parsed.host() {
+            Some(Host::Domain(domain)) => domain == "localhost",
+            Some(Host::Ipv4(address)) => address.is_loopback(),
+            Some(Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        };
+        match (parsed.scheme(), is_loopback) {
+            ("https", _) | ("http", true) => {}
+            _ => return Err(RuntimeTargetError::new("invalid Responses Base URL")),
         }
+
+        let model = model.into();
+        if model.is_empty()
+            || model.len() > MAX_MODEL_BYTES
+            || model.trim() != model
+            || model.chars().any(char::is_control)
+        {
+            return Err(RuntimeTargetError::new(
+                "invalid Responses model identifier",
+            ));
+        }
+
+        let normalized_path = parsed.path().trim_end_matches('/').to_owned();
+        parsed.set_path(&normalized_path);
+        Ok(Self {
+            kind: if is_loopback {
+                RuntimeTargetKind::Local
+            } else {
+                RuntimeTargetKind::Cloud
+            },
+            base_url: parsed,
+            model,
+        })
     }
 
     #[must_use]
@@ -46,15 +100,46 @@ impl RuntimeTarget {
     }
 
     #[must_use]
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_str()
     }
 
     #[must_use]
-    pub const fn model(&self) -> &'static str {
-        self.model
+    pub fn responses_endpoint(&self) -> String {
+        let mut endpoint = self.base_url.clone();
+        let responses_path = if self.base_url.path() == "/" {
+            "/responses".to_owned()
+        } else {
+            format!("{}/responses", self.base_url.path())
+        };
+        endpoint.set_path(&responses_path);
+        endpoint.into()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeTargetError {
+    message: &'static str,
+}
+
+impl RuntimeTargetError {
+    const fn new(message: &'static str) -> Self {
+        Self { message }
+    }
+}
+
+impl fmt::Display for RuntimeTargetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl Error for RuntimeTargetError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvocationKind {
@@ -66,7 +151,7 @@ pub enum InvocationKind {
 pub struct OutboundDisclosureRecord {
     sequence: u64,
     target: RuntimeTargetKind,
-    model: &'static str,
+    model: String,
     invocation: InvocationKind,
     evidence_ids: Vec<EvidenceId>,
     retrieved_sources: Vec<OutboundContextSource>,
@@ -77,7 +162,7 @@ impl OutboundDisclosureRecord {
     pub(crate) fn new(
         sequence: u64,
         target: RuntimeTargetKind,
-        model: &'static str,
+        model: String,
         invocation: InvocationKind,
         evidence_ids: Vec<EvidenceId>,
         retrieved_sources: Vec<OutboundContextSource>,
@@ -105,8 +190,8 @@ impl OutboundDisclosureRecord {
     }
 
     #[must_use]
-    pub const fn model(&self) -> &'static str {
-        self.model
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     #[must_use]
@@ -200,7 +285,7 @@ impl fmt::Display for TransportError {
 
 impl Error for TransportError {}
 
-/// Sends one already-serialized Responses v1 request.
+/// Sends one already-serialized Responses v2 request.
 ///
 /// Authentication belongs to the host transport implementation. The trait
 /// intentionally exposes no repository or credential inspection capability.
@@ -213,59 +298,42 @@ pub trait ResponsesTransport {
     fn send(
         &mut self,
         target: &RuntimeTarget,
+        responses_endpoint: &str,
         request_json: &str,
         timeout: Duration,
     ) -> Result<String, TransportError>;
 }
 
-/// Blocking HTTPS/HTTP transport for the Responses v1 endpoint.
+/// Blocking HTTPS/loopback-HTTP transport for the Responses v2 endpoint.
 ///
 /// The optional bearer token is held in zeroizing memory and added only as an
 /// HTTP header, after the auditable request body has been recorded.
 pub struct HttpResponsesTransport {
-    client: Client,
+    remote_client: Client,
+    loopback_client: Client,
     bearer_token: Option<Zeroizing<String>>,
 }
 
 impl HttpResponsesTransport {
-    /// Creates a cloud transport that adds one bearer token per request.
+    /// Creates a transport with an optional bearer token.
     ///
     /// # Errors
     ///
     /// Returns a transport error when the HTTP client cannot be constructed.
-    pub fn openai_cloud(bearer_token: impl Into<String>) -> Result<Self, TransportError> {
-        let bearer_token = bearer_token.into();
-        if bearer_token.trim().is_empty() {
-            return Err(TransportError::other(
-                "cloud Responses transport requires a non-empty bearer token",
-            ));
+    pub fn new(bearer_token: Option<String>) -> Result<Self, TransportError> {
+        if bearer_token.as_ref().is_some_and(|token| {
+            token.trim().is_empty()
+                || token.len() > MAX_BEARER_TOKEN_BYTES
+                || token.chars().any(char::is_control)
+        }) {
+            return Err(TransportError::other("invalid Responses bearer token"));
         }
-        Self::build(Some(Zeroizing::new(bearer_token)), false)
-    }
-
-    /// Creates a local transport without cloud credentials or system proxies.
-    ///
-    /// # Errors
-    ///
-    /// Returns a transport error when the HTTP client cannot be constructed.
-    pub fn openai_local() -> Result<Self, TransportError> {
-        Self::build(None, true)
-    }
-
-    fn build(
-        bearer_token: Option<Zeroizing<String>>,
-        no_proxy: bool,
-    ) -> Result<Self, TransportError> {
-        let mut builder = Client::builder().redirect(Policy::none());
-        if no_proxy {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|error| TransportError::other(error.to_string()))?;
+        let remote_client = build_http_client(false)?;
+        let loopback_client = build_http_client(true)?;
         Ok(Self {
-            client,
-            bearer_token,
+            remote_client,
+            loopback_client,
+            bearer_token: bearer_token.map(Zeroizing::new),
         })
     }
 }
@@ -274,31 +342,21 @@ impl ResponsesTransport for HttpResponsesTransport {
     fn send(
         &mut self,
         target: &RuntimeTarget,
+        responses_endpoint: &str,
         request_json: &str,
         timeout: Duration,
     ) -> Result<String, TransportError> {
-        match (target.kind(), self.bearer_token.as_ref()) {
-            (RuntimeTargetKind::Cloud, None) => {
-                return Err(TransportError::other(
-                    "cloud Responses transport requires a bearer token",
-                ));
-            }
-            (RuntimeTargetKind::Cloud, Some(_)) if !target.endpoint().starts_with("https://") => {
-                return Err(TransportError::other(
-                    "cloud Responses endpoint must use HTTPS",
-                ));
-            }
-            (RuntimeTargetKind::Local, Some(_)) => {
-                return Err(TransportError::other(
-                    "local Responses transport cannot carry a cloud bearer token",
-                ));
-            }
-            (RuntimeTargetKind::Cloud, Some(_)) | (RuntimeTargetKind::Local, None) => {}
+        if target.responses_endpoint() != responses_endpoint {
+            return Err(TransportError::other(
+                "Responses endpoint does not match the validated target",
+            ));
         }
-
-        let mut request = self
-            .client
-            .post(target.endpoint())
+        let client = match target.kind() {
+            RuntimeTargetKind::Local => &self.loopback_client,
+            RuntimeTargetKind::Cloud => &self.remote_client,
+        };
+        let mut request = client
+            .post(responses_endpoint)
             .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(request_json.to_owned());
@@ -332,12 +390,22 @@ impl ResponsesTransport for HttpResponsesTransport {
 
 fn map_http_error(error: &reqwest::Error) -> TransportError {
     if error.is_timeout() {
-        TransportError::timeout(error.to_string())
+        TransportError::timeout("Responses request timed out")
     } else if error.is_connect() {
-        TransportError::unavailable(error.to_string())
+        TransportError::unavailable("Responses endpoint is unavailable")
     } else {
-        TransportError::other(error.to_string())
+        TransportError::other("Responses request failed")
     }
+}
+
+fn build_http_client(no_proxy: bool) -> Result<Client, TransportError> {
+    let mut builder = Client::builder().redirect(Policy::none());
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|_| TransportError::other("Responses HTTP client construction failed"))
 }
 
 fn map_http_status(status: StatusCode) -> TransportError {

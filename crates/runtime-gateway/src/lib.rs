@@ -1,6 +1,6 @@
 //! S06 model runtime gateway.
 //!
-//! The gateway translates trusted Core values into one strict Responses v1
+//! The gateway translates trusted Core values into one strict Responses v2
 //! contract. It never receives a repository, Vault key, or action tool.
 
 mod adapter;
@@ -10,7 +10,7 @@ mod transport;
 pub use adapter::OpenAiResponsesRuntime;
 pub use fallback::FallbackRuntime;
 pub use transport::{
-    HttpResponsesTransport, InvocationKind, OPENAI_CLOUD_MODEL, OPENAI_LOCAL_MODEL,
-    OutboundContextSource, OutboundDisclosureRecord, ResponsesTransport, RuntimeTarget,
-    RuntimeTargetKind, TransportError, TransportErrorKind,
+    HttpResponsesTransport, InvocationKind, OutboundContextSource, OutboundDisclosureRecord,
+    ResponsesTransport, RuntimeTarget, RuntimeTargetError, RuntimeTargetKind, TransportError,
+    TransportErrorKind,
 };

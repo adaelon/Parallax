@@ -36,8 +36,10 @@ use eam_runtime_gateway::{
 use eam_vault::{PreparedVault, VaultKey, VaultKeyStore, VaultRepository};
 use serde::Serialize;
 
-const LOCAL_RESPONSES_ENDPOINT: &str = "http://127.0.0.1:11434/v1/responses";
-const CLOUD_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
+const LOCAL_RESPONSES_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+const CLOUD_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1";
+const LOCAL_RESPONSES_MODEL: &str = "gpt-oss-20b";
+const CLOUD_RESPONSES_MODEL: &str = "gpt-5.6-terra";
 const RUNTIME_TIMEOUT: Duration = Duration::from_secs(45);
 const CONTINUOUS_SESSION_ID: &str = "continuous-conversation";
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
@@ -873,10 +875,11 @@ impl HostCore {
 
 fn configured_runtime() -> Result<AppRuntime, String> {
     let local_endpoint = env::var("EAM_LOCAL_RESPONSES_ENDPOINT")
-        .unwrap_or_else(|_| LOCAL_RESPONSES_ENDPOINT.to_owned());
+        .unwrap_or_else(|_| LOCAL_RESPONSES_BASE_URL.to_owned());
     let local = OpenAiResponsesRuntime::new(
-        RuntimeTarget::openai_local(local_endpoint),
-        HttpResponsesTransport::openai_local().map_err(|error| error.to_string())?,
+        RuntimeTarget::new(local_endpoint, LOCAL_RESPONSES_MODEL)
+            .map_err(|error| error.to_string())?,
+        HttpResponsesTransport::new(None).map_err(|error| error.to_string())?,
         RUNTIME_TIMEOUT,
     );
 
@@ -887,10 +890,11 @@ fn configured_runtime() -> Result<AppRuntime, String> {
         None => Ok(Box::new(local)),
         Some(token) => {
             let cloud_endpoint = env::var("EAM_CLOUD_RESPONSES_ENDPOINT")
-                .unwrap_or_else(|_| CLOUD_RESPONSES_ENDPOINT.to_owned());
+                .unwrap_or_else(|_| CLOUD_RESPONSES_BASE_URL.to_owned());
             let cloud = OpenAiResponsesRuntime::new(
-                RuntimeTarget::openai_cloud(cloud_endpoint),
-                HttpResponsesTransport::openai_cloud(token).map_err(|error| error.to_string())?,
+                RuntimeTarget::new(cloud_endpoint, CLOUD_RESPONSES_MODEL)
+                    .map_err(|error| error.to_string())?,
+                HttpResponsesTransport::new(Some(token)).map_err(|error| error.to_string())?,
                 RUNTIME_TIMEOUT,
             );
             Ok(Box::new(FallbackRuntime::new(cloud, local)))

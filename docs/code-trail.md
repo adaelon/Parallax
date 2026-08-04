@@ -1,5 +1,28 @@
 # 代码链路
 
+## 2026-08-04 S06R-1 Responses Runtime Contract v2 与可配置目标
+
+**触达**:
+- `crates/runtime-gateway/src/transport.rs:RuntimeTarget::new/HttpResponsesTransport::new` — 自有 Base URL/模型，拒绝非环回 HTTP、凭据/query/fragment/空白，并以可选清零 bearer 和无重定向 client 发送。
+- `crates/runtime-gateway/src/adapter.rs:OpenAiResponsesRuntime::invoke` — 由规范化 Base URL 追加 `/responses`，把自定义模型写入请求和无凭据外发记录。
+- `crates/runtime-gateway/tests/runtime_contract.rs:runtime_target_accepts_remote_https_and_loopback_http_only` — 覆盖远程 HTTPS、环回 HTTP、非法 URL、自定义模型、可选 Key、3xx 拒绝和 v1 夹具等价。
+- `apps/desktop/src-tauri/src/state.rs:configured_runtime` — 仅适配 v2 构造 API，保留 S06 旧固定双档案直至 S06R-3。
+- `docs/runtime-contract-v2.md:G03 Runtime Contract v2`、`docs/architecture.md:§3.6/§9.6` — 冻结配置、传输、脱敏错误与后续切片边界。
+
+**入口**：`OpenAiResponsesRuntime` 构造合法 `RuntimeTarget` 后，分类或回应调用在适配器内派生 `<base_url>/responses` 并经 `ResponsesTransport` 发送；Bearer Key 只由具体传输持有。
+**测试**：`cargo test -p runtime-gateway` 27/27、`cargo test -p desktop-app` 24/24；runtime-gateway Clippy `-D warnings`、desktop all-targets check、Markdown 本地链接 266/266、254 个 tracked text 隐私扫描与静态安全边界、`git diff --check` 全绿。
+
+## 2026-08-04 S06R-0 可配置运行时档案决策与切片
+
+**触达**:
+- `CONTEXT.md:推理运行时/运行时后端/运行时档案` — 固定模型执行能力与第二自我身份、个人上下文及 Core 权限的领域边界。
+- `docs/adr/0053-vault-backed-configurable-responses-runtime-profile.md`、`docs/adr/0048-openai-responses-runtime-family.md` — 接受 Vault 单档案、write-only Key 与热切换，并只取代旧 ADR 的固定档案/模型部分。
+- `docs/implementation-slices.md:S06R-1..S06R-5` — 按 Contract v2、SQLCipher 档案、宿主热切换、设置 UI、系统重验收拆成五个独立门禁。
+- `docs/system-acceptance-v1.md:§8`、`SESSION_CHECKPOINT.md` — 把旧 S31 构建降为历史证据并锁定 S32，直到新边界完成重验收。
+
+**入口**：本人确认可自由填写 Responses Base URL、模型 ID 和可选 Bearer Key；本片仅落设计，不改变可执行路径。
+**测试**：Markdown 本地链接 263/263、隐私扫描 253 个文本文件零违规、`git diff --check` 通过；旧 S31 矩阵按预期拒绝缺少证据的 ADR-0053，S06R-5 前不得恢复为绿。
+
 ## 2026-08-03 S31-2 完整系统验收与可安装构建
 
 **触达**:

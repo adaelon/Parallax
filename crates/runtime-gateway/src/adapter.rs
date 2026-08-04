@@ -184,15 +184,21 @@ where
         self.disclosures.push(OutboundDisclosureRecord::new(
             sequence,
             self.target.kind(),
-            self.target.model(),
+            self.target.model().to_owned(),
             invocation,
             selection.evidence_ids,
             selection.retrieved_sources,
             request_json.clone(),
         ));
 
+        let responses_endpoint = self.target.responses_endpoint();
         self.transport
-            .send(&self.target, &request_json, self.timeout)
+            .send(
+                &self.target,
+                &responses_endpoint,
+                &request_json,
+                self.timeout,
+            )
             .map_err(|error| map_transport_error(&error))
     }
 }

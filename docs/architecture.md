@@ -212,7 +212,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 
 ### 3.6 模型运行时
 
-本地模型和云端模型实现同一运行时契约。S06 的首个档案统一采用 OpenAI Responses v1：云端为 `gpt-5.6-terra`，本地为 `gpt-oss-20b`；供应商传输由无 repository 的适配器注入，认证信息不进入请求记录。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、输出和错误协议见 [G03 Runtime Contract v1](runtime-contract-v1.md)。
+本地与远程模型实现同一 Responses 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v2](runtime-contract-v2.md)；Vault 单档案、宿主热切换和设置 UI 分别留给 S06R-2～S06R-4。
 
 ### 3.7 技术职责
 
@@ -1278,9 +1278,9 @@ Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用�
 
 ```text
 crates/runtime-gateway/src/
-  transport.rs          # 固定档案、具体 HTTP/无 repository 传输、清零 bearer 与外发记录
-  adapter.rs            # Responses v1 最小负载、严格 schema、固定夹具解析和错误分类
-  fallback.rs           # 仅 TIMEOUT/UNAVAILABLE 从 Cloud 降级到 Local
+  transport.rs          # 可配置 Base URL/模型、URL 拒绝矩阵、可选清零 bearer 与无重定向 HTTP
+  adapter.rs            # 追加 /responses、Responses v2 最小负载、严格 schema、外发记录和错误分类
+  fallback.rs           # S06 旧宿主仅 TIMEOUT/UNAVAILABLE 从 Cloud 降级到 Local；S06R-3 将移除固定双档案
 crates/core/src/
   ports.rs              # RuntimeErrorKind 确定错误语义
   domain.rs             # 未知结构化操作与 Core 拒绝结果
@@ -1289,6 +1289,8 @@ crates/core/src/
 
 ```text
 OpenAiResponsesRuntime::classify_person_turn(evidence)
+  -> validate/normalize owned Base URL + model
+  -> append /responses
   -> record exact classification request
   -> ResponsesTransport::send(timeout)
   -> strict PersonTurnClassification
@@ -1300,7 +1302,7 @@ OpenAiResponsesRuntime::respond(RuntimeRequest)
   -> preserve unknown operation name for Core rejection
 ```
 
-Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 对同一固定夹具产生等价领域输出；具体 HTTP 传输强制 Cloud HTTPS + bearer 与无凭据 Local 端点，S07 只注入端点和秘密，不能取得保险库或改变 [G03 Runtime Contract v1](runtime-contract-v1.md)。结构化输出错误失败关闭，只有超时和不可用进入本地档案。SQLCipher 集成测试证明运行时不可用不会回滚已提交的本人证据。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0048](adr/0048-openai-responses-runtime-family.md)。
+任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 固定夹具继续产生等价领域输出。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v2](runtime-contract-v2.md)。结构化输出错误仍失败关闭，旧宿主只有超时和不可用进入本地 fallback；SQLCipher 集成测试继续证明运行时不可用不会回滚已提交的本人证据。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md) 和 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)。
 
 ### 9.7 S07 桌面宿主与持续对话当前实现边界
 
