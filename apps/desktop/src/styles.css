@@ -132,7 +132,7 @@ textarea {
 
 .conversation-shell {
   display: grid;
-  min-height: 100vh;
+  height: 100vh;
   grid-template-rows: auto minmax(0, 1fr) auto;
   background:
     radial-gradient(circle at 8% 4%, rgb(111 143 103 / 18%), transparent 31rem),
@@ -199,6 +199,7 @@ h1 {
 }
 
 .conversation {
+  min-height: 0;
   overflow-y: auto;
   padding: clamp(1.5rem, 4vw, 3.25rem) clamp(1.25rem, 6vw, 6rem) 2rem;
   scrollbar-color: #3b4038 transparent;

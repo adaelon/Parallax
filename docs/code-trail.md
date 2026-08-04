@@ -1,5 +1,15 @@
 # 代码链路
 
+## 2026-08-04 持续对话滚动所有权修复
+
+**触达**:
+- `apps/desktop/src/App.tsx:App conversationViewport effect` — 新消息与恢复消息只更新聊天区自身的 `scrollTop`，不再用 `scrollIntoView` 滚动外层视口。
+- `apps/desktop/src/styles.css:.conversation-shell/.conversation` — 将三行网格固定为一屏高，并允许中间聊天行收缩后独立纵向滚动。
+- `apps/desktop/src/App.test.tsx:S07 continuous conversation` — 复现恢复消息后聊天区未取得滚动所有权，并锁定其滚到自身 `scrollHeight` 的行为。
+
+**入口**：启动时恢复持续对话，或本人发送消息令 `turns/sending` 变化时触发聊天区自动滚底。
+**测试**：回归测试先以 `scrollTop=0` 失败；修复后桌面 React 20/20、`npm run typecheck` 与 `npm run build` 全绿。
+
 ## 2026-08-04 S06D DeepSeek Chat Completions 协议适配
 
 **触达**:

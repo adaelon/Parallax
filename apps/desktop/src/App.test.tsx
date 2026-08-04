@@ -122,6 +122,48 @@ describe("first-run encrypted vault setup", () => {
 });
 
 describe("S07 continuous conversation", () => {
+  it("keeps restored turns inside the viewport-owned conversation scroller", async () => {
+    let resolveConversation!: (turns: ConversationTurn[]) => void;
+    const restoredConversation = new Promise<ConversationTurn[]>((resolve) => {
+      resolveConversation = resolve;
+    });
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
+      if (command === "list_conversation") {
+        return restoredConversation as Promise<T>;
+      }
+      if (
+        command === "list_shared_experience_ceremonies" ||
+        command === "list_identity_history" ||
+        command === "list_offered_reflection_invitations" ||
+        command === "list_activity_timeline"
+      ) {
+        return [] as T;
+      }
+      if (command === "get_capture_status") {
+        return { state: "collecting" } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    const conversation = document.querySelector<HTMLElement>(".conversation")!;
+    Object.defineProperty(conversation, "scrollHeight", {
+      configurable: true,
+      value: 1_200,
+    });
+
+    await act(async () => {
+      resolveConversation([
+        turn(1, "person", "第一句"),
+        turn(2, "counterpart", "第二句"),
+      ]);
+      await restoredConversation;
+    });
+    await vi.waitFor(() => expect(document.body.textContent).toContain("第二句"));
+
+    expect(conversation.scrollTop).toBe(1_200);
+  });
+
   it("restores prior turns and appends a successful round through whitelisted commands", async () => {
     const restored = [turn(1, "person", "重启前的原话")];
     const result = {

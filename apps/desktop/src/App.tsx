@@ -249,7 +249,7 @@ export function App() {
   const [revisionDraft, setRevisionDraft] = useState<AgreementRevisionDraft | null>(null);
   const [revisionNotice, setRevisionNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const conversationEnd = useRef<HTMLDivElement>(null);
+  const conversationViewport = useRef<HTMLElement>(null);
   const messageInput = useRef<HTMLTextAreaElement>(null);
   const runtimeSettingsTrigger = useRef<HTMLButtonElement>(null);
   const runtimeSettingsBaseUrl = useRef<HTMLInputElement>(null);
@@ -289,7 +289,10 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    conversationEnd.current?.scrollIntoView?.({ block: "end" });
+    const conversation = conversationViewport.current;
+    if (conversation) {
+      conversation.scrollTop = conversation.scrollHeight;
+    }
   }, [turns, sending]);
 
   useEffect(() => {
@@ -841,7 +844,11 @@ export function App() {
         </div>
       </header>
 
-      <section className="conversation" aria-label="持续对话">
+      <section
+        aria-label="持续对话"
+        className="conversation"
+        ref={conversationViewport}
+      >
         {loading ? (
           <p className="conversation-state">正在从加密保险库恢复对话…</p>
         ) : turns.length === 0 ? (
@@ -874,7 +881,6 @@ export function App() {
             正在回应
           </div>
         ) : null}
-        <div ref={conversationEnd} />
       </section>
 
       {runtimeSettingsOpen ? (
