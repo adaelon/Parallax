@@ -321,13 +321,14 @@ impl HttpResponsesTransport {
     ///
     /// Returns a transport error when the HTTP client cannot be constructed.
     pub fn new(bearer_token: Option<String>) -> Result<Self, TransportError> {
-        validate_responses_bearer_token(bearer_token.as_deref())?;
+        let bearer_token = bearer_token.map(Zeroizing::new);
+        validate_responses_bearer_token(bearer_token.as_ref().map(|token| token.as_str()))?;
         let remote_client = build_http_client(false)?;
         let loopback_client = build_http_client(true)?;
         Ok(Self {
             remote_client,
             loopback_client,
-            bearer_token: bearer_token.map(Zeroizing::new),
+            bearer_token,
         })
     }
 }

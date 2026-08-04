@@ -28,6 +28,7 @@ tauri-plugin-autostart = "=2.5.1"
 tauri-plugin-single-instance = "=2.4.3"
 tauri-plugin-updater = "=2.10.1"
 url = "=2.5.7"
+zeroize = "=1.9.0"
 
 [dev-dependencies]
 tempfile = "=3.27.0"

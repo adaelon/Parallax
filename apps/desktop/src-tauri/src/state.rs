@@ -1,5 +1,4 @@
 use std::{
-    env,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
     time::Duration,
@@ -16,10 +15,10 @@ use eam_core::{
     EvidenceCitation, EvidenceId, IdentityEvolutionRepository, IdentityStateSnapshot, MemoryCore,
     MemoryRepository, ReflectionDecision, ReflectionImportance, ReflectionInvitation,
     ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationRepository,
-    ReflectionInvitationState, ReflectionOpportunity, SessionId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementResolution, SharedAgreementRevision,
-    SharedExperienceKind, SharedExperienceRepository, Speaker, SystemClock, Timestamp,
-    WorkingContext, agreement_is_active_at,
+    ReflectionInvitationState, ReflectionOpportunity, RuntimeErrorKind, SessionId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
+    SharedAgreementRevision, SharedExperienceKind, SharedExperienceRepository, Speaker,
+    SystemClock, Timestamp, WorkingContext, agreement_is_active_at,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_ingestion::{
@@ -30,17 +29,18 @@ use eam_retrieval::{
     RetrievalQuery, RetrievalRepository, TokenBudget, freeze_working_context as freeze_retrieval,
     project_active_relational_constraints, search_terms,
 };
-use eam_runtime_gateway::{
-    FallbackRuntime, HttpResponsesTransport, OpenAiResponsesRuntime, RuntimeTarget,
+use eam_runtime_gateway::{HttpResponsesTransport, OpenAiResponsesRuntime, RuntimeTarget};
+use eam_vault::{
+    PreparedVault, RuntimeProfile as VaultRuntimeProfile,
+    RuntimeProfileKeyAction as VaultRuntimeProfileKeyAction,
+    RuntimeProfileView as VaultRuntimeProfileView, VaultKey, VaultKeyStore, VaultRepository,
 };
-use eam_vault::{PreparedVault, VaultKey, VaultKeyStore, VaultRepository};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
-const LOCAL_RESPONSES_BASE_URL: &str = "http://127.0.0.1:11434/v1";
-const CLOUD_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1";
-const LOCAL_RESPONSES_MODEL: &str = "gpt-oss-20b";
-const CLOUD_RESPONSES_MODEL: &str = "gpt-5.6-terra";
 const RUNTIME_TIMEOUT: Duration = Duration::from_secs(45);
+const RUNTIME_PROFILE_TEST_INPUT: &str =
+    "Synthetic runtime profile test: is the strict classification contract available?";
 const CONTINUOUS_SESSION_ID: &str = "continuous-conversation";
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_TURNS: usize = 32;
@@ -87,6 +87,55 @@ pub struct HostStatusView {
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryKeyView {
     recovery_key: String,
+}
+
+/// One command-scoped candidate for the singleton runtime profile.
+///
+/// This type intentionally omits `Debug`, `Clone`, and serialization so a
+/// replacement key cannot be echoed by routine host diagnostics, and its
+/// destructor zeroizes that replacement value.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeProfileDraft {
+    base_url: String,
+    model: String,
+    api_key_change: RuntimeProfileApiKeyChange,
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "action",
+    content = "value",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+enum RuntimeProfileApiKeyChange {
+    Keep,
+    Replace(String),
+    Clear,
+}
+
+impl Drop for RuntimeProfileDraft {
+    fn drop(&mut self) {
+        if let RuntimeProfileApiKeyChange::Replace(value) = &mut self.api_key_change {
+            value.zeroize();
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProfileView {
+    base_url: String,
+    model: String,
+    api_key_configured: bool,
+    api_key_last_four: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProfileTestView {
+    succeeded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -369,6 +418,61 @@ impl ManagedHost {
                 updater_configured: self.updater_configured,
                 detail: None,
             },
+        }
+    }
+
+    pub fn get_runtime_profile(&self) -> Result<RuntimeProfileView, String> {
+        match &*self.lock() {
+            HostSlot::Ready(host) => host
+                .core
+                .repository()
+                .runtime_profile_view()
+                .map(|view| RuntimeProfileView::from(&view))
+                .map_err(|error| error.to_string()),
+            slot => Err(runtime_profile_slot_error(slot)),
+        }
+    }
+
+    pub fn test_runtime_profile(
+        &self,
+        draft: &RuntimeProfileDraft,
+    ) -> Result<RuntimeProfileTestView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                let mut candidate = runtime_from_draft(host.core.repository(), draft)?;
+                let evidence = ConversationEvidence::restore(
+                    EvidenceId::from_raw(1),
+                    SessionId::new("runtime-profile-test"),
+                    Speaker::Person,
+                    RUNTIME_PROFILE_TEST_INPUT.to_owned(),
+                    Timestamp::from_millis(0),
+                );
+                candidate
+                    .classify_person_turn(&evidence)
+                    .map_err(|error| sanitized_runtime_test_error(error.kind()))?;
+                Ok(RuntimeProfileTestView { succeeded: true })
+            }
+            slot => Err(runtime_profile_slot_error(slot)),
+        }
+    }
+
+    pub fn save_runtime_profile(
+        &self,
+        draft: &RuntimeProfileDraft,
+    ) -> Result<RuntimeProfileView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                save_runtime_profile_from_core(&mut host.core, draft, |repository, draft| {
+                    repository
+                        .update_runtime_profile(
+                            &draft.base_url,
+                            &draft.model,
+                            draft.api_key_change.as_vault_action(),
+                        )
+                        .map_err(|error| error.to_string())
+                })
+            }
+            slot => Err(runtime_profile_slot_error(slot)),
         }
     }
 
@@ -830,9 +934,14 @@ impl HostCore {
         vault_key: VaultKey,
         launch_mode: LaunchMode,
     ) -> Result<Self, String> {
-        let runtime = configured_runtime()?;
         let mut repository =
             VaultRepository::open(vault_root, vault_key).map_err(|error| error.to_string())?;
+        let runtime = {
+            let profile = repository
+                .runtime_profile()
+                .map_err(|error| error.to_string())?;
+            runtime_from_profile(&profile)?
+        };
         let mut lifecycle = HostLifecycle::new();
         lifecycle
             .begin_recovery()
@@ -873,32 +982,105 @@ impl HostCore {
     }
 }
 
-fn configured_runtime() -> Result<AppRuntime, String> {
-    let local_endpoint = env::var("EAM_LOCAL_RESPONSES_ENDPOINT")
-        .unwrap_or_else(|_| LOCAL_RESPONSES_BASE_URL.to_owned());
-    let local = OpenAiResponsesRuntime::new(
-        RuntimeTarget::new(local_endpoint, LOCAL_RESPONSES_MODEL)
-            .map_err(|error| error.to_string())?,
-        HttpResponsesTransport::new(None).map_err(|error| error.to_string())?,
-        RUNTIME_TIMEOUT,
-    );
-
-    let token = env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    match token {
-        None => Ok(Box::new(local)),
-        Some(token) => {
-            let cloud_endpoint = env::var("EAM_CLOUD_RESPONSES_ENDPOINT")
-                .unwrap_or_else(|_| CLOUD_RESPONSES_BASE_URL.to_owned());
-            let cloud = OpenAiResponsesRuntime::new(
-                RuntimeTarget::new(cloud_endpoint, CLOUD_RESPONSES_MODEL)
-                    .map_err(|error| error.to_string())?,
-                HttpResponsesTransport::new(Some(token)).map_err(|error| error.to_string())?,
-                RUNTIME_TIMEOUT,
-            );
-            Ok(Box::new(FallbackRuntime::new(cloud, local)))
+impl RuntimeProfileApiKeyChange {
+    fn as_vault_action(&self) -> VaultRuntimeProfileKeyAction<'_> {
+        match self {
+            Self::Keep => VaultRuntimeProfileKeyAction::Keep,
+            Self::Replace(value) => VaultRuntimeProfileKeyAction::Replace(value),
+            Self::Clear => VaultRuntimeProfileKeyAction::Clear,
         }
+    }
+}
+
+impl From<&VaultRuntimeProfileView> for RuntimeProfileView {
+    fn from(value: &VaultRuntimeProfileView) -> Self {
+        Self {
+            base_url: value.base_url().to_owned(),
+            model: value.model().to_owned(),
+            api_key_configured: value.api_key_configured(),
+            api_key_last_four: value.api_key_last_four().map(str::to_owned),
+        }
+    }
+}
+
+fn runtime_from_profile(profile: &VaultRuntimeProfile) -> Result<AppRuntime, String> {
+    let target = validated_runtime_target(profile.base_url(), profile.model())?;
+    runtime_from_target(target, profile.bearer_key().map(str::to_owned))
+}
+
+fn runtime_from_draft(
+    repository: &VaultRepository,
+    draft: &RuntimeProfileDraft,
+) -> Result<AppRuntime, String> {
+    let target = validated_runtime_target(&draft.base_url, &draft.model)?;
+    let bearer_key = match &draft.api_key_change {
+        RuntimeProfileApiKeyChange::Keep => repository
+            .runtime_profile()
+            .map_err(|error| error.to_string())?
+            .bearer_key()
+            .map(str::to_owned),
+        RuntimeProfileApiKeyChange::Replace(value) => Some(value.clone()),
+        RuntimeProfileApiKeyChange::Clear => None,
+    };
+    runtime_from_target(target, bearer_key)
+}
+
+fn validated_runtime_target(base_url: &str, model: &str) -> Result<RuntimeTarget, String> {
+    RuntimeTarget::new(base_url, model.to_owned())
+        .map_err(|_| "runtime profile is invalid".to_owned())
+}
+
+fn runtime_from_target(
+    target: RuntimeTarget,
+    bearer_key: Option<String>,
+) -> Result<AppRuntime, String> {
+    let transport = HttpResponsesTransport::new(bearer_key)
+        .map_err(|_| "runtime transport could not be initialized".to_owned())?;
+    Ok(Box::new(OpenAiResponsesRuntime::new(
+        target,
+        transport,
+        RUNTIME_TIMEOUT,
+    )))
+}
+
+fn save_runtime_profile_from_core<F>(
+    core: &mut AppCore,
+    draft: &RuntimeProfileDraft,
+    persist: F,
+) -> Result<RuntimeProfileView, String>
+where
+    F: FnOnce(
+        &mut VaultRepository,
+        &RuntimeProfileDraft,
+    ) -> Result<VaultRuntimeProfileView, String>,
+{
+    let candidate = runtime_from_draft(core.repository(), draft)?;
+    let persisted = persist(core.repository_mut(), draft)?;
+    let response = RuntimeProfileView::from(&persisted);
+    drop(core.replace_runtime(candidate));
+    Ok(response)
+}
+
+fn runtime_profile_slot_error(slot: &HostSlot) -> String {
+    match slot {
+        HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+            VAULT_SETUP_INCOMPLETE.to_owned()
+        }
+        HostSlot::Locked(detail) => format!("vault is locked: {detail}"),
+        HostSlot::FailedClosed(detail) => format!("Core is closed: {detail}"),
+        HostSlot::Closed => "desktop host is already stopped".to_owned(),
+        HostSlot::Ready(_) => unreachable!("ready hosts are handled by the command path"),
+    }
+}
+
+fn sanitized_runtime_test_error(kind: RuntimeErrorKind) -> String {
+    match kind {
+        RuntimeErrorKind::Timeout => "runtime profile test timed out".to_owned(),
+        RuntimeErrorKind::Unavailable => "runtime profile is unavailable".to_owned(),
+        RuntimeErrorKind::InvalidResponse => {
+            "runtime profile returned an invalid strict response".to_owned()
+        }
+        RuntimeErrorKind::Other => "runtime profile test failed".to_owned(),
     }
 }
 
@@ -2838,4 +3020,6 @@ mod tests {
         assert_eq!(rejected.reason, Some("UNSUPPORTED_FILE_TYPE"));
         assert!(repository.statuses.is_empty());
     }
+
+    mod runtime_profile;
 }

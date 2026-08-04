@@ -92,6 +92,20 @@ set_capture_paused(paused) -> CaptureStatusView
 
 S29 不新增 WebView command。浏览扩展只访问固定来源、仅环回、当前进程令牌保护的独立 HTTP 入口；入口线程调用 `ManagedHost` 的当前开放宿主会话，不进入主窗口 invoke handler 或 capability。
 
+S06R-3 只在同一白名单边界追加：
+
+```text
+get_runtime_profile() -> RuntimeProfileView
+test_runtime_profile(draft) -> RuntimeProfileTestView
+save_runtime_profile(draft) -> RuntimeProfileView
+
+draft.apiKeyChange = { action: KEEP }
+                   | { action: REPLACE, value: secret }
+                   | { action: CLEAR }
+```
+
+`RuntimeProfileView` 只含 Base URL、模型、Key 存在状态和不会构成完整短 Key 的末四位；草稿只可反序列化进可信宿主，不能序列化回 WebView，`REPLACE` 值在草稿析构时清零。`test` 在宿主单写锁内用固定合成输入执行一次严格分类，不写 Vault、不替换活动运行时，并把 provider 正文和认证错误压缩为固定失败类别。`save` 在同一锁内先构造候选运行时，再原子提交 Vault，最后以不可失败的内存替换完成切换；因此在途请求完整使用旧档案，保存返回后的下一请求完整使用新档案。
+
 命令参数和返回值只能是有界结构化数据。WebView 不接收 Vault Key、Recovery Key、数据库或 repository 句柄、模型 bearer token、任意路径、通用文件 API、shell、HTTP 或进程能力。
 
 ## 6. Windows 测试方案
@@ -109,5 +123,6 @@ S29 不新增 WebView command。浏览扩展只访问固定来源、仅环回、
 | 采集恢复 | 崩溃后活动只保留至最后观测点，之后为 `CRASH` 空缺；关窗隐藏期间采集线程与宿主会话继续。 |
 | 浏览器采集 | 环回服务只接受 manifest 公钥派生的固定扩展来源和当前进程令牌；相同提交幂等、冲突和陈旧会话拒绝，绑定或扩展断开不影响 Core，主窗口 capability 不扩张。 |
 | 扩展权限与恢复 | manifest 权限与实际 API 集合相等；正文只在本人按来源授权时读取，撤销清理未提交正文；失败队列跨浏览器重启保留且满足去重、128 项与 4 MiB 上限。 |
+| 运行时档案 | 测试零持久化/零切换且错误脱敏；保存失败保留旧档案和运行时；保存成功后的下一请求与重启使用新档案；在途请求与保存串行且不混用配置。 |
 
 纯生命周期转换和 SQLCipher 重启/故障注入由 Rust 自动化测试覆盖；Tauri 窗口、托盘、单实例与自启动在 Windows 上使用打包后的 smoke harness 验证，前端使用类型检查与组件测试验证 command 调用和错误呈现。

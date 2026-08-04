@@ -395,6 +395,15 @@ where
         &self.runtime
     }
 
+    /// Replaces the active inference runtime without disturbing repository or
+    /// clock state.
+    ///
+    /// The caller must finish all fallible preparation before invoking this
+    /// method; the in-memory swap itself cannot fail.
+    pub fn replace_runtime(&mut self, runtime: T) -> T {
+        std::mem::replace(&mut self.runtime, runtime)
+    }
+
     #[must_use]
     pub fn into_parts(self) -> (R, T, C) {
         (self.repository, self.runtime, self.clock)

@@ -1,5 +1,18 @@
 # 代码链路
 
+## 2026-08-04 S06R-3 宿主热切换与严格测试连接
+
+**触达**:
+- `apps/desktop/src-tauri/src/state.rs:RuntimeProfileDraft/RuntimeProfileView/ManagedHost::{get_runtime_profile,test_runtime_profile,save_runtime_profile}/HostCore::open_with_key/runtime_from_profile/save_runtime_profile_from_core` — 宿主从 Vault 单档案启动；测试只发送固定合成严格分类；保存按候选构造、Vault 提交、无失败运行时替换顺序执行。
+- `crates/runtime-gateway/src/transport.rs:HttpResponsesTransport::new` — 在任何可能失败的 HTTP client 构造前把候选 bearer 包进清零内存，覆盖测试与热切换候选的失败路径。
+- `crates/core/src/memory_loop.rs:MemoryCore::replace_runtime` — 在不移动 repository 与 clock 的前提下提供不可失败的活动运行时交换原语。
+- `apps/desktop/src-tauri/src/lib.rs:{get_runtime_profile,test_runtime_profile,save_runtime_profile}`、`apps/desktop/src-tauri/Cargo.toml:zeroize` — 注册三个领域白名单 command；完整 Key 草稿只反序列化进 Rust，并在析构时清零，响应只使用脱敏视图或固定测试结果。
+- `apps/desktop/src-tauri/src/state/tests/runtime_profile.rs` — 覆盖测试零持久化/零切换、错误脱敏、保存失败保留旧状态、保存后下一请求与重启、新旧配置并发不混用。
+- `docs/architecture.md:§3.6/§9.6/§9.7`、`docs/host-lifecycle-v1.md:§5/§6` — 同步单档案启动、宿主锁顺序、WebView command 与测试门禁。
+
+**入口**：WebView 可调用 `get_runtime_profile`、`test_runtime_profile({ draft })`、`save_runtime_profile({ draft })`；实际密钥读取、严格请求、Vault 更新和运行时替换全部留在 `ManagedHost` 单写锁内。
+**测试**：desktop 30/30、Core 42/42、runtime-gateway 27/27、Vault 116/116；四 crate all-targets Clippy `-D warnings` 通过。
+
 ## 2026-08-04 S06R-2 SQLCipher 单档案与 write-only 密钥
 
 **触达**:

@@ -886,6 +886,7 @@ dependencies = [
  "tempfile",
  "url",
  "vault",
+ "zeroize",
 ]
 
 [[package]]

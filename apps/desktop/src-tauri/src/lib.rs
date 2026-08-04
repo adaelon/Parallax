@@ -19,8 +19,8 @@ use state::{
     ActiveSharedAgreementView, ActivityTimelineEntryView, CaptureStatusView,
     ConversationTurnResult, ConversationTurnView, HostStatusView, IdentityStateView,
     ImportContextFileView, ManagedHost, RecoveryKeyView, ReflectionInvitationDecisionView,
-    ReflectionInvitationView, SharedAgreementResolutionView, SharedAgreementRevisionView,
-    SharedExperienceCeremonyView,
+    ReflectionInvitationView, RuntimeProfileDraft, RuntimeProfileTestView, RuntimeProfileView,
+    SharedAgreementResolutionView, SharedAgreementRevisionView, SharedExperienceCeremonyView,
 };
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
@@ -54,6 +54,36 @@ struct UpdateAvailability {
 #[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
 fn get_host_status(host: tauri::State<'_, ManagedHost>) -> HostStatusView {
     host.status()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn get_runtime_profile(host: tauri::State<'_, ManagedHost>) -> Result<RuntimeProfileView, String> {
+    host.get_runtime_profile()
+}
+
+#[tauri::command]
+async fn test_runtime_profile(
+    app: AppHandle,
+    draft: RuntimeProfileDraft,
+) -> Result<RuntimeProfileTestView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>().test_runtime_profile(&draft)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn save_runtime_profile(
+    app: AppHandle,
+    draft: RuntimeProfileDraft,
+) -> Result<RuntimeProfileView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>().save_runtime_profile(&draft)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -401,6 +431,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         })
         .invoke_handler(tauri::generate_handler![
             get_host_status,
+            get_runtime_profile,
+            test_runtime_profile,
+            save_runtime_profile,
             initialize_vault,
             confirm_recovery_key_saved,
             get_capture_status,
