@@ -158,6 +158,27 @@ function Assert-ExactIdSet {
     }
 }
 
+function Assert-RequiredEvidenceCoverage {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Rows,
+        [Parameter(Mandatory = $true)][hashtable]$RequiredEvidenceByRow
+    )
+
+    foreach ($rowId in $RequiredEvidenceByRow.Keys) {
+        $matching = @($Rows | Where-Object { $_.Id -eq $rowId })
+        if ($matching.Count -ne 1) {
+            throw "required evidence row is missing or duplicated: $rowId"
+        }
+        $missing = @(
+            $RequiredEvidenceByRow[$rowId] |
+                Where-Object { $_ -notin $matching[0].Evidence }
+        )
+        if ($missing.Count -gt 0) {
+            throw "required S06R evidence is missing from ${rowId}: $($missing -join ',')"
+        }
+    }
+}
+
 function Test-AcceptanceMatrix {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
@@ -209,6 +230,17 @@ function Test-AcceptanceMatrix {
         if ($undefined.Count -gt 0) {
             throw "matrix row $($row.Id) references undefined evidence: $($undefined -join ',')"
         }
+    }
+
+    Assert-RequiredEvidenceCoverage -Rows $rows -RequiredEvidenceByRow @{
+        "DET-30" = @("EV-RUNTIME-PROFILE")
+        "DET-31" = @("EV-RUNTIME-PROFILE")
+        "FR-07" = @("EV-RUNTIME-PROFILE")
+        "ADR-0053" = @("EV-RUNTIME-PROFILE")
+        "THR-07" = @("EV-RUNTIME-PROFILE")
+        "MIG-01" = @("EV-SCHEMA", "EV-RUNTIME-PROFILE")
+        "MIG-03" = @("EV-RUNTIME-PROFILE")
+        "MIG-05" = @("EV-RUNTIME-PROFILE")
     }
 
     return [pscustomobject]@{

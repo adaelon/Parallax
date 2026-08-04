@@ -2105,15 +2105,16 @@ S30 不新增 schema：删除重放消费 S19 schema v16 的 `deletion_intents`�
 docs/system-acceptance-v1.md
   -> 33 个产品确定性判据
   -> FR-01..FR-12
-  -> 49 个 accepted ADR
+  -> 50 个 accepted ADR
   -> 8 个威胁边界 + 5 个迁移契约
+  -> EV-RUNTIME-PROFILE 强制覆盖 S06R 档案、密钥、热切换与恢复
 scripts/run-system-acceptance.ps1
-  -> 精确集合/证据外键 + G10 隐私 + 静态边界
+  -> 精确集合/证据外键 + S06R 必需证据 + G10 隐私 + 静态边界
   -> Rust workspace + desktop + browser extension
   -> Tauri release -> versioned NSIS -> SHA-256 -> isolated install smoke
   -> ephemeral bundle.meta seed -> installed exe must create self.db
 ```
 
-G10 真实资料和 S32 观察记录只能位于仓库外或 `/.local/`；仓库只保留合成 fixture、协议和聚合结果。验收 runner 只记步骤、耗时、版本、文件大小与 SHA-256，中间 JSON 留在被忽略的 `/.local/system-acceptance/`。
+G10 真实资料和 S32 观察记录只能位于仓库外或 `/.local/`；仓库只保留合成 fixture、协议和聚合结果。S06R-5 把 schema v26 默认档案与中断回滚、`KEEP/REPLACE/CLEAR` 和 WebView write-only Key、Recovery Set 完整档案恢复、严格合成测试连接、提交后热切换、重启及并发隔离注册为 `EV-RUNTIME-PROFILE`；矩阵门禁要求 ADR-0053 及相应 DET/FR/THR/MIG 行显式引用该证据，不能只依赖全仓测试偶然经过。验收 runner 只记步骤、耗时、版本、文件大小与 SHA-256，中间 JSON 留在被忽略的 `/.local/system-acceptance/`。
 
 S31 本地构建只产生 NSIS 安装包，`createUpdaterArtifacts=false`。安装烟测用不打包、不输出 Recovery Key 的示例仅预置 `bundle.meta`，随后要求安装版 exe 自己创建 `self.db`；“进程仍存活”不再等价于 Vault 已打开。签名升级仍保持 G04 的 HTTPS endpoint + 内嵌公钥门禁；更新包只能在后续签名发布流水线同时提供静态 updater 配置与仓库外私钥时生成，不得为本地验收伪造签名材料。S31 不改变 schema 或领域语义。

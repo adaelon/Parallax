@@ -40,9 +40,10 @@ $repositoryRoot = Get-EamRepositoryRoot
 $summary = Test-AcceptanceMatrix -RepositoryRoot $repositoryRoot
 Assert-Equal 33 $summary.DeterministicCriteria "DET count drifted"
 Assert-Equal 12 $summary.FunctionalRequirements "FR count drifted"
-Assert-Equal 49 $summary.AcceptedAdrs "accepted ADR count drifted"
+Assert-Equal 50 $summary.AcceptedAdrs "accepted ADR count drifted"
 Assert-Equal 8 $summary.ThreatBoundaries "threat count drifted"
 Assert-Equal 5 $summary.MigrationContracts "migration count drifted"
+Assert-Equal 33 $summary.EvidenceEntries "evidence registry count drifted"
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("eam-acceptance-tests-" + [guid]::NewGuid().ToString("N"))
 [System.IO.Directory]::CreateDirectory($tempRoot) | Out-Null
@@ -50,12 +51,42 @@ try {
     $matrixPath = Join-Path $repositoryRoot "docs/system-acceptance-v1.md"
     $brokenMatrix = Join-Path $tempRoot "broken-matrix.md"
     $matrixText = Read-Utf8Text -Path $matrixPath
-    $brokenText = [regex]::Replace($matrixText, '(?m)^\| ADR-0052 .*\r?\n', '', 1)
+    $brokenText = [regex]::Replace($matrixText, '(?m)^\| ADR-0053 .*\r?\n', '', 1)
     $encoding = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($brokenMatrix, $brokenText, $encoding)
     Assert-Throws {
         Test-AcceptanceMatrix -RepositoryRoot $repositoryRoot -MatrixPath $brokenMatrix | Out-Null
     } "missing accepted ADR did not fail the matrix gate"
+
+    $missingProfileEvidence = Join-Path $tempRoot "missing-runtime-profile-evidence.md"
+    $missingProfileText = [regex]::Replace(
+        $matrixText,
+        '(?m)^(\| ADR-0053 \|[^|]+\|)\s*[^|]+?(\| automated \|)$',
+        '$1 EV-RUNTIME, EV-VAULT, EV-DESKTOP $2',
+        1
+    )
+    if ($missingProfileText -eq $matrixText) {
+        throw "runtime profile rejection fixture did not change ADR-0053"
+    }
+    [System.IO.File]::WriteAllText($missingProfileEvidence, $missingProfileText, $encoding)
+    Assert-Throws {
+        Test-AcceptanceMatrix -RepositoryRoot $repositoryRoot -MatrixPath $missingProfileEvidence | Out-Null
+    } "ADR-0053 without runtime profile evidence did not fail the matrix gate"
+
+    $staleMigration = Join-Path $tempRoot "stale-runtime-profile-migration.md"
+    $staleMigrationText = [regex]::Replace(
+        $matrixText,
+        '(?m)^(\| MIG-01 \|[^|]+\|)\s*[^|]+?(\| automated \|)$',
+        '$1 EV-SCHEMA $2',
+        1
+    )
+    if ($staleMigrationText -eq $matrixText) {
+        throw "runtime profile rejection fixture did not change MIG-01"
+    }
+    [System.IO.File]::WriteAllText($staleMigration, $staleMigrationText, $encoding)
+    Assert-Throws {
+        Test-AcceptanceMatrix -RepositoryRoot $repositoryRoot -MatrixPath $staleMigration | Out-Null
+    } "schema v26 migration without runtime profile evidence did not fail the matrix gate"
 
     $fakeInstaller = Join-Path $tempRoot "evrything-about-me_0.1.0_x64-setup.exe"
     [System.IO.File]::WriteAllBytes($fakeInstaller, [byte[]](0, 1, 2, 3))

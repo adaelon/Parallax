@@ -1,5 +1,16 @@
 # 代码链路
 
+## 2026-08-04 S06R-5-1 运行时档案系统验收证据
+
+**触达**:
+- `scripts/run-system-acceptance.ps1:Assert-RequiredEvidenceCoverage/Test-AcceptanceMatrix` — 在精确集合与证据外键之外，强制 ADR-0053 及相关 DET/FR/THR/MIG 行显式引用运行时档案证据。
+- `scripts/tests/run-system-acceptance.tests.ps1:S06R matrix rejection fixtures` — 覆盖 ADR-0053 整行缺失、ADR-0053 未引用运行时档案证据、schema v26 迁移未引用运行时档案证据三类失败关闭。
+- `docs/system-acceptance-v1.md:EV-RUNTIME-PROFILE/DET-30..31/FR-07..10/ADR-0053/THR-01,07/MIG-01,03,05` — 注册档案迁移、write-only Key、恢复、严格测试连接、热切换、重启和并发隔离，并把旧 v25/ADR 计数推进到 v26/50。
+- `docs/architecture.md:§9.31` — 同步 S06R 必需证据门禁与完整系统验收数据流。
+
+**入口**：仓库根目录执行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-system-acceptance.ps1 -Mode Validate`；Full 模式在同一矩阵门禁后继续全仓验证、打包与安装烟测。
+**测试**：脚本自测通过，并证明三类 S06R 缺证据矩阵会拒绝；Vault 档案 3/3、恢复 1/1、desktop host 运行时档案 6/6、React 设置 5/5 及 `Validate` 全绿。
+
 ## 2026-08-04 S06R-4 本地设置面板
 
 **触达**:

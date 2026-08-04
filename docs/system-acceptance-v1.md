@@ -30,8 +30,9 @@
 | EV-RETRIEVAL | `cargo test -p retrieval`; `cargo test -p vault --test retrieval_persistence` | 全文/向量/时间/关系/记忆召回、权威回读与冻结窗口 | automated |
 | EV-UNDERSTANDING | `cargo test -p understanding`; `cargo test -p vault --test understanding_persistence` | 有限触发、显式来源、可重建投影与失效 | automated |
 | EV-RUNTIME | `cargo test -p runtime-gateway --test runtime_contract` | 本地/云端等价 contract、最小输出、HTTPS 与结构化白名单 | automated |
+| EV-RUNTIME-PROFILE | `cargo test -p vault --test runtime_profile_persistence`; `cargo test -p vault --test backup_recovery encrypted_snapshot_round_trips_authority_and_rebuilds_indexes -- --exact`; `cargo test -p desktop-app runtime_profile`; `npm test -- App.test.tsx -t "S06R-4 local runtime settings"` in `apps/desktop` | v25→v26 默认档案、`KEEP/REPLACE/CLEAR` 与 write-only Key、Recovery Set 完整恢复、严格合成测试、提交后热切换、重启和并发隔离 | automated |
 | EV-VAULT | `cargo test -p vault --test encrypted_repository`; `cargo test -p vault --test windows_unlock`; `cargo test -p vault --lib` | SQLCipher、对象 AEAD、DPAPI/恢复密钥、确认前零写入、错误密钥、清零与故障注入 | automated |
-| EV-SCHEMA | `cargo test -p vault schema::tests` | schema v1→v25 逐版事务迁移、中断回滚与数据回填 | automated |
+| EV-SCHEMA | `cargo test -p vault schema::tests` | schema v1→v26 逐版事务迁移、中断回滚与数据回填 | automated |
 | EV-HOST | `cargo test -p desktop-host`; `cargo test -p desktop-app` | 首次初始化状态机、单实例、关窗隐藏、安全退出、更新失败回复与白名单投影 | automated |
 | EV-WIN-CAPTURE | `cargo test -p capture-windows`; `cargo test -p vault --test capture_persistence` | 前台/空闲元数据、暂停、崩溃空缺与不伪造活动 | automated |
 | EV-BROWSER | `cargo test -p capture-browser`; `cargo test -p vault --test browser_capture_persistence` | 固定扩展来源、环回、进程令牌、范围与幂等持久化 | automated |
@@ -40,7 +41,7 @@
 | EV-BACKUP | `cargo test -p backup`; `cargo test -p vault --test backup_recovery` | 认证快照、最新删除头、遗忘重放、索引重建与 Vault Key 轮换 | automated |
 | EV-STATIC | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo check -p desktop-app --all-targets` | 格式、lint、全目标编译与静态安全边界 | automated |
 | EV-PRIVACY | `scripts/run-system-acceptance.ps1 -Mode Validate` | G10 ignore、tracked 私有路径、常见密钥/令牌与本机用户路径扫描 | automated |
-| EV-MATRIX | `scripts/run-system-acceptance.ps1 -Mode Validate` | 33 DET、12 FR、48 accepted ADR、8 THR、5 MIG 精确集合与证据外键 | automated |
+| EV-MATRIX | `scripts/run-system-acceptance.ps1 -Mode Validate` | 33 DET、12 FR、50 accepted ADR、8 THR、5 MIG 精确集合、S06R 强制证据与证据外键 | automated |
 | EV-PACKAGE | `npm run tauri -- build`; `scripts/run-system-acceptance.ps1 -Mode Smoke` | 版本一致、NSIS 产物、SHA-256、安装版真实创建加密数据库、退出/卸载烟雾 | automated |
 
 ## 3. 产品第 6.1 节确定性验收
@@ -76,8 +77,8 @@
 | DET-27 | 遗忘传播 | EV-FORGET, EV-BACKUP | automated |
 | DET-28 | 身份连续 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-VAULT | automated |
 | DET-29 | 对话证据 | EV-CORE-MEMORY, EV-DESKTOP, EV-FORGET | automated |
-| DET-30 | 模型迁移 | EV-CORE-IDENTITY, EV-RUNTIME | automated |
-| DET-31 | 数据边界 | EV-VAULT, EV-RUNTIME | automated |
+| DET-30 | 模型迁移 | EV-CORE-IDENTITY, EV-RUNTIME, EV-RUNTIME-PROFILE | automated |
+| DET-31 | 数据边界 | EV-VAULT, EV-RUNTIME, EV-RUNTIME-PROFILE | automated |
 | DET-32 | 内容隔离 | EV-MARKDOWN, EV-INGESTION, EV-RUNTIME | automated |
 | DET-33 | 威胁边界 | EV-VAULT, EV-BROWSER, EV-EXTENSION, EV-PRIVACY | automated |
 
@@ -91,10 +92,10 @@
 | FR-04 | 时间化事实账本 | EV-CORE-MEMORY, EV-CORRECTION, EV-SHARED | automated |
 | FR-05 | 全库检索与工作上下文 | EV-RETRIEVAL, EV-UNDERSTANDING | automated |
 | FR-06 | 长期记忆维护 | EV-MEMORY, EV-DISPUTE, EV-PATTERN, EV-CORRECTION, EV-FORGET | automated |
-| FR-07 | 第二自我运行时 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-REFLECTION, EV-RUNTIME | automated |
-| FR-08 | 持续对话界面 | EV-DESKTOP, EV-SHARED, EV-DISPUTE | automated |
+| FR-07 | 第二自我运行时 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-REFLECTION, EV-RUNTIME, EV-RUNTIME-PROFILE | automated |
+| FR-08 | 持续对话界面 | EV-DESKTOP, EV-SHARED, EV-DISPUTE, EV-RUNTIME-PROFILE | automated |
 | FR-09 | 纠错与遗忘 | EV-CORRECTION, EV-FORGET, EV-BACKUP | automated |
-| FR-10 | 本地加密与恢复 | EV-VAULT, EV-BACKUP | automated |
+| FR-10 | 本地加密与恢复 | EV-VAULT, EV-BACKUP, EV-RUNTIME-PROFILE | automated |
 | FR-11 | 不可信内容隔离 | EV-INGESTION, EV-MARKDOWN, EV-BROWSER, EV-RUNTIME | automated |
 | FR-12 | 首版威胁边界 | EV-VAULT, EV-RUNTIME, EV-BROWSER, EV-EXTENSION, EV-PRIVACY | automated |
 
@@ -151,29 +152,30 @@
 | ADR-0050 | 固定来源环回浏览器采集 | EV-BROWSER, EV-EXTENSION | automated |
 | ADR-0051 | 历史备份携带最新删除头 | EV-BACKUP | automated |
 | ADR-0052 | 首次创建一次性展示恢复密钥 | EV-VAULT, EV-HOST, EV-DESKTOP | automated |
+| ADR-0053 | 运行时采用 Vault 单档案热切换 | EV-RUNTIME-PROFILE, EV-VAULT, EV-DESKTOP | automated |
 
 ## 6. 威胁边界
 
 | ID | 威胁或声明边界 | 自动化证据 | 状态 |
 | --- | --- | --- | --- |
-| THR-01 | 丢失/脱机复制的保险库与备份不泄漏正文 | EV-VAULT, EV-BACKUP, EV-PRIVACY | automated |
+| THR-01 | 丢失/脱机复制的保险库与备份不泄漏正文或运行时密钥 | EV-VAULT, EV-BACKUP, EV-RUNTIME-PROFILE, EV-PRIVACY | automated |
 | THR-02 | 其他非管理员账户不能用错误密钥或非当前用户封装打开 Vault | EV-VAULT | automated |
 | THR-03 | 网络客户端不能远程控制 Core，云端凭据不走明文 HTTP | EV-BROWSER, EV-RUNTIME | automated |
 | THR-04 | 外部模型只获得冻结工作上下文，不获得 Vault、密钥或持久身份所有权 | EV-RETRIEVAL, EV-RUNTIME | automated |
 | THR-05 | 恶意 Markdown、文件边界和网页内容不执行、不触发工具、不进入控制通道 | EV-INGESTION, EV-MARKDOWN, EV-BROWSER, EV-RUNTIME | automated |
 | THR-06 | 浏览器扩展权限等于实际 API 需求，正文只在精确来源授权后读取 | EV-BROWSER, EV-EXTENSION | automated |
-| THR-07 | WebView 只有领域 command，关系约束不扩大宪法、安全或现实行动权 | EV-HOST, EV-CONSTRAINTS, EV-DESKTOP | automated |
+| THR-07 | WebView 只有领域 command，运行时密钥只写不回显，关系约束不扩大宪法、安全或现实行动权 | EV-HOST, EV-CONSTRAINTS, EV-DESKTOP, EV-RUNTIME-PROFILE | automated |
 | THR-08 | 测试和文档不声称抵抗已控制当前登录会话、管理员、内核或解锁设备物理攻击 | EV-MATRIX, EV-PRIVACY | automated |
 
 ## 7. 迁移契约
 
 | ID | 迁移边界 | 自动化证据 | 状态 |
 | --- | --- | --- | --- |
-| MIG-01 | SQLCipher schema v1→v25 逐版迁移在中断时整体回滚并可重开 | EV-SCHEMA | automated |
+| MIG-01 | SQLCipher schema v1→v26 逐版迁移在中断时整体回滚，并以单例默认档案重开 | EV-SCHEMA, EV-RUNTIME-PROFILE | automated |
 | MIG-02 | 有数据迁移回填 Claim/谱系/检索状态，派生索引损坏可从权威数据重建 | EV-SCHEMA, EV-VAULT, EV-RETRIEVAL | automated |
-| MIG-03 | 更换本地/云端推理运行时不转移自我包所有权或丢失身份链 | EV-CORE-IDENTITY, EV-RUNTIME | automated |
+| MIG-03 | 热切换运行时后端、模型或 Key 不转移自我包所有权、丢失身份链或混用配置 | EV-CORE-IDENTITY, EV-RUNTIME, EV-RUNTIME-PROFILE | automated |
 | MIG-04 | Markdown 解析库变化仍必须保持 `eam-markdown-v1` 等价输出，否则提升契约版本 | EV-MARKDOWN, EV-LINEAGE | automated |
-| MIG-05 | 历史备份恢复须先重放最新遗忘、重建索引并轮换 Vault Key | EV-BACKUP, EV-FORGET | automated |
+| MIG-05 | 历史备份恢复须先重放最新遗忘、恢复完整运行时档案、重建索引并轮换 Vault Key | EV-BACKUP, EV-FORGET, EV-RUNTIME-PROFILE | automated |
 
 ## 8. S31 运行记录
 
