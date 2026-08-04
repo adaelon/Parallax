@@ -16,15 +16,22 @@ pub enum RuntimeTargetKind {
     Cloud,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeProtocol {
+    OpenAiResponses,
+    DeepSeekChatCompletions,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeTarget {
     kind: RuntimeTargetKind,
+    protocol: RuntimeProtocol,
     base_url: Url,
     model: String,
 }
 
 impl RuntimeTarget {
-    /// Validates and normalizes one configurable Responses-compatible target.
+    /// Validates and normalizes one configurable runtime target.
     ///
     /// Remote targets require HTTPS. HTTP is accepted only for the literal
     /// loopback hosts `localhost`, `127.0.0.0/8`, and `::1`. Credentials,
@@ -45,10 +52,10 @@ impl RuntimeTarget {
             || base_url.chars().any(char::is_whitespace)
             || base_url.chars().any(char::is_control)
         {
-            return Err(RuntimeTargetError::new("invalid Responses Base URL"));
+            return Err(RuntimeTargetError::new("invalid runtime Base URL"));
         }
         let mut parsed = Url::parse(base_url)
-            .map_err(|_| RuntimeTargetError::new("invalid Responses Base URL"))?;
+            .map_err(|_| RuntimeTargetError::new("invalid runtime Base URL"))?;
         if parsed.cannot_be_a_base()
             || parsed.host().is_none()
             || !parsed.username().is_empty()
@@ -56,7 +63,7 @@ impl RuntimeTarget {
             || parsed.query().is_some()
             || parsed.fragment().is_some()
         {
-            return Err(RuntimeTargetError::new("invalid Responses Base URL"));
+            return Err(RuntimeTargetError::new("invalid runtime Base URL"));
         }
 
         let is_loopback = match parsed.host() {
@@ -67,7 +74,7 @@ impl RuntimeTarget {
         };
         match (parsed.scheme(), is_loopback) {
             ("https", _) | ("http", true) => {}
-            _ => return Err(RuntimeTargetError::new("invalid Responses Base URL")),
+            _ => return Err(RuntimeTargetError::new("invalid runtime Base URL")),
         }
 
         let model = model.into();
@@ -76,9 +83,7 @@ impl RuntimeTarget {
             || model.trim() != model
             || model.chars().any(char::is_control)
         {
-            return Err(RuntimeTargetError::new(
-                "invalid Responses model identifier",
-            ));
+            return Err(RuntimeTargetError::new("invalid runtime model identifier"));
         }
 
         let normalized_path = parsed.path().trim_end_matches('/').to_owned();
@@ -88,6 +93,11 @@ impl RuntimeTarget {
                 RuntimeTargetKind::Local
             } else {
                 RuntimeTargetKind::Cloud
+            },
+            protocol: if matches!(parsed.host(), Some(Host::Domain("api.deepseek.com"))) {
+                RuntimeProtocol::DeepSeekChatCompletions
+            } else {
+                RuntimeProtocol::OpenAiResponses
             },
             base_url: parsed,
             model,
@@ -100,19 +110,28 @@ impl RuntimeTarget {
     }
 
     #[must_use]
+    pub const fn protocol(&self) -> RuntimeProtocol {
+        self.protocol
+    }
+
+    #[must_use]
     pub fn base_url(&self) -> &str {
         self.base_url.as_str()
     }
 
     #[must_use]
-    pub fn responses_endpoint(&self) -> String {
+    pub fn endpoint(&self) -> String {
         let mut endpoint = self.base_url.clone();
-        let responses_path = if self.base_url.path() == "/" {
-            "/responses".to_owned()
-        } else {
-            format!("{}/responses", self.base_url.path())
+        let suffix = match self.protocol {
+            RuntimeProtocol::OpenAiResponses => "responses",
+            RuntimeProtocol::DeepSeekChatCompletions => "chat/completions",
         };
-        endpoint.set_path(&responses_path);
+        let endpoint_path = if self.base_url.path() == "/" {
+            format!("/{suffix}")
+        } else {
+            format!("{}/{suffix}", self.base_url.path())
+        };
+        endpoint.set_path(&endpoint_path);
         endpoint.into()
     }
 
@@ -285,7 +304,7 @@ impl fmt::Display for TransportError {
 
 impl Error for TransportError {}
 
-/// Sends one already-serialized Responses v2 request.
+/// Sends one request already serialized for the target's selected protocol.
 ///
 /// Authentication belongs to the host transport implementation. The trait
 /// intentionally exposes no repository or credential inspection capability.
@@ -298,13 +317,13 @@ pub trait ResponsesTransport {
     fn send(
         &mut self,
         target: &RuntimeTarget,
-        responses_endpoint: &str,
+        endpoint: &str,
         request_json: &str,
         timeout: Duration,
     ) -> Result<String, TransportError>;
 }
 
-/// Blocking HTTPS/loopback-HTTP transport for the Responses v2 endpoint.
+/// Blocking HTTPS/loopback-HTTP transport for a validated runtime endpoint.
 ///
 /// The optional bearer token is held in zeroizing memory and added only as an
 /// HTTP header, after the auditable request body has been recorded.
@@ -333,7 +352,7 @@ impl HttpResponsesTransport {
     }
 }
 
-/// Applies the frozen Responses v2 bearer-token field boundary without
+/// Applies the runtime bearer-token field boundary without
 /// constructing an HTTP client or retaining the secret.
 ///
 /// # Errors
@@ -355,13 +374,13 @@ impl ResponsesTransport for HttpResponsesTransport {
     fn send(
         &mut self,
         target: &RuntimeTarget,
-        responses_endpoint: &str,
+        endpoint: &str,
         request_json: &str,
         timeout: Duration,
     ) -> Result<String, TransportError> {
-        if target.responses_endpoint() != responses_endpoint {
+        if target.endpoint() != endpoint {
             return Err(TransportError::other(
-                "Responses endpoint does not match the validated target",
+                "runtime endpoint does not match the validated target",
             ));
         }
         let client = match target.kind() {
@@ -369,7 +388,7 @@ impl ResponsesTransport for HttpResponsesTransport {
             RuntimeTargetKind::Cloud => &self.remote_client,
         };
         let mut request = client
-            .post(responses_endpoint)
+            .post(endpoint)
             .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(request_json.to_owned());
@@ -403,11 +422,11 @@ impl ResponsesTransport for HttpResponsesTransport {
 
 fn map_http_error(error: &reqwest::Error) -> TransportError {
     if error.is_timeout() {
-        TransportError::timeout("Responses request timed out")
+        TransportError::timeout("runtime request timed out")
     } else if error.is_connect() {
-        TransportError::unavailable("Responses endpoint is unavailable")
+        TransportError::unavailable("runtime endpoint is unavailable")
     } else {
-        TransportError::other("Responses request failed")
+        TransportError::other("runtime request failed")
     }
 }
 
@@ -418,11 +437,11 @@ fn build_http_client(no_proxy: bool) -> Result<Client, TransportError> {
     }
     builder
         .build()
-        .map_err(|_| TransportError::other("Responses HTTP client construction failed"))
+        .map_err(|_| TransportError::other("runtime HTTP client construction failed"))
 }
 
 fn map_http_status(status: StatusCode) -> TransportError {
-    let message = format!("Responses endpoint returned HTTP {status}");
+    let message = format!("runtime endpoint returned HTTP {status}");
     if status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()

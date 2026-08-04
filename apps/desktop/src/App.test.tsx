@@ -235,6 +235,10 @@ describe("S06R-4 local runtime settings", () => {
     expect(password.type).toBe("password");
     expect(password.value).toBe("");
     expect(document.body.textContent).not.toContain(completeKeyThatMustNotRender);
+    expect(document.body.textContent).toContain(
+      "官方 DeepSeek 地址会自动使用 Chat Completions",
+    );
+    expect(document.body.textContent).toContain("/chat/completions");
     expect(document.activeElement).toBe(
       document.querySelector("#runtime-base-url"),
     );

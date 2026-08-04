@@ -212,7 +212,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 
 ### 3.6 模型运行时
 
-本地与远程模型实现同一 Responses 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格分类 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v2](runtime-contract-v2.md)。
+本地与远程模型实现同一 Core 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：默认适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格分类 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。S06D 对 URL 解析后的精确 host `api.deepseek.com` 派生 Chat Completions：发送 `messages` 与 `response_format=json_object`、显式关闭默认思考、从 `choices[0].message.content` 提取正文，再走同一严格领域解析；其他 host 继续使用 Responses。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v3](runtime-contract-v3.md)。
 
 ### 3.7 技术职责
 
@@ -1278,8 +1278,9 @@ Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用�
 
 ```text
 crates/runtime-gateway/src/
-  transport.rs          # 可复用 Base URL/模型/Key 校验、可选清零 bearer 与无重定向 HTTP
-  adapter.rs            # 追加 /responses、Responses v2 最小负载、严格 schema、外发记录和错误分类
+  transport.rs          # Base URL/模型/Key 校验、精确 host 协议选择、endpoint 与无重定向 HTTP
+  deepseek.rs           # Chat Completions 请求、JSON Object 提示、关闭思考和 content 提取
+  adapter.rs            # Responses 编码或 DeepSeek 分派、严格 schema、外发记录和错误分类
   fallback.rs           # 保留的 runtime 组合原语与回归夹具；桌面宿主不再接线固定双档案
 crates/vault/src/
   schema.rs             # v26 单例 runtime_profiles 与默认本地档案
@@ -1298,14 +1299,18 @@ apps/desktop/src/
 ```text
 OpenAiResponsesRuntime::classify_person_turn(evidence)
   -> validate/normalize owned Base URL + model
-  -> append /responses
-  -> record exact classification request
+  -> RuntimeTarget::protocol by exact normalized host
+  -> Responses: append /responses + strict json_schema request
+     DeepSeek: append /chat/completions + messages/json_object + thinking disabled
+  -> record exact provider request without credentials
   -> ResponsesTransport::send(timeout)
+  -> extract output_text or choices[0].message.content
   -> strict PersonTurnClassification
 
 OpenAiResponsesRuntime::respond(RuntimeRequest)
   -> serialize prompt + WorkingContext.evidence only
-  -> record exact response request without credentials
+  -> adapt and record exact provider request without credentials
+  -> extract protocol-specific structured JSON text
   -> parse free text, citations and propose_judgment
   -> preserve unknown operation name for Core rejection
 
@@ -1334,7 +1339,7 @@ React runtime settings open
   -> save_runtime_profile success clears Key input and refreshes redacted view
 ```
 
-任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 固定夹具继续产生等价领域输出。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v2](runtime-contract-v2.md)。结构化输出错误仍失败关闭；桌面宿主只认 Vault 单档案，不再读取 `OPENAI_API_KEY` 或 `EAM_*_RESPONSES_ENDPOINT`，也不再接线固定 fallback。schema v26 与 Repository 故障注入证明迁移/更新中断保持旧档案，Recovery Set 测试证明完整 Key 随加密数据库恢复且不出现在原始字节中；桌面集成测试进一步证明测试零副作用、保存失败保留旧运行时、保存后下一请求与重启使用新档案，以及请求中切换不会混用配置。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md) 和 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)。
+任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra`、Local `gpt-oss-20b` 与 DeepSeek `deepseek-v4-pro` 固定夹具产生等价领域输出。只有精确官方 DeepSeek host 选择 Chat Completions；相似 host 与自定义代理不被猜测。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v3](runtime-contract-v3.md)。结构化输出错误仍失败关闭；桌面宿主只认 Vault 单档案，不再读取 `OPENAI_API_KEY` 或 `EAM_*_RESPONSES_ENDPOINT`，也不再接线固定 fallback。schema v26 与 Repository 故障注入证明迁移/更新中断保持旧档案，Recovery Set 测试证明完整 Key 随加密数据库恢复且不出现在原始字节中；桌面集成测试进一步证明测试零副作用、保存失败保留旧运行时、保存后下一请求与重启使用新档案，以及请求中切换不会混用配置。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md)、[ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 和 [ADR-0054](adr/0054-deepseek-chat-completions-protocol-adapter.md)。
 
 ### 9.7 S07 桌面宿主与持续对话当前实现边界
 

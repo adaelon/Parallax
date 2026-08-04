@@ -13,4 +13,5 @@ status: accepted
 
 **命门**：两端只交换 G03 v1 contract；固定双档案与模型由 [ADR-0053](0053-vault-backed-configurable-responses-runtime-profile.md) 取代。
 **何时回头**：任一模型无法稳定实现同一严格结构化夹具，或 Responses 兼容层泄漏供应商状态时。
+**后续**：[ADR-0054](0054-deepseek-chat-completions-protocol-adapter.md) 为 DeepSeek 官方后端接受受限 Chat Completions 适配；其他后端仍受本决策约束。
 **展开**：[G03 Runtime Contract v1](../runtime-contract-v1.md)

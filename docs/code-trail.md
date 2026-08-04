@@ -1,5 +1,19 @@
 # 代码链路
 
+## 2026-08-04 S06D DeepSeek Chat Completions 协议适配
+
+**触达**:
+- `crates/runtime-gateway/src/transport.rs:RuntimeProtocol/RuntimeTarget::{new,endpoint}` — 仅对 URL 解析后的精确 `api.deepseek.com` 选择 Chat Completions，并保持其他 HTTPS/环回目标走 Responses。
+- `crates/runtime-gateway/src/deepseek.rs:{request_json,output_text}` — 把固定 instructions/input/schema 转为 system/user messages、JSON Object、关闭思考与非流式请求；只接受 `stop` 且非空的 choice 0 content。
+- `crates/runtime-gateway/src/adapter.rs:OpenAiResponsesRuntime::invoke/output_text` — 在同一外发记录和 Core 严格解析前后分派 Responses 与 DeepSeek wire encoding，不把凭据带入请求记录。
+- `crates/runtime-gateway/tests/runtime_contract.rs:deepseek_*`、`tests/fixtures/deepseek-*.json` — 固定协议等价、精确/相似 host、请求字段、45 秒调用方 timeout 保留及截断/空正文失败关闭。
+- `apps/desktop/src/App.tsx:runtime settings`、`apps/desktop/src/App.test.tsx:S06R-4` — 设置面板改为 API Base URL，并说明官方 DeepSeek 自动追加 `/chat/completions`、其他后端保持 `/responses`。
+- `docs/adr/0054-deepseek-chat-completions-protocol-adapter.md`、`docs/runtime-contract-v3.md`、`docs/architecture.md:§3.6/§9.6` — 固定协议选择、思考/超时策略、数据流和不扩张 Vault/Core 的边界。
+- `docs/system-acceptance-v1.md:EV-RUNTIME/ADR-0054`、`scripts/tests/run-system-acceptance.tests.ps1` — 把第 51 个 accepted ADR 映射到可执行 runtime contract 证据。
+
+**入口**：本人在现有运行时设置中填写 Base URL `https://api.deepseek.com`、模型 `deepseek-v4-pro` 与新 Key；测试或保存后的分类/回应自动使用 `/chat/completions`，无需 provider 下拉或 Vault migration。
+**测试**：红测先复现 DeepSeek `choices` 被 Responses parser 拒绝；修复后 runtime-gateway 30/30、Rust workspace、workspace all-targets Clippy `-D warnings`、桌面 React 19/19、TypeScript、生产构建及系统 `Validate`（矩阵/隐私/静态边界/Markdown 链接/diff）全绿。未执行 Full runner、NSIS 重建或真实 Key 网络调用。
+
 ## 2026-08-04 S06R-5-2 完整重验收与冻结构建
 
 **触达**:

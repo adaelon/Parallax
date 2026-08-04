@@ -40,7 +40,7 @@ $repositoryRoot = Get-EamRepositoryRoot
 $summary = Test-AcceptanceMatrix -RepositoryRoot $repositoryRoot
 Assert-Equal 33 $summary.DeterministicCriteria "DET count drifted"
 Assert-Equal 12 $summary.FunctionalRequirements "FR count drifted"
-Assert-Equal 50 $summary.AcceptedAdrs "accepted ADR count drifted"
+Assert-Equal 51 $summary.AcceptedAdrs "accepted ADR count drifted"
 Assert-Equal 8 $summary.ThreatBoundaries "threat count drifted"
 Assert-Equal 5 $summary.MigrationContracts "migration count drifted"
 Assert-Equal 33 $summary.EvidenceEntries "evidence registry count drifted"

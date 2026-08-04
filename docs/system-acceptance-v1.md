@@ -29,7 +29,7 @@
 | EV-OBSIDIAN | `cargo test -p source-obsidian`; `cargo test -p vault --test obsidian_reconciliation`; `cargo test -p vault --test obsidian_source_persistence` | 只读扫描、配置排除、移除/离线与结构查询 | automated |
 | EV-RETRIEVAL | `cargo test -p retrieval`; `cargo test -p vault --test retrieval_persistence` | 全文/向量/时间/关系/记忆召回、权威回读与冻结窗口 | automated |
 | EV-UNDERSTANDING | `cargo test -p understanding`; `cargo test -p vault --test understanding_persistence` | 有限触发、显式来源、可重建投影与失效 | automated |
-| EV-RUNTIME | `cargo test -p runtime-gateway --test runtime_contract` | 本地/云端等价 contract、最小输出、HTTPS 与结构化白名单 | automated |
+| EV-RUNTIME | `cargo test -p runtime-gateway --test runtime_contract` | Responses/DeepSeek 等价 contract、最小输出、HTTPS 与结构化白名单 | automated |
 | EV-RUNTIME-PROFILE | `cargo test -p vault --test runtime_profile_persistence`; `cargo test -p vault --test backup_recovery encrypted_snapshot_round_trips_authority_and_rebuilds_indexes -- --exact`; `cargo test -p desktop-app runtime_profile`; `npm test -- App.test.tsx -t "S06R-4 local runtime settings"` in `apps/desktop` | v25→v26 默认档案、`KEEP/REPLACE/CLEAR` 与 write-only Key、Recovery Set 完整恢复、严格合成测试、提交后热切换、重启和并发隔离 | automated |
 | EV-VAULT | `cargo test -p vault --test encrypted_repository`; `cargo test -p vault --test windows_unlock`; `cargo test -p vault --lib` | SQLCipher、对象 AEAD、DPAPI/恢复密钥、确认前零写入、错误密钥、清零与故障注入 | automated |
 | EV-SCHEMA | `cargo test -p vault schema::tests` | schema v1→v26 逐版事务迁移、中断回滚与数据回填 | automated |
@@ -41,7 +41,7 @@
 | EV-BACKUP | `cargo test -p backup`; `cargo test -p vault --test backup_recovery` | 认证快照、最新删除头、遗忘重放、索引重建与 Vault Key 轮换 | automated |
 | EV-STATIC | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo check -p desktop-app --all-targets` | 格式、lint、全目标编译与静态安全边界 | automated |
 | EV-PRIVACY | `scripts/run-system-acceptance.ps1 -Mode Validate` | G10 ignore、tracked 私有路径、常见密钥/令牌与本机用户路径扫描 | automated |
-| EV-MATRIX | `scripts/run-system-acceptance.ps1 -Mode Validate` | 33 DET、12 FR、50 accepted ADR、8 THR、5 MIG 精确集合、S06R 强制证据与证据外键 | automated |
+| EV-MATRIX | `scripts/run-system-acceptance.ps1 -Mode Validate` | 33 DET、12 FR、51 accepted ADR、8 THR、5 MIG 精确集合、S06R 强制证据与证据外键 | automated |
 | EV-PACKAGE | `npm run tauri -- build`; `scripts/run-system-acceptance.ps1 -Mode Smoke` | 版本一致、NSIS 产物、SHA-256、安装版真实创建加密数据库、退出/卸载烟雾 | automated |
 
 ## 3. 产品第 6.1 节确定性验收
@@ -153,6 +153,7 @@
 | ADR-0051 | 历史备份携带最新删除头 | EV-BACKUP | automated |
 | ADR-0052 | 首次创建一次性展示恢复密钥 | EV-VAULT, EV-HOST, EV-DESKTOP | automated |
 | ADR-0053 | 运行时采用 Vault 单档案热切换 | EV-RUNTIME-PROFILE, EV-VAULT, EV-DESKTOP | automated |
+| ADR-0054 | DeepSeek 官方后端使用 Chat Completions 适配 | EV-RUNTIME | automated |
 
 ## 6. 威胁边界
 

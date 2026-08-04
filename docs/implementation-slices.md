@@ -543,6 +543,18 @@ save(draft) -> validate/build -> Vault commit -> replace active runtime -> Runti
 
 **确定性完成**：相关定向测试与 `scripts/run-system-acceptance.ps1 -Mode Full` 全绿；安装、首次创建、配置、热切换、重启和卸载烟测通过；S31 记录、checkpoint 与纵向模板指向同一个新构建，S32 门禁才重新打开。
 
+### S06D DeepSeek Chat Completions 协议适配
+
+**状态**：源码实现完成；全仓 Rust、桌面 React/类型/生产构建及 Validate 门禁已通过。现有 S32 冻结安装包早于本片，不包含 DeepSeek 适配；替换冻结构建前仍须重新执行 Full runner 与安装烟测。
+
+**依赖/输入**：[ADR-0054](adr/0054-deepseek-chat-completions-protocol-adapter.md)、[G03 Runtime Contract v3](runtime-contract-v3.md)、S06R Vault 单档案与 45 秒严格合成测试。
+
+**新增/输出**：`RuntimeTarget` 仅对精确官方 host `api.deepseek.com` 选择 `/chat/completions`；独立适配层把固定 instructions、input 与 schema 转为 system/user messages 和 `json_object`，关闭默认思考，并把 `choices[0].message.content` 送回既有严格解析。
+
+**明确不做**：按模型名猜协议、自定义代理自动识别、Vault/provider 字段迁移、开放思考参数、增加全局超时或放宽 Core schema。
+
+**确定性完成**：Responses 与 DeepSeek fixtures 产生相同领域结果；精确/相似 host、请求字段、外发记录、非 `stop` 与空 content 失败关闭均有自动化覆盖；设置面板说明真实 endpoint 规则，accepted ADR 矩阵保持闭合。
+
 ### S32 冻结构建纵向验收与首版发布结论
 
 **状态**：锁定；不得使用 ADR-0053 之前的 S31 安装包开始或延续观察。

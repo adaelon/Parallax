@@ -2,6 +2,8 @@
 
 本契约冻结 S06R-1 的可配置 Responses 运行时边界。它取代 v1 的固定 Cloud/Local 目标、固定模型与完整 endpoint；Core 端口、最小数据出口、严格结构化 schema、操作白名单和失败关闭语义保持不变。
 
+当前实现的协议选择边界已由 [G03 Runtime Contract v3](runtime-contract-v3.md) 扩展；本文件保留 v2 的历史 Responses 契约。
+
 ## 1. 可配置目标
 
 ```text

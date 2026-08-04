@@ -13,4 +13,5 @@ status: accepted
 
 **命门**：WebView 只写密钥，读取仅得状态与末四位；密钥随加密 `self.db` 和 Recovery Set 迁移。
 **何时回头**：本人明确需要多个并存档案，或 Responses 之外的协议族。
+**后续**：[ADR-0054](0054-deepseek-chat-completions-protocol-adapter.md) 只按官方 DeepSeek host 派生协议，不扩大 Vault 档案字段。
 **展开**：[S06R 实施切片](../implementation-slices.md#s06r-可配置运行时档案边界修订)

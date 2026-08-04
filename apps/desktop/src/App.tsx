@@ -888,7 +888,8 @@ export function App() {
             <p className="eyebrow">Vault 单档案</p>
             <h2 id="runtime-settings-title">运行时设置</h2>
             <p className="ceremony-note runtime-settings-intro">
-              配置兼容 Responses 的 Base URL、模型和可选 Bearer Key。完整 Key 只写入本次草稿，读取时不会回显。
+              配置 API Base URL、模型和可选 Bearer Key。官方 DeepSeek 地址会自动使用 Chat Completions；其他地址保持 Responses。完整 Key
+              只写入本次草稿，读取时不会回显。
             </p>
             {runtimeProfileLoading ? (
               <>
@@ -939,7 +940,7 @@ export function App() {
                   void saveRuntimeProfile();
                 }}
               >
-                <label htmlFor="runtime-base-url">Responses Base URL</label>
+                <label htmlFor="runtime-base-url">API Base URL</label>
                 <input
                   autoComplete="url"
                   disabled={runtimeProfileAction !== null}
@@ -951,7 +952,7 @@ export function App() {
                   value={runtimeBaseUrl}
                 />
                 <p className="runtime-field-note">
-                  应用会规范化地址，并只追加一个 <code>/responses</code>。
+                  应用会规范化地址，并按后端只追加一个 <code>/responses</code> 或 <code>/chat/completions</code>。
                 </p>
 
                 <label htmlFor="runtime-model">模型 ID</label>

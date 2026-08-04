@@ -26,8 +26,8 @@ use eam_memory::{
 };
 use eam_runtime_gateway::{
     FallbackRuntime, HttpResponsesTransport, InvocationKind, OpenAiResponsesRuntime,
-    OutboundContextSource, ResponsesTransport, RuntimeTarget, RuntimeTargetKind, TransportError,
-    TransportErrorKind,
+    OutboundContextSource, ResponsesTransport, RuntimeProtocol, RuntimeTarget, RuntimeTargetKind,
+    TransportError, TransportErrorKind,
 };
 use eam_vault::{VaultKey, VaultRepository};
 use serde_json::Value;
@@ -35,6 +35,9 @@ use tempfile::tempdir;
 
 const CLASSIFICATION_RESPONSE: &str = include_str!("fixtures/classification-response.json");
 const TURN_RESPONSE: &str = include_str!("fixtures/turn-response.json");
+const DEEPSEEK_CLASSIFICATION_RESPONSE: &str =
+    include_str!("fixtures/deepseek-classification-response.json");
+const DEEPSEEK_TURN_RESPONSE: &str = include_str!("fixtures/deepseek-turn-response.json");
 const UNSUPPORTED_OPERATION_RESPONSE: &str =
     include_str!("fixtures/unsupported-operation-response.json");
 const SHARED_EXPERIENCE_RESPONSE: &str = include_str!("fixtures/shared-experience-response.json");
@@ -69,7 +72,7 @@ const LOCAL_MODEL: &str = "gpt-oss-20b";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SeenCall {
-    responses_endpoint: String,
+    endpoint: String,
     request_json: String,
     timeout: Duration,
 }
@@ -100,12 +103,12 @@ impl ResponsesTransport for ScriptedTransport {
     fn send(
         &mut self,
         _target: &RuntimeTarget,
-        responses_endpoint: &str,
+        endpoint: &str,
         request_json: &str,
         timeout: Duration,
     ) -> Result<String, TransportError> {
         self.seen.push(SeenCall {
-            responses_endpoint: responses_endpoint.to_owned(),
+            endpoint: endpoint.to_owned(),
             request_json: request_json.to_owned(),
             timeout,
         });
@@ -130,6 +133,16 @@ fn local_runtime(
 ) -> OpenAiResponsesRuntime<ScriptedTransport> {
     OpenAiResponsesRuntime::new(
         RuntimeTarget::new("http://127.0.0.1:11434/v1", LOCAL_MODEL).unwrap(),
+        ScriptedTransport::new(replies),
+        TIMEOUT,
+    )
+}
+
+fn deepseek_runtime(
+    replies: impl IntoIterator<Item = Result<&'static str, TransportError>>,
+) -> OpenAiResponsesRuntime<ScriptedTransport> {
+    OpenAiResponsesRuntime::new(
+        RuntimeTarget::new("https://api.deepseek.com", "deepseek-v4-pro").unwrap(),
         ScriptedTransport::new(replies),
         TIMEOUT,
     )
@@ -293,6 +306,84 @@ fn local_and_cloud_adapters_produce_equivalent_domain_results_from_fixed_fixture
 }
 
 #[test]
+fn deepseek_chat_completions_adapter_preserves_the_strict_domain_contract() {
+    let responses_replies = [
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(TURN_RESPONSE),
+    ];
+    let deepseek_replies = [
+        Ok(DEEPSEEK_CLASSIFICATION_RESPONSE),
+        Ok(DEEPSEEK_CLASSIFICATION_RESPONSE),
+        Ok(DEEPSEEK_TURN_RESPONSE),
+    ];
+    let (responses_outcome, responses_claims, _) = run_contract(cloud_runtime(responses_replies));
+    let (deepseek_outcome, deepseek_claims, deepseek) =
+        run_contract(deepseek_runtime(deepseek_replies));
+
+    assert_eq!(deepseek_outcome, responses_outcome);
+    assert_eq!(deepseek_claims, responses_claims);
+    assert_eq!(deepseek.transport().seen().len(), 3);
+    assert!(deepseek.transport().seen().iter().all(|call| call.endpoint
+        == "https://api.deepseek.com/chat/completions"
+        && call.timeout == TIMEOUT));
+
+    let classification_request: Value =
+        serde_json::from_str(&deepseek.transport().seen()[0].request_json).unwrap();
+    assert_eq!(classification_request["model"], "deepseek-v4-pro");
+    assert_eq!(
+        classification_request["response_format"]["type"],
+        "json_object"
+    );
+    assert_eq!(classification_request["thinking"]["type"], "disabled");
+    assert_eq!(classification_request["stream"], false);
+    assert_eq!(classification_request["messages"][0]["role"], "system");
+    assert_eq!(classification_request["messages"][1]["role"], "user");
+    let system_message = classification_request["messages"][0]["content"]
+        .as_str()
+        .unwrap();
+    assert!(system_message.contains("eam_person_turn_classification_v1"));
+    assert!(system_message.contains("JSON Schema"));
+    assert!(system_message.contains("classification"));
+    assert!(system_message.contains(r#"{"classification":"question"}"#));
+    assert!(
+        classification_request["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("只选择这一条")
+    );
+    for responses_only_field in ["instructions", "input", "reasoning", "store", "text"] {
+        assert!(classification_request.get(responses_only_field).is_none());
+    }
+    assert_eq!(
+        deepseek.disclosures()[0].request_json(),
+        deepseek.transport().seen()[0].request_json
+    );
+}
+
+#[test]
+fn deepseek_non_stop_or_empty_completion_fails_closed() {
+    for response in [
+        r#"{"choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":"{\"classification\":\"question\"}"}}]}"#,
+        r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":""}}]}"#,
+    ] {
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            deepseek_runtime([Ok(response)]),
+            IncrementingClock::new(1_650),
+        );
+        let error = core
+            .record_person_turn(SessionId::new("deepseek-invalid"), "必须失败关闭")
+            .expect_err("incomplete DeepSeek output must be invalid");
+        assert!(matches!(
+            error,
+            CoreError::Runtime(ref runtime_error)
+                if runtime_error.kind() == RuntimeErrorKind::InvalidResponse
+        ));
+    }
+}
+
+#[test]
 fn concrete_http_transport_appends_responses_and_keeps_optional_bearer_out_of_records() {
     let (local_endpoint, local_server) = serve_one_response(CLASSIFICATION_RESPONSE, None);
     let local_transport = HttpResponsesTransport::new(None).unwrap();
@@ -354,8 +445,9 @@ fn runtime_target_accepts_remote_https_and_loopback_http_only() {
     for (base_url, expected_kind) in accepted {
         let target = RuntimeTarget::new(base_url, "custom-model").unwrap();
         assert_eq!(target.kind(), expected_kind);
-        assert!(target.responses_endpoint().ends_with("/responses"));
-        assert!(!target.responses_endpoint().contains("//responses"));
+        assert_eq!(target.protocol(), RuntimeProtocol::OpenAiResponses);
+        assert!(target.endpoint().ends_with("/responses"));
+        assert!(!target.endpoint().contains("//responses"));
     }
 
     for base_url in [
@@ -373,6 +465,33 @@ fn runtime_target_accepts_remote_https_and_loopback_http_only() {
         );
     }
     assert!(RuntimeTarget::new("https://example.test/v1", "   ").is_err());
+}
+
+#[test]
+fn only_the_exact_official_deepseek_host_selects_chat_completions() {
+    for (base_url, expected_endpoint) in [
+        (
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/chat/completions",
+        ),
+        (
+            "https://api.deepseek.com/v1/",
+            "https://api.deepseek.com/v1/chat/completions",
+        ),
+    ] {
+        let target = RuntimeTarget::new(base_url, "deepseek-v4-pro").unwrap();
+        assert_eq!(target.protocol(), RuntimeProtocol::DeepSeekChatCompletions);
+        assert_eq!(target.endpoint(), expected_endpoint);
+    }
+
+    for base_url in [
+        "https://deepseek.example.test/v1",
+        "https://api.deepseek.com.evil.example/v1",
+    ] {
+        let target = RuntimeTarget::new(base_url, "deepseek-v4-pro").unwrap();
+        assert_eq!(target.protocol(), RuntimeProtocol::OpenAiResponses);
+        assert!(target.endpoint().ends_with("/responses"));
+    }
 }
 
 #[test]
@@ -397,7 +516,7 @@ fn custom_model_is_used_in_the_request_and_outbound_disclosure() {
     assert_eq!(request["model"], custom_model);
     assert_eq!(core.runtime().disclosures()[0].model(), custom_model);
     assert_eq!(
-        core.runtime().transport().seen()[0].responses_endpoint,
+        core.runtime().transport().seen()[0].endpoint,
         "https://runtime.example.test/openai/v1/responses"
     );
 }
@@ -408,9 +527,9 @@ fn redirect_is_rejected_without_exposing_the_bearer_secret() {
     let (base_url, server) = serve_one_redirect();
     let target = RuntimeTarget::new(base_url, "redirect-test-model").unwrap();
     let mut transport = HttpResponsesTransport::new(Some(token.to_owned())).unwrap();
-    let responses_endpoint = target.responses_endpoint();
+    let endpoint = target.endpoint();
     let error = transport
-        .send(&target, &responses_endpoint, "{}", TIMEOUT)
+        .send(&target, &endpoint, "{}", TIMEOUT)
         .expect_err("3xx responses must not be followed or accepted");
     server.join().unwrap();
     assert_eq!(error.kind(), TransportErrorKind::Other);
@@ -433,7 +552,7 @@ fn concrete_transport_rejects_an_endpoint_not_derived_from_the_validated_target(
     assert_eq!(error.kind(), TransportErrorKind::Other);
     assert_eq!(
         error.to_string(),
-        "Responses endpoint does not match the validated target"
+        "runtime endpoint does not match the validated target"
     );
     assert!(!error.to_string().contains("synthetic-secret"));
 }

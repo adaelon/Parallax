@@ -294,7 +294,7 @@ impl VaultRepository {
     /// # Errors
     ///
     /// Fails closed if the singleton is missing, malformed, or no longer
-    /// satisfies the frozen Responses v2 target and bearer boundaries.
+    /// satisfies the supported runtime target and bearer boundaries.
     pub fn runtime_profile(&self) -> Result<RuntimeProfile, VaultError> {
         load_runtime_profile(self.connection())
     }
@@ -314,7 +314,7 @@ impl VaultRepository {
     /// key action.
     ///
     /// Base URL and model normalization reuse [`RuntimeTarget::new`]; bearer
-    /// replacement reuses the exact Responses v2 transport field validator.
+    /// replacement reuses the exact runtime transport field validator.
     ///
     /// # Errors
     ///

@@ -1,0 +1,16 @@
+{
+  "id": "chatcmpl_deepseek_turn_fixture",
+  "object": "chat.completion",
+  "model": "deepseek-v4-pro",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "reasoning_content": null,
+        "content": "{\"text\":\"我只使用已选择证据。\",\"citations\":[{\"evidence_id\":1,\"quote\":\"只选择这一条\"}],\"operations\":[{\"type\":\"propose_judgment\",\"statement\":\"我认为这条证据值得在当前回答中引用。\",\"support\":[{\"evidence_id\":1,\"quote\":\"只选择这一条\"}],\"uncertainty\":\"low\",\"applicable_time\":{\"kind\":\"unknown\"}}]}"
+      }
+    }
+  ]
+}

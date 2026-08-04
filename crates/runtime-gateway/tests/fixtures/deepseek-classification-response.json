@@ -1,0 +1,16 @@
+{
+  "id": "chatcmpl_deepseek_classification_fixture",
+  "object": "chat.completion",
+  "model": "deepseek-v4-pro",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "reasoning_content": null,
+        "content": "{\"classification\":\"question\"}"
+      }
+    }
+  ]
+}
