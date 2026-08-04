@@ -179,21 +179,20 @@
 
 ## 8. S31 运行记录
 
-本节只记录最后一次完整通过的 S31 运行；命令输出与中间 JSON 留在被忽略的 `/.local/system-acceptance/`，不携带个人正文进入 Git。
-
-> 2026-08-04 接受 ADR-0053 后，下表只保留旧边界的历史证据，不再具备 S32 候选资格。S06R 完成后必须把 ADR-0053、schema v26 与运行时档案证据加入矩阵，重跑完整 S31 并冻结新构建。
+本节只记录最后一次完整通过的 S31 运行；命令输出与中间 JSON 留在被忽略的 `/.local/system-acceptance/`，不携带个人正文进入 Git。下表是完成 S06R-5 后重新冻结的唯一 S32 候选构建。
 
 | 字段 | 结果 |
 | --- | --- |
 | 状态 | `PASS`（`Full` 模式，18/18 步骤通过） |
-| Git head | `425f5ffa3af679818c9fafa6992ec58192282906`（S31 构建来源） |
-| 执行时间 | 2026-08-03 22:13:38～22:17:22 `+08:00`（223.669 秒） |
+| Git head | `1468ca57b9919e8dfc08d428b2885770ae66649a`（S06R-5/S31 构建来源） |
+| 执行时间 | 2026-08-04 19:17:11～19:20:44 `+08:00`（212.855 秒） |
 | Rust workspace | `cargo fmt`、workspace Clippy `-D warnings`、`cargo test --workspace --no-fail-fast`、desktop all-targets check 全部通过 |
-| Desktop React | 14/14，通过 TypeScript 检查与生产构建 |
+| Desktop React | 19/19，通过 TypeScript 检查与生产构建 |
 | Browser extension | 10/10，通过 TypeScript 检查与生产构建 |
-| 静态/隐私/矩阵 | 33 个确定性判据、FR-01～FR-12、49 个 accepted ADR、8 个威胁边界、5 个迁移契约完整；252 个文本文件隐私扫描零违规，259 个本地链接零缺失 |
-| NSIS 版本 | `0.1.0`；`target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe`；5,424,551 bytes |
-| NSIS SHA-256 | `8adbb4d0ef0a2880caca62ec40f370d5ec6766eacf801c2c30a01c1f5c02baed` |
-| 安装/启动/退出/卸载 | 隔离目录静默安装、启动、关窗保留托盘宿主、进程清理与静默卸载全部通过；仅预置 `bundle.meta` 后，安装版实际创建 `self.db` |
+| S06R 运行时档案 | `EV-RUNTIME-PROFILE` 覆盖 v25→v26、`KEEP/REPLACE/CLEAR`、write-only Key、恢复、严格合成测试、热切换、下一请求、重启与并发隔离 |
+| 静态/隐私/矩阵 | 33 个确定性判据、FR-01～FR-12、50 个 accepted ADR、8 个威胁边界、5 个迁移契约、33 个证据入口完整；256 个文本文件隐私扫描零违规，266 个本地链接零缺失 |
+| NSIS 版本 | `0.1.0`；`target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe`；5,448,409 bytes |
+| NSIS SHA-256 | `824203ffd36bd2ca32957c10719edd21c4bfaeb39c34b108aa27eda418f87242` |
+| 安装/启动/退出/卸载 | 隔离目录静默安装、启动、关窗保留托盘宿主、进程清理与静默卸载全部通过；仅预置 `bundle.meta` 后，安装版实际创建含 schema v26 默认运行时档案的 `self.db` |
 
 S31 不执行第 6.2 节的十四天纵向验收。该过程只能使用 [S32 观察模板](longitudinal-observation-template.md) 在同一个冻结安装包上完成。

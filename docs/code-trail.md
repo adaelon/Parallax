@@ -1,5 +1,16 @@
 # 代码链路
 
+## 2026-08-04 S06R-5-2 完整重验收与冻结构建
+
+**触达**:
+- `.local/system-acceptance/latest.json:eam-system-acceptance-result-v1` — 被忽略的最终结果记录构建来源、18 个通过步骤、矩阵/隐私/链接计数、安装包元数据和安装生命周期；不进入 Git。
+- `target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe` — 从提交 `1468ca57b9919e8dfc08d428b2885770ae66649a` 生成新的 S32 冻结候选；安装包不进入 Git。
+- `docs/system-acceptance-v1.md:§8`、`docs/longitudinal-observation-template.md:构建身份` — 统一固定版本、构建来源、字节数与 SHA-256，旧 S31 构建不再是候选。
+- `docs/implementation-slices.md:S06R/S06R-5`、`docs/architecture.md:§9.31` — 关闭 S06R 修订系列并把 S32 门禁切换到新冻结构建。
+
+**入口**：仓库根目录执行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-system-acceptance.ps1 -Mode Full`；S32 复制纵向模板后只能安装并观察本条 SHA 对应的产物。
+**测试**：针对 `1468ca57b9919e8dfc08d428b2885770ae66649a` 的最终 Full runner 18/18；33 DET、12 FR、50 ADR、8 THR、5 MIG、33 个证据入口，256 个文本文件隐私扫描与 266 个本地链接全绿；NSIS 5,448,409 bytes，记录及独立复算 SHA-256 均为 `824203ffd36bd2ca32957c10719edd21c4bfaeb39c34b108aa27eda418f87242`，隔离安装、启动、schema v26 首次建库、关窗驻留、退出清理与卸载通过。
+
 ## 2026-08-04 S06R-5-1 运行时档案系统验收证据
 
 **触达**:

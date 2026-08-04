@@ -6,10 +6,10 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 产品版本 | `<semver>` |
-| NSIS 安装包 | `<filename>` |
-| SHA-256 | `<64 lowercase hex>` |
-| S31 commit | `<git hash>` |
+| 产品版本 | `0.1.0` |
+| NSIS 安装包 | `evrything-about-me_0.1.0_x64-setup.exe` |
+| SHA-256 | `824203ffd36bd2ca32957c10719edd21c4bfaeb39c34b108aa27eda418f87242` |
+| S31 构建来源 commit | `1468ca57b9919e8dfc08d428b2885770ae66649a` |
 | 安装时间 | `<RFC3339>` |
 | 观察起点 | `<YYYY-MM-DD>` |
 | 最早可结束日 | `<start + 13 calendar days>` |

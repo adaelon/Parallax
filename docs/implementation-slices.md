@@ -1,8 +1,8 @@
 # 首版完整实现切片方案
 
-状态：实施中；S01～S31 与 S06R-1～S06R-4 已完成，下一片为 S06R-5；S32 在新构建重验收前锁定
+状态：实施中；S01～S31 与 S06R-1～S06R-5 已完成，下一片为 S32；S32 只使用 S06R-5 重新冻结的构建
 
-本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 已形成旧边界下的可安装构建。ADR-0053 新增 S06R 修订系列，完成后必须重跑 S31，S32 只能使用重新冻结的构建。
+本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 已形成可安装构建。ADR-0053 的五个 S06R 修订子片已完成并重跑 S31，S32 只能使用构建来源 `1468ca57b9919e8dfc08d428b2885770ae66649a`、SHA-256 `824203ffd36bd2ca32957c10719edd21c4bfaeb39c34b108aa27eda418f87242` 的重新冻结构建。
 
 ## 1. 结论
 
@@ -461,7 +461,7 @@ S28 -> S29 -> S30 -> S31(旧边界证据)
 
 ### S06R 可配置运行时档案边界修订
 
-**状态**：已由 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 接受；S06R-1～S06R-4 已实现，S06R-5 待实施。保留 ADR-0048 的 Responses 严格 contract 与 Core 最小数据出口，逐步取代固定 Cloud/Local 档案、固定模型和环境变量配置。
+**状态**：已由 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 接受；S06R-1～S06R-5 已实现并完成系统重验收。保留 ADR-0048 的 Responses 严格 contract 与 Core 最小数据出口，固定 Cloud/Local 档案、固定模型和环境变量配置已由 Vault 单档案取代。
 
 ```text
 RuntimeProfileDraft {
@@ -532,6 +532,8 @@ save(draft) -> validate/build -> Vault commit -> replace active runtime -> Runti
 **确定性完成**：React 测试覆盖读取不回显、KEEP/REPLACE/CLEAR、测试不保存、保存后清空输入、失败保留草稿、键盘关闭与焦点返回；TypeScript 检查和生产构建通过。
 
 #### S06R-5 系统重验收与新冻结构建
+
+**状态**：已完成；50 个 accepted ADR 与 S06R 必需证据矩阵全绿，Full runner 18/18，通过安装生命周期烟测并冻结新的 S32 候选构建。
 
 **依赖/输入**：S06R-1～S06R-4 全绿、更新后的 Runtime Contract v2、schema 与桌面 UI。
 
