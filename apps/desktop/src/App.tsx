@@ -112,6 +112,24 @@ interface RecoveryKeyView {
   recoveryKey: string;
 }
 
+interface RuntimeProfileView {
+  baseUrl: string;
+  model: string;
+  apiKeyConfigured: boolean;
+  apiKeyLastFour: string | null;
+}
+
+type RuntimeProfileApiKeyChange =
+  | { action: "KEEP" }
+  | { action: "REPLACE"; value: string }
+  | { action: "CLEAR" };
+
+interface RuntimeProfileDraft {
+  baseUrl: string;
+  model: string;
+  apiKeyChange: RuntimeProfileApiKeyChange;
+}
+
 interface VaultProjection {
   turns: ConversationTurn[];
   ceremonies: SharedExperienceCeremony[];
@@ -212,6 +230,18 @@ export function App() {
   const [activityTimeline, setActivityTimeline] = useState<ActivityTimelineEntry[]>([]);
   const [activityTimelineOpen, setActivityTimelineOpen] = useState(false);
   const [captureAction, setCaptureAction] = useState(false);
+  const [runtimeSettingsOpen, setRuntimeSettingsOpen] = useState(false);
+  const [runtimeProfile, setRuntimeProfile] = useState<RuntimeProfileView | null>(null);
+  const [runtimeBaseUrl, setRuntimeBaseUrl] = useState("");
+  const [runtimeModel, setRuntimeModel] = useState("");
+  const [runtimeApiKey, setRuntimeApiKey] = useState("");
+  const [runtimeClearKey, setRuntimeClearKey] = useState(false);
+  const [runtimeProfileLoading, setRuntimeProfileLoading] = useState(false);
+  const [runtimeProfileAction, setRuntimeProfileAction] = useState<
+    "test" | "save" | null
+  >(null);
+  const [runtimeProfileError, setRuntimeProfileError] = useState<string | null>(null);
+  const [runtimeProfileNotice, setRuntimeProfileNotice] = useState<string | null>(null);
   const [agreementManagerOpen, setAgreementManagerOpen] = useState(false);
   const [agreementLoading, setAgreementLoading] = useState(false);
   const [withdrawalDraft, setWithdrawalDraft] = useState<WithdrawalDraft | null>(null);
@@ -221,6 +251,11 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const conversationEnd = useRef<HTMLDivElement>(null);
   const messageInput = useRef<HTMLTextAreaElement>(null);
+  const runtimeSettingsTrigger = useRef<HTMLButtonElement>(null);
+  const runtimeSettingsBaseUrl = useRef<HTMLInputElement>(null);
+  const runtimeSettingsClose = useRef<HTMLButtonElement>(null);
+  const runtimeSettingsWasOpen = useRef(false);
+  const runtimeSettingsShouldFocus = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -257,6 +292,35 @@ export function App() {
     conversationEnd.current?.scrollIntoView?.({ block: "end" });
   }, [turns, sending]);
 
+  useEffect(() => {
+    if (runtimeSettingsOpen) {
+      runtimeSettingsWasOpen.current = true;
+      if (!runtimeProfileLoading && runtimeSettingsShouldFocus.current) {
+        runtimeSettingsShouldFocus.current = false;
+        (runtimeSettingsBaseUrl.current ?? runtimeSettingsClose.current)?.focus();
+      }
+      return;
+    }
+    if (runtimeSettingsWasOpen.current) {
+      runtimeSettingsWasOpen.current = false;
+      runtimeSettingsTrigger.current?.focus();
+    }
+  }, [runtimeProfileLoading, runtimeSettingsOpen]);
+
+  useEffect(() => {
+    if (!runtimeSettingsOpen) {
+      return;
+    }
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape" && runtimeProfileAction === null) {
+        event.preventDefault();
+        closeRuntimeSettings();
+      }
+    }
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [runtimeProfileAction, runtimeSettingsOpen]);
+
   function applyVaultProjection(projection: VaultProjection) {
     setTurns(projection.turns);
     setCeremonies(projection.ceremonies);
@@ -264,6 +328,114 @@ export function App() {
     setReflectionInvitations(projection.reflectionInvitations);
     setCaptureStatus(projection.captureStatus);
     setActivityTimeline(projection.activityTimeline);
+  }
+
+  async function openRuntimeSettings() {
+    if (runtimeProfileAction !== null) {
+      return;
+    }
+    runtimeSettingsShouldFocus.current = true;
+    setRuntimeSettingsOpen(true);
+    setRuntimeProfileLoading(true);
+    setRuntimeProfile(null);
+    setRuntimeBaseUrl("");
+    setRuntimeModel("");
+    setRuntimeApiKey("");
+    setRuntimeClearKey(false);
+    setRuntimeProfileError(null);
+    setRuntimeProfileNotice(null);
+    try {
+      const profile = redactRuntimeProfileView(
+        await invoke<RuntimeProfileView>("get_runtime_profile"),
+      );
+      setRuntimeProfile(profile);
+      setRuntimeBaseUrl(profile.baseUrl);
+      setRuntimeModel(profile.model);
+    } catch {
+      setRuntimeProfileError("运行时设置暂时无法读取；未显示任何认证信息。");
+    } finally {
+      setRuntimeProfileLoading(false);
+    }
+  }
+
+  function closeRuntimeSettings() {
+    if (runtimeProfileAction !== null) {
+      return;
+    }
+    setRuntimeSettingsOpen(false);
+    setRuntimeProfile(null);
+    setRuntimeBaseUrl("");
+    setRuntimeModel("");
+    setRuntimeApiKey("");
+    setRuntimeClearKey(false);
+    setRuntimeProfileError(null);
+    setRuntimeProfileNotice(null);
+  }
+
+  function runtimeProfileDraft(): RuntimeProfileDraft {
+    const apiKeyChange: RuntimeProfileApiKeyChange = runtimeClearKey
+      ? { action: "CLEAR" }
+      : runtimeApiKey.length > 0
+        ? { action: "REPLACE", value: runtimeApiKey }
+        : { action: "KEEP" };
+    return {
+      baseUrl: runtimeBaseUrl,
+      model: runtimeModel,
+      apiKeyChange,
+    };
+  }
+
+  async function testRuntimeProfile() {
+    if (
+      runtimeProfile === null ||
+      runtimeProfileAction !== null ||
+      runtimeBaseUrl.length === 0 ||
+      runtimeModel.length === 0
+    ) {
+      return;
+    }
+    setRuntimeProfileAction("test");
+    setRuntimeProfileError(null);
+    setRuntimeProfileNotice(null);
+    try {
+      await invoke("test_runtime_profile", { draft: runtimeProfileDraft() });
+      setRuntimeProfileNotice("连接测试成功；草稿尚未保存，当前运行时未切换。");
+    } catch {
+      setRuntimeProfileError("连接测试失败；草稿与当前运行时均未改变。");
+    } finally {
+      setRuntimeProfileAction(null);
+    }
+  }
+
+  async function saveRuntimeProfile() {
+    if (
+      runtimeProfile === null ||
+      runtimeProfileAction !== null ||
+      runtimeBaseUrl.length === 0 ||
+      runtimeModel.length === 0
+    ) {
+      return;
+    }
+    setRuntimeProfileAction("save");
+    setRuntimeProfileError(null);
+    setRuntimeProfileNotice(null);
+    try {
+      const saved = redactRuntimeProfileView(
+        await invoke<RuntimeProfileView>("save_runtime_profile", {
+          draft: runtimeProfileDraft(),
+        }),
+      );
+      setRuntimeProfile(saved);
+      setRuntimeBaseUrl(saved.baseUrl);
+      setRuntimeModel(saved.model);
+      setRuntimeApiKey("");
+      setRuntimeClearKey(false);
+      setRuntimeProfileNotice("运行时档案已保存并切换；Key 输入已清空。");
+    } catch {
+      setRuntimeProfileError("保存并切换失败；草稿和当前运行时均保持不变。");
+    } finally {
+      setRuntimeProfileAction(null);
+    }
   }
 
   async function beginVaultInitialization() {
@@ -639,6 +811,14 @@ export function App() {
         <div className="topbar-actions">
           <button
             className="agreement-manager-trigger"
+            onClick={() => void openRuntimeSettings()}
+            ref={runtimeSettingsTrigger}
+            type="button"
+          >
+            运行时设置
+          </button>
+          <button
+            className="agreement-manager-trigger"
             onClick={() => void openActivityTimeline()}
             type="button"
           >
@@ -696,6 +876,181 @@ export function App() {
         ) : null}
         <div ref={conversationEnd} />
       </section>
+
+      {runtimeSettingsOpen ? (
+        <div className="ceremony-layer runtime-settings-layer">
+          <article
+            aria-labelledby="runtime-settings-title"
+            aria-modal="true"
+            className="ceremony-card runtime-settings-card"
+            role="dialog"
+          >
+            <p className="eyebrow">Vault 单档案</p>
+            <h2 id="runtime-settings-title">运行时设置</h2>
+            <p className="ceremony-note runtime-settings-intro">
+              配置兼容 Responses 的 Base URL、模型和可选 Bearer Key。完整 Key 只写入本次草稿，读取时不会回显。
+            </p>
+            {runtimeProfileLoading ? (
+              <>
+                <p className="runtime-settings-state" role="status">
+                  正在读取脱敏运行时档案…
+                </p>
+                <div className="ceremony-actions">
+                  <button
+                    className="secondary-action"
+                    onClick={closeRuntimeSettings}
+                    ref={runtimeSettingsClose}
+                    type="button"
+                  >
+                    关闭
+                  </button>
+                </div>
+              </>
+            ) : runtimeProfile === null ? (
+              <>
+                {runtimeProfileError ? (
+                  <p className="runtime-settings-error" role="alert">
+                    {runtimeProfileError}
+                  </p>
+                ) : null}
+                <div className="ceremony-actions">
+                  <button
+                    className="secondary-action"
+                    onClick={() => void openRuntimeSettings()}
+                    type="button"
+                  >
+                    重新读取
+                  </button>
+                  <button
+                    className="secondary-action"
+                    onClick={closeRuntimeSettings}
+                    ref={runtimeSettingsClose}
+                    type="button"
+                  >
+                    关闭
+                  </button>
+                </div>
+              </>
+            ) : (
+              <form
+                className="runtime-settings-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void saveRuntimeProfile();
+                }}
+              >
+                <label htmlFor="runtime-base-url">Responses Base URL</label>
+                <input
+                  autoComplete="url"
+                  disabled={runtimeProfileAction !== null}
+                  id="runtime-base-url"
+                  onChange={(event) => setRuntimeBaseUrl(event.target.value)}
+                  ref={runtimeSettingsBaseUrl}
+                  spellCheck={false}
+                  type="url"
+                  value={runtimeBaseUrl}
+                />
+                <p className="runtime-field-note">
+                  应用会规范化地址，并只追加一个 <code>/responses</code>。
+                </p>
+
+                <label htmlFor="runtime-model">模型 ID</label>
+                <input
+                  autoComplete="off"
+                  disabled={runtimeProfileAction !== null}
+                  id="runtime-model"
+                  onChange={(event) => setRuntimeModel(event.target.value)}
+                  spellCheck={false}
+                  value={runtimeModel}
+                />
+
+                <label htmlFor="runtime-api-key">Bearer Key（可选）</label>
+                <input
+                  aria-describedby="runtime-key-status"
+                  autoComplete="new-password"
+                  disabled={runtimeProfileAction !== null || runtimeClearKey}
+                  id="runtime-api-key"
+                  onChange={(event) => {
+                    setRuntimeApiKey(event.target.value);
+                    if (event.target.value.length > 0) {
+                      setRuntimeClearKey(false);
+                    }
+                  }}
+                  placeholder="留空以保持当前 Key"
+                  spellCheck={false}
+                  type="password"
+                  value={runtimeApiKey}
+                />
+                <p className="runtime-field-note" id="runtime-key-status">
+                  当前状态：{runtimeKeyStatus(runtimeProfile)}。输入新值会替换；留空会保持。
+                </p>
+                <label className="runtime-clear-confirmation" htmlFor="runtime-clear-key">
+                  <input
+                    checked={runtimeClearKey}
+                    disabled={
+                      runtimeProfileAction !== null || !runtimeProfile.apiKeyConfigured
+                    }
+                    id="runtime-clear-key"
+                    onChange={(event) => {
+                      setRuntimeClearKey(event.target.checked);
+                      if (event.target.checked) {
+                        setRuntimeApiKey("");
+                      }
+                    }}
+                    type="checkbox"
+                  />
+                  <span>确认清除当前已保存的 Key</span>
+                </label>
+
+                {runtimeProfileError ? (
+                  <p className="runtime-settings-error" role="alert">
+                    {runtimeProfileError}
+                  </p>
+                ) : null}
+                {runtimeProfileNotice ? (
+                  <p className="runtime-settings-notice" role="status">
+                    {runtimeProfileNotice}
+                  </p>
+                ) : null}
+
+                <div className="ceremony-actions runtime-settings-actions">
+                  <button
+                    className="secondary-action"
+                    disabled={
+                      runtimeProfileAction !== null ||
+                      runtimeBaseUrl.length === 0 ||
+                      runtimeModel.length === 0
+                    }
+                    onClick={() => void testRuntimeProfile()}
+                    type="button"
+                  >
+                    {runtimeProfileAction === "test" ? "正在测试…" : "测试连接"}
+                  </button>
+                  <button
+                    className="secondary-action"
+                    disabled={runtimeProfileAction !== null}
+                    onClick={closeRuntimeSettings}
+                    ref={runtimeSettingsClose}
+                    type="button"
+                  >
+                    关闭
+                  </button>
+                  <button
+                    disabled={
+                      runtimeProfileAction !== null ||
+                      runtimeBaseUrl.length === 0 ||
+                      runtimeModel.length === 0
+                    }
+                    type="submit"
+                  >
+                    {runtimeProfileAction === "save" ? "正在保存…" : "保存并切换"}
+                  </button>
+                </div>
+              </form>
+            )}
+          </article>
+        </div>
+      ) : null}
 
       {activityTimelineOpen ? (
         <div className="ceremony-layer">
@@ -1569,6 +1924,27 @@ function gapReasonLabel(
     case null:
       return "未知原因";
   }
+}
+
+function runtimeKeyStatus(profile: RuntimeProfileView): string {
+  if (!profile.apiKeyConfigured) {
+    return "未配置";
+  }
+  return profile.apiKeyLastFour === null
+    ? "已配置，不显示短 Key 的任何字符"
+    : `已配置，末四位 ${profile.apiKeyLastFour}`;
+}
+
+function redactRuntimeProfileView(profile: RuntimeProfileView): RuntimeProfileView {
+  return {
+    baseUrl: profile.baseUrl,
+    model: profile.model,
+    apiKeyConfigured: profile.apiKeyConfigured,
+    apiKeyLastFour:
+      profile.apiKeyConfigured && profile.apiKeyLastFour?.length === 4
+        ? profile.apiKeyLastFour
+        : null,
+  };
 }
 
 function errorMessage(reason: unknown): string {

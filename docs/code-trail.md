@@ -1,5 +1,17 @@
 # 代码链路
 
+## 2026-08-04 S06R-4 本地设置面板
+
+**触达**:
+- `apps/desktop/src/App.tsx:RuntimeProfileView/RuntimeProfileApiKeyChange/App::{openRuntimeSettings,runtimeProfileDraft,testRuntimeProfile,saveRuntimeProfile}/runtimeKeyStatus/redactRuntimeProfileView` — 在 Vault 就绪的持续对话页增加按需读取模态；只投影白名单视图字段，空 Key、输入新 Key、单独清除确认精确映射 `KEEP/REPLACE/CLEAR`，测试保留草稿，保存成功清空 Key 输入并刷新脱敏视图，失败使用固定脱敏提示。
+- `apps/desktop/src/App.tsx:App runtime settings focus effects` — Escape 和关闭按钮丢弃临时 Key 草稿并把焦点返回设置入口，读取完成后聚焦 Base URL；操作进行中禁止关闭。
+- `apps/desktop/src/styles.css:.runtime-settings-*` — 为设置字段、Key 状态、清除确认、脱敏错误/成功反馈及窄屏动作换行提供本地模态样式。
+- `apps/desktop/src/App.test.tsx:S06R-4 local runtime settings` — 覆盖读取不回显、空输入 `KEEP`、输入 `REPLACE`、单独确认 `CLEAR`、测试零保存且不清草稿、保存成功/失败、固定脱敏错误、Escape 关闭和焦点返回。
+- `docs/architecture.md:§3.6/§9.6/§9.7`、`docs/implementation-slices.md:S06R-4` — 同步 write-only Key UI 数据流、已解锁入口、失败语义和切片完成状态。
+
+**入口**：Vault 已解锁后，从持续对话页顶部选择“运行时设置”；WebView 只经 `get_runtime_profile`、`test_runtime_profile({ draft })` 与 `save_runtime_profile({ draft })` 访问宿主。
+**测试**：桌面 React 19/19、desktop Rust 30/30、`npm run typecheck` 与 `npm run build` 全绿；desktop all-targets Clippy `-D warnings`、`cargo fmt --all -- --check`、Markdown 本地链接 266/266、256 个 tracked text 隐私扫描、静态权限边界和 `git diff --check` 通过。
+
 ## 2026-08-04 S06R-3 宿主热切换与严格测试连接
 
 **触达**:

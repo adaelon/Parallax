@@ -27,6 +27,7 @@ const READY_HOST_STATUS = {
   updaterConfigured: false,
   detail: null,
 };
+const RUNTIME_REPLACEMENT_KEY = "synthetic-runtime-secret-4321";
 
 type InvokeHandler = <T>(command: string) => Promise<T>;
 
@@ -194,6 +195,252 @@ describe("S07 continuous conversation", () => {
     });
     expect(listCalls).toBe(2);
     expect(ceremonyCalls).toBe(2);
+  });
+});
+
+describe("S06R-4 local runtime settings", () => {
+  it("loads only the redacted profile and starts with an empty password field", async () => {
+    const completeKeyThatMustNotRender = "complete-read-secret-2468";
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
+      if (
+        command === "list_conversation" ||
+        command === "list_shared_experience_ceremonies"
+      ) {
+        return [] as T;
+      }
+      if (command === "get_runtime_profile") {
+        return {
+          ...runtimeProfileView(),
+          apiKeyLastFour: "2468",
+          apiKey: completeKeyThatMustNotRender,
+        } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("从此刻继续认识彼此"));
+    await clickButton("运行时设置");
+
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("已配置，末四位 2468"),
+    );
+    expect(document.querySelector<HTMLInputElement>("#runtime-base-url")!.value).toBe(
+      "http://127.0.0.1:11434/v1",
+    );
+    expect(document.querySelector<HTMLInputElement>("#runtime-model")!.value).toBe(
+      "gpt-oss-20b",
+    );
+    const password = document.querySelector<HTMLInputElement>("#runtime-api-key")!;
+    expect(password.type).toBe("password");
+    expect(password.value).toBe("");
+    expect(document.body.textContent).not.toContain(completeKeyThatMustNotRender);
+    expect(document.activeElement).toBe(
+      document.querySelector("#runtime-base-url"),
+    );
+  });
+
+  it("maps blank, replacement, and confirmed clearing to KEEP, REPLACE, and CLEAR without saving", async () => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
+      if (
+        command === "list_conversation" ||
+        command === "list_shared_experience_ceremonies"
+      ) {
+        return [] as T;
+      }
+      if (command === "get_runtime_profile") {
+        return runtimeProfileView() as T;
+      }
+      if (command === "test_runtime_profile") {
+        return { succeeded: true } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("从此刻继续认识彼此"));
+    await clickButton("运行时设置");
+    await vi.waitFor(() => expect(document.querySelector("#runtime-api-key")).not.toBeNull());
+
+    await clickButton("测试连接");
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("草稿尚未保存"),
+    );
+
+    await setControlValue("#runtime-api-key", RUNTIME_REPLACEMENT_KEY);
+    await clickButton("测试连接");
+    await vi.waitFor(() =>
+      expect(
+        document.querySelector<HTMLInputElement>("#runtime-api-key")!.value,
+      ).toBe(RUNTIME_REPLACEMENT_KEY),
+    );
+
+    const clear = document.querySelector<HTMLInputElement>("#runtime-clear-key")!;
+    await act(async () => clear.click());
+    expect(document.querySelector<HTMLInputElement>("#runtime-api-key")!.value).toBe("");
+    await clickButton("测试连接");
+
+    const testDrafts = invokeMock.mock.calls
+      .filter(([command]) => command === "test_runtime_profile")
+      .map(([, args]) => args);
+    expect(testDrafts).toEqual([
+      {
+        draft: {
+          baseUrl: "http://127.0.0.1:11434/v1",
+          model: "gpt-oss-20b",
+          apiKeyChange: { action: "KEEP" },
+        },
+      },
+      {
+        draft: {
+          baseUrl: "http://127.0.0.1:11434/v1",
+          model: "gpt-oss-20b",
+          apiKeyChange: {
+            action: "REPLACE",
+            value: RUNTIME_REPLACEMENT_KEY,
+          },
+        },
+      },
+      {
+        draft: {
+          baseUrl: "http://127.0.0.1:11434/v1",
+          model: "gpt-oss-20b",
+          apiKeyChange: { action: "CLEAR" },
+        },
+      },
+    ]);
+    expect(
+      invokeMock.mock.calls.some(([command]) => command === "save_runtime_profile"),
+    ).toBe(false);
+  });
+
+  it("clears the replacement input and refreshes the redacted view after saving", async () => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
+      if (
+        command === "list_conversation" ||
+        command === "list_shared_experience_ceremonies"
+      ) {
+        return [] as T;
+      }
+      if (command === "get_runtime_profile") {
+        return runtimeProfileView() as T;
+      }
+      if (command === "save_runtime_profile") {
+        return runtimeProfileView({
+          baseUrl: "https://runtime.example.test/v1",
+          model: "new-model",
+          apiKeyLastFour: "4321",
+        }) as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("从此刻继续认识彼此"));
+    await clickButton("运行时设置");
+    await vi.waitFor(() => expect(document.querySelector("#runtime-base-url")).not.toBeNull());
+    await setControlValue("#runtime-base-url", "https://runtime.example.test/v1");
+    await setControlValue("#runtime-model", "new-model");
+    await setControlValue("#runtime-api-key", RUNTIME_REPLACEMENT_KEY);
+    await clickButton("保存并切换");
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("运行时档案已保存并切换");
+      expect(document.body.textContent).toContain("已配置，末四位 4321");
+      expect(document.querySelector<HTMLInputElement>("#runtime-api-key")!.value).toBe("");
+    });
+    expect(invokeMock).toHaveBeenCalledWith("save_runtime_profile", {
+      draft: {
+        baseUrl: "https://runtime.example.test/v1",
+        model: "new-model",
+        apiKeyChange: {
+          action: "REPLACE",
+          value: RUNTIME_REPLACEMENT_KEY,
+        },
+      },
+    });
+    expect(document.body.textContent).not.toContain(RUNTIME_REPLACEMENT_KEY);
+  });
+
+  it("keeps the draft and shows a fixed redacted error when saving fails", async () => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
+      if (
+        command === "list_conversation" ||
+        command === "list_shared_experience_ceremonies"
+      ) {
+        return [] as T;
+      }
+      if (command === "get_runtime_profile") {
+        return runtimeProfileView() as T;
+      }
+      if (command === "save_runtime_profile") {
+        throw new Error(`provider echoed ${RUNTIME_REPLACEMENT_KEY}`);
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("从此刻继续认识彼此"));
+    await clickButton("运行时设置");
+    await vi.waitFor(() => expect(document.querySelector("#runtime-base-url")).not.toBeNull());
+    await setControlValue("#runtime-base-url", "https://draft.example.test/v1");
+    await setControlValue("#runtime-model", "draft-model");
+    await setControlValue("#runtime-api-key", RUNTIME_REPLACEMENT_KEY);
+    await clickButton("保存并切换");
+
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain(
+        "保存并切换失败；草稿和当前运行时均保持不变。",
+      ),
+    );
+    expect(document.querySelector<HTMLInputElement>("#runtime-base-url")!.value).toBe(
+      "https://draft.example.test/v1",
+    );
+    expect(document.querySelector<HTMLInputElement>("#runtime-model")!.value).toBe(
+      "draft-model",
+    );
+    const password = document.querySelector<HTMLInputElement>("#runtime-api-key")!;
+    expect(password.type).toBe("password");
+    expect(password.value).toBe(RUNTIME_REPLACEMENT_KEY);
+    expect(document.body.textContent).not.toContain(RUNTIME_REPLACEMENT_KEY);
+    expect(document.body.textContent).toContain("已配置，末四位 1111");
+  });
+
+  it("closes on Escape, restores trigger focus, and never reuses a closed Key draft", async () => {
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
+      if (
+        command === "list_conversation" ||
+        command === "list_shared_experience_ceremonies"
+      ) {
+        return [] as T;
+      }
+      if (command === "get_runtime_profile") {
+        return runtimeProfileView() as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("从此刻继续认识彼此"));
+    await clickButton("运行时设置");
+    await vi.waitFor(() => expect(document.querySelector("#runtime-api-key")).not.toBeNull());
+    await setControlValue("#runtime-api-key", RUNTIME_REPLACEMENT_KEY);
+    await act(async () => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { bubbles: true, key: "Escape" }),
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[aria-labelledby="runtime-settings-title"]')).toBeNull();
+      expect(document.activeElement?.textContent).toBe("运行时设置");
+    });
+    await clickButton("运行时设置");
+    await vi.waitFor(() => expect(document.querySelector("#runtime-api-key")).not.toBeNull());
+    expect(document.querySelector<HTMLInputElement>("#runtime-api-key")!.value).toBe("");
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "get_runtime_profile"),
+    ).toHaveLength(2);
   });
 });
 
@@ -743,6 +990,23 @@ async function setControlValue(selector: string, value: string) {
     setter.call(control, value);
     control.dispatchEvent(new Event("input", { bubbles: true }));
   });
+}
+
+function runtimeProfileView(
+  overrides: Partial<{
+    baseUrl: string;
+    model: string;
+    apiKeyConfigured: boolean;
+    apiKeyLastFour: string | null;
+  }> = {},
+) {
+  return {
+    baseUrl: "http://127.0.0.1:11434/v1",
+    model: "gpt-oss-20b",
+    apiKeyConfigured: true,
+    apiKeyLastFour: "1111",
+    ...overrides,
+  };
 }
 
 function agreementCeremony(): SharedExperienceCeremony {

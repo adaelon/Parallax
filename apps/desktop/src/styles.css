@@ -441,6 +441,113 @@ h1 {
   font-weight: 500;
 }
 
+.runtime-settings-card {
+  width: min(100%, 40rem);
+}
+
+.runtime-settings-intro {
+  margin-bottom: 1.2rem;
+}
+
+.runtime-settings-state {
+  margin: 1.5rem 0 0;
+  color: #aeb3a9;
+}
+
+.runtime-settings-form {
+  display: grid;
+  gap: 0.48rem;
+  margin-top: 1.35rem;
+}
+
+.runtime-settings-form > label:not(.runtime-clear-confirmation) {
+  margin-top: 0.45rem;
+  color: #a6aea1;
+  font-size: 0.76rem;
+  font-weight: 650;
+}
+
+.runtime-settings-form > input {
+  width: 100%;
+  padding: 0.72rem 0.78rem;
+  border: 1px solid rgb(255 255 255 / 11%);
+  border-radius: 0.7rem;
+  outline: none;
+  color: #eceee8;
+  background: #121511;
+}
+
+.runtime-settings-form > input:focus {
+  border-color: rgb(143 177 132 / 55%);
+  box-shadow: 0 0 0 0.2rem rgb(143 177 132 / 8%);
+}
+
+.runtime-settings-form > input:disabled {
+  color: #858a81;
+  cursor: not-allowed;
+  opacity: 0.68;
+}
+
+.runtime-field-note {
+  margin: 0;
+  color: #7f867b;
+  font-size: 0.7rem;
+  line-height: 1.55;
+}
+
+.runtime-field-note code {
+  color: #a9bca2;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.runtime-clear-confirmation {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  margin-top: 0.45rem;
+  color: #b8bdb4;
+  cursor: pointer;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.runtime-clear-confirmation input {
+  width: 1rem;
+  height: 1rem;
+  margin-top: 0.08rem;
+  accent-color: #9db895;
+}
+
+.runtime-clear-confirmation:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.runtime-settings-error,
+.runtime-settings-notice {
+  margin: 0.75rem 0 0;
+  padding: 0.68rem 0.78rem;
+  border-radius: 0.7rem;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.runtime-settings-error {
+  border: 1px solid rgb(207 115 103 / 30%);
+  color: #e0aaa2;
+  background: rgb(107 44 37 / 23%);
+}
+
+.runtime-settings-notice {
+  border: 1px solid rgb(143 177 132 / 28%);
+  color: #b7c9b0;
+  background: rgb(76 97 68 / 22%);
+}
+
+.runtime-settings-actions {
+  flex-wrap: wrap;
+}
+
 .ceremony-statement {
   margin: 1rem 0 1.2rem;
   color: #eff1ea;

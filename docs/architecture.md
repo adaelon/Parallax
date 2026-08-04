@@ -212,7 +212,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 
 ### 3.6 模型运行时
 
-本地与远程模型实现同一 Responses 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格分类 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v2](runtime-contract-v2.md)；本地设置界面留给 S06R-4。
+本地与远程模型实现同一 Responses 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格分类 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v2](runtime-contract-v2.md)。
 
 ### 3.7 技术职责
 
@@ -1291,6 +1291,8 @@ crates/core/src/
 apps/desktop/src-tauri/src/
   state.rs              # Vault 启动装配、严格合成测试、提交后热切换与宿主单写锁
   lib.rs                # get/test/save_runtime_profile 白名单 command
+apps/desktop/src/
+  App.tsx               # 脱敏档案模态、write-only Key 草稿、测试与保存交互
 ```
 
 ```text
@@ -1324,6 +1326,12 @@ ManagedHost::save_runtime_profile(draft)
   -> atomically update Vault singleton
   -> MemoryCore::replace_runtime(candidate) without a fallible step
   -> return only RuntimeProfileView
+
+React runtime settings open
+  -> get_runtime_profile -> redacted status + always-empty Key input
+  -> blank Key | replacement Key | confirmed clear -> KEEP | REPLACE | CLEAR
+  -> test_runtime_profile keeps the draft and active runtime
+  -> save_runtime_profile success clears Key input and refreshes redacted view
 ```
 
 任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra` 与 Local `gpt-oss-20b` 固定夹具继续产生等价领域输出。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v2](runtime-contract-v2.md)。结构化输出错误仍失败关闭；桌面宿主只认 Vault 单档案，不再读取 `OPENAI_API_KEY` 或 `EAM_*_RESPONSES_ENDPOINT`，也不再接线固定 fallback。schema v26 与 Repository 故障注入证明迁移/更新中断保持旧档案，Recovery Set 测试证明完整 Key 随加密数据库恢复且不出现在原始字节中；桌面集成测试进一步证明测试零副作用、保存失败保留旧运行时、保存后下一请求与重启使用新档案，以及请求中切换不会混用配置。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md) 和 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)。
@@ -1335,7 +1343,7 @@ apps/desktop/src-tauri/src/
   lib.rs                # 宿主事件循环、对话与运行时档案白名单 command
   state.rs              # Vault/Core/运行时装配、热切换、持续会话、心跳与安全退出
 apps/desktop/src/
-  App.tsx               # 重启恢复、发送、忙碌与错误恢复的持续对话界面
+  App.tsx               # 持续对话、运行时设置模态、重启恢复、发送与错误恢复界面
 crates/desktop-host/src/
   lifecycle.rs          # 无 Tauri 依赖的宿主状态机
 crates/vault/src/
@@ -1347,11 +1355,12 @@ first process -> single-instance plugin -> unlock Vault -> load RuntimeProfile -
 second process -> activate_existing_window(first process) -> exit
 React send -> send_message -> freeze recent conversation context -> MemoryCore -> exact turn views
 React restore -> list_conversation -> SQLCipher evidence -> exact turn views
-Tauri invoke -> get/test/save_runtime_profile -> ManagedHost mutex -> redacted view | synthetic test | Vault commit + runtime swap
+React settings open -> get_runtime_profile -> redacted view + empty Key input
+React settings test/save -> explicit KEEP | REPLACE | CLEAR draft -> ManagedHost mutex -> synthetic test | Vault commit + runtime swap
 explicit exit -> finish_host_session -> close Vault -> zeroize key -> release lock -> process exit
 ```
 
-主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater、首次创建、持续对话和运行时配置只能经宿主白名单 command 使用。运行时档案读取只返回 Base URL、模型、Key 是否存在和安全末四位；测试与保存草稿中的完整 Key 不可序列化回 WebView，并在 Rust 草稿析构时清零。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。首次创建的 Recovery Key 是 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 限定的一次性展示例外，不赋予 UI 任何 Vault Key 或持久密钥能力。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md)、[ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)、[ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 和 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)。
+主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater、首次创建、持续对话和运行时配置只能经宿主白名单 command 使用。运行时设置入口只在 Vault 就绪的持续对话页出现；打开时按需读取 Base URL、模型、Key 是否存在和安全末四位，Key 密码框永远从空值开始且关闭即丢弃。测试连接不清草稿，保存失败保留草稿，保存成功才清空 Key 输入并刷新返回的脱敏视图；读取和操作失败都使用不拼接 provider 正文或 Key 的固定提示，键盘关闭把焦点交还入口。测试与保存草稿中的完整 Key 不可序列化回 WebView，并在 Rust 草稿析构时清零。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。首次创建的 Recovery Key 是 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 限定的一次性展示例外，不赋予 UI 任何 Vault Key 或持久密钥能力。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md)、[ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)、[ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 和 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)。
 
 ### 9.8 S08 Context Inbox 先归档当前实现边界
 
