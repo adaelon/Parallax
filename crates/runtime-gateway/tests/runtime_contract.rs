@@ -9,16 +9,18 @@ use std::{
 
 use eam_core::{
     ActiveRelationalConstraint, ApplicableTime, Claim, ClaimId, ClaimOwner, ConversationEvidence,
-    CoreError, DecisionImpact, DisputeState, EvidenceCitation, EvidenceId, FrozenEvidenceBlock,
-    FrozenMemoryDispute, FrozenRetrievalWindow, IdentityEvolutionRepository,
-    IdentityProfileSnapshot, IdentityRuntimeContext, IdentityStateSnapshot, InMemoryRepository,
-    IncrementingClock, MemoryCore, MemoryRepository, PatternMaturityWriteRejectionReason,
-    PersonTurnClassification, ReflectionImportance, ReflectionInvitation,
-    ReflectionInvitationBasis, ReflectionInvitationRepository, ReflectionInvitationState,
-    ReflectionOpportunity, RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SessionId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementRevision,
-    SharedExperienceKind, SharedExperienceRepository, SourceCurrentness, Speaker,
-    StructuredOperationRejectionReason, Timestamp, Uncertainty, WorkingContext,
+    CoreError, CounterpartReplyAttribution, CounterpartSelfContextError, DecisionImpact,
+    DisputeState, EvidenceCitation, EvidenceId, FrozenEvidenceBlock, FrozenMemoryDispute,
+    FrozenRetrievalWindow, IdentityEvolutionRepository, IdentityProfileSnapshot,
+    IdentityRuntimeContext, IdentityStateSnapshot, InMemoryRepository, IncrementingClock,
+    MAX_COUNTERPART_SELF_CONTEXT_BYTES, MemoryCore, MemoryRepository,
+    PatternMaturityWriteRejectionReason, PersonTurnClassification, ReflectionImportance,
+    ReflectionInvitation, ReflectionInvitationBasis, ReflectionInvitationRepository,
+    ReflectionInvitationState, ReflectionOpportunity, RetrievalSnapshot, RetrievedContextItem,
+    RuntimeErrorKind, SelfBundleSnapshot, SessionId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementRevision, SharedExperienceKind,
+    SharedExperienceRepository, SourceCurrentness, Speaker, StructuredOperationRejectionReason,
+    Timestamp, Uncertainty, WorkingContext,
 };
 use eam_identity::{
     IdentityError, IdentityFormation, IdentityProposalRejectionReason, IdentityStateVersion,
@@ -77,6 +79,16 @@ const PATTERN_MATURITY_MALFORMED_RESPONSE: &str =
     include_str!("fixtures/pattern-maturity-malformed-response.json");
 const HIGH_IMPACT_DISPUTE_RESPONSE: &str =
     include_str!("fixtures/high-impact-dispute-response.json");
+const EMPTY_TURN_RESPONSE: &str = r#"{
+  "id":"resp_empty_turn_fixture",
+  "output":[{
+    "type":"message",
+    "content":[{
+      "type":"output_text",
+      "text":"{\"text\":\"我保留了当前主体状态。\",\"citations\":[],\"operations\":[]}"
+    }]
+  }]
+}"#;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CLOUD_MODEL: &str = "gpt-5.6-terra";
 const LOCAL_MODEL: &str = "gpt-oss-20b";
@@ -400,6 +412,68 @@ fn run_contract(
     (outcome, claims, runtime)
 }
 
+fn run_self_context_contract(
+    runtime: OpenAiResponsesRuntime<ScriptedTransport>,
+) -> OpenAiResponsesRuntime<ScriptedTransport> {
+    let mut repository = ready_in_memory_repository();
+    let belief_evidence_id = repository.next_evidence_id();
+    repository
+        .append_evidence(ConversationEvidence::restore_counterpart(
+            belief_evidence_id,
+            SessionId::new("self-context-belief"),
+            "我注意到本人会在重要决定前主动核对证据。".to_owned(),
+            Timestamp::from_millis(100),
+            CounterpartReplyAttribution::IdentityBound(1),
+        ))
+        .unwrap();
+    let belief_claim_id = repository.next_claim_id();
+    repository
+        .append_claim(Claim::restore(
+            belief_claim_id,
+            ClaimOwner::Counterpart,
+            "本人会在重要决定前主动核对证据。".to_owned(),
+            vec![EvidenceCitation::new(belief_evidence_id, "主动核对证据")],
+            Some(Uncertainty::Low),
+            ApplicableTime::Since(Timestamp::from_millis(100)),
+            Timestamp::from_millis(100),
+        ))
+        .unwrap();
+    let hidden_evidence_id = repository.next_evidence_id();
+    repository
+        .append_evidence(ConversationEvidence::restore(
+            hidden_evidence_id,
+            SessionId::new("self-context-hidden"),
+            Speaker::Person,
+            "绝不能外发的无关个人资料".to_owned(),
+            Timestamp::from_millis(110),
+        ))
+        .unwrap();
+    let repository = repository.with_self_bundle_snapshot(SelfBundleSnapshot::restore(
+        1,
+        1,
+        1,
+        vec![
+            "experience:relevant-shared-review".to_owned(),
+            "experience:private-unselected-history".to_owned(),
+        ],
+        vec![belief_claim_id],
+        "彼此可以直接指出证据缺口".to_owned(),
+        vec!["下次继续核对长期目标".to_owned()],
+    ));
+    let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_000));
+    let context = WorkingContext::from_selected_evidence(Vec::new(), Timestamp::from_millis(900))
+        .with_relevant_counterpart_experiences(vec!["experience:relevant-shared-review".to_owned()])
+        .unwrap();
+    core.run_counterpart_turn(
+        SessionId::new("self-context-turn"),
+        "请继续这轮讨论。",
+        context,
+    )
+    .unwrap();
+    let (_, runtime, _) = core.into_parts();
+    runtime
+}
+
 #[test]
 fn responses_and_deepseek_form_equivalent_strict_initial_identity_proposals() {
     let answers = complete_initial_identity_introduction();
@@ -678,6 +752,170 @@ fn local_and_cloud_adapters_produce_equivalent_domain_results_from_fixed_fixture
         assert!(!schema.contains("\"oneOf\""));
         assert!(!schema.contains("\"const\""));
     }
+}
+
+#[test]
+fn current_counterpart_self_context_is_complete_bounded_and_model_portable() {
+    let cloud = run_self_context_contract(cloud_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(EMPTY_TURN_RESPONSE),
+    ]));
+    let local = run_self_context_contract(local_runtime([
+        Ok(CLASSIFICATION_RESPONSE),
+        Ok(EMPTY_TURN_RESPONSE),
+    ]));
+
+    let cloud_disclosure = cloud.disclosures().last().unwrap();
+    let local_disclosure = local.disclosures().last().unwrap();
+    let cloud_request: Value = serde_json::from_str(cloud_disclosure.request_json()).unwrap();
+    let local_request: Value = serde_json::from_str(local_disclosure.request_json()).unwrap();
+    let cloud_input: Value =
+        serde_json::from_str(cloud_request["input"].as_str().unwrap()).unwrap();
+    let local_input: Value =
+        serde_json::from_str(local_request["input"].as_str().unwrap()).unwrap();
+
+    assert_eq!(cloud_input["self_context"], local_input["self_context"]);
+    let self_context = &cloud_input["self_context"];
+    assert_eq!(self_context["constitution_version"], 1);
+    assert_eq!(self_context["self_bundle_version"], 1);
+    assert_eq!(self_context["identity"]["version"], 1);
+    assert_eq!(self_context["identity"]["name"], "测试第二自我");
+    assert_eq!(
+        self_context["relationship_state"],
+        "彼此可以直接指出证据缺口"
+    );
+    assert_eq!(self_context["active_beliefs"].as_array().unwrap().len(), 1);
+    assert_eq!(self_context["active_beliefs"][0]["claim_id"], 1);
+    assert_eq!(
+        self_context["pending_intentions"],
+        serde_json::json!(["下次继续核对长期目标"])
+    );
+    assert_eq!(
+        self_context["relevant_counterpart_experiences"],
+        serde_json::json!(["experience:relevant-shared-review"])
+    );
+    let serialized_input = cloud_request["input"].as_str().unwrap();
+    assert!(!serialized_input.contains("experience:private-unselected-history"));
+    assert!(!serialized_input.contains("绝不能外发的无关个人资料"));
+    assert!(
+        cloud_disclosure
+            .retrieved_sources()
+            .contains(&OutboundContextSource::SelfBundleState { version: 1 })
+    );
+    assert!(
+        cloud_disclosure
+            .retrieved_sources()
+            .contains(&OutboundContextSource::IdentityState { version: 1 })
+    );
+    assert!(
+        cloud_disclosure
+            .retrieved_sources()
+            .contains(&OutboundContextSource::LedgerClaim {
+                claim_id: ClaimId::from_raw(1),
+            })
+    );
+    assert_eq!(
+        cloud_disclosure
+            .evidence_ids()
+            .iter()
+            .map(|id| id.get())
+            .collect::<Vec<_>>(),
+        [3, 1]
+    );
+}
+
+#[test]
+fn dangling_belief_fails_before_person_evidence_or_runtime_invocation() {
+    let dangling = ClaimId::from_raw(999_999);
+    let repository =
+        ready_in_memory_repository().with_self_bundle_snapshot(SelfBundleSnapshot::restore(
+            1,
+            1,
+            1,
+            Vec::new(),
+            vec![dangling],
+            "共同回看".to_owned(),
+            Vec::new(),
+        ));
+    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
+    let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_500));
+    let context = core.freeze_working_context(&[]).unwrap();
+
+    let error = core
+        .run_counterpart_turn(
+            SessionId::new("dangling-belief"),
+            "这条消息不能落盘。",
+            context,
+        )
+        .expect_err("a dangling Self Bundle belief must fail closed");
+
+    assert_eq!(
+        error,
+        CoreError::CounterpartSelfContext(CounterpartSelfContextError::BeliefNotFound(dangling))
+    );
+    assert!(core.repository().all_evidence().unwrap().is_empty());
+    assert!(core.runtime().disclosures().is_empty());
+}
+
+#[test]
+fn mismatched_self_bundle_identity_fails_before_formal_conversation() {
+    let repository =
+        ready_in_memory_repository().with_self_bundle_snapshot(SelfBundleSnapshot::restore(
+            1,
+            1,
+            2,
+            Vec::new(),
+            Vec::new(),
+            "共同回看".to_owned(),
+            Vec::new(),
+        ));
+    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
+    let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_600));
+    let context = core.freeze_working_context(&[]).unwrap();
+
+    let error = core
+        .run_counterpart_turn(
+            SessionId::new("mismatched-self-bundle"),
+            "这条消息不能落盘。",
+            context,
+        )
+        .expect_err("a mismatched Self Bundle identity must fail closed");
+
+    assert_eq!(error, CoreError::CounterpartStateChanged);
+    assert!(core.repository().all_evidence().unwrap().is_empty());
+    assert!(core.runtime().disclosures().is_empty());
+}
+
+#[test]
+fn oversized_counterpart_self_context_fails_before_formal_conversation() {
+    let repository =
+        ready_in_memory_repository().with_self_bundle_snapshot(SelfBundleSnapshot::restore(
+            1,
+            1,
+            1,
+            Vec::new(),
+            Vec::new(),
+            "共同回看".to_owned(),
+            vec!["x".repeat(MAX_COUNTERPART_SELF_CONTEXT_BYTES + 1)],
+        ));
+    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
+    let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_700));
+    let context = core.freeze_working_context(&[]).unwrap();
+
+    let error = core
+        .run_counterpart_turn(
+            SessionId::new("oversized-self-context"),
+            "这条消息不能落盘。",
+            context,
+        )
+        .expect_err("an oversized Self Bundle projection must fail closed");
+
+    assert_eq!(
+        error,
+        CoreError::CounterpartSelfContext(CounterpartSelfContextError::BudgetExceeded)
+    );
+    assert!(core.repository().all_evidence().unwrap().is_empty());
+    assert!(core.runtime().disclosures().is_empty());
 }
 
 #[test]
@@ -1021,10 +1259,10 @@ fn runtime_receives_the_current_self_bundle_identity_and_emits_a_strict_revision
     );
     let request: Value = serde_json::from_str(disclosure.request_json()).unwrap();
     let input: Value = serde_json::from_str(request["input"].as_str().unwrap()).unwrap();
-    assert_eq!(input["identity"]["constitution_version"], 7);
-    assert_eq!(input["identity"]["self_bundle_version"], 1);
-    assert_eq!(input["identity"]["state"]["version"], 1);
-    assert_eq!(input["identity"]["state"]["name"], "岚");
+    assert_eq!(input["self_context"]["constitution_version"], 7);
+    assert_eq!(input["self_context"]["self_bundle_version"], 1);
+    assert_eq!(input["self_context"]["identity"]["version"], 1);
+    assert_eq!(input["self_context"]["identity"]["name"], "岚");
     assert!(
         request["text"]["format"]["schema"]
             .to_string()
@@ -1313,6 +1551,7 @@ fn response_payload_and_disclosure_contain_only_the_frozen_retrieval_result() {
                 evidence_id: 900,
                 block_id: 901,
             },
+            OutboundContextSource::SelfBundleState { version: 1 },
             OutboundContextSource::IdentityState { version: 1 },
         ]
     );

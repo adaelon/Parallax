@@ -7,7 +7,7 @@ use crate::{
     IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot,
     MAX_OPEN_REFLECTION_INVITATIONS, MemoryRepository, ReflectionInvitation,
     ReflectionInvitationId, ReflectionInvitationReceipt, ReflectionInvitationRepository,
-    ReflectionInvitationState, RepositoryError, SharedAgreementCandidate,
+    ReflectionInvitationState, RepositoryError, SelfBundleSnapshot, SharedAgreementCandidate,
     SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedAgreementDecision,
     SharedAgreementResolution, SharedExperience, SharedExperienceKind, SharedExperienceRepository,
     Speaker, Timestamp, agreement_is_active_at,
@@ -24,6 +24,7 @@ pub struct InMemoryRepository {
     shared_experiences: BTreeMap<ClaimId, SharedExperience>,
     counterpart_readiness: CounterpartReadiness,
     identity_context: Option<IdentityRuntimeContext>,
+    self_bundle_snapshot: Option<SelfBundleSnapshot>,
     identity_history: Vec<IdentityStateSnapshot>,
     next_reflection_invitation_id: u64,
     reflection_invitations: BTreeMap<ReflectionInvitationId, ReflectionInvitation>,
@@ -50,6 +51,7 @@ impl InMemoryRepository {
             shared_experiences: BTreeMap::new(),
             counterpart_readiness: CounterpartReadiness::NeedsIntroduction,
             identity_context: None,
+            self_bundle_snapshot: None,
             identity_history: Vec::new(),
             next_reflection_invitation_id: 1,
             reflection_invitations: BTreeMap::new(),
@@ -76,6 +78,15 @@ impl InMemoryRepository {
                 "identity context versions must be greater than zero",
             ));
         }
+        self.self_bundle_snapshot = Some(SelfBundleSnapshot::restore(
+            context.self_bundle_version(),
+            context.constitution_version(),
+            context.state().version(),
+            Vec::new(),
+            Vec::new(),
+            context.state().profile().relationship_posture().to_owned(),
+            Vec::new(),
+        ));
         self.identity_history.push(context.state().clone());
         self.counterpart_readiness = CounterpartReadiness::Ready {
             identity_version: context.state().version(),
@@ -83,6 +94,14 @@ impl InMemoryRepository {
         };
         self.identity_context = Some(context);
         Ok(self)
+    }
+
+    /// Overrides the current Self Bundle projection for deterministic Core
+    /// and runtime-contract tests, including intentionally inconsistent state.
+    #[must_use]
+    pub fn with_self_bundle_snapshot(mut self, snapshot: SelfBundleSnapshot) -> Self {
+        self.self_bundle_snapshot = Some(snapshot);
+        self
     }
 
     /// Overrides the derived state for deterministic non-ready adapter tests.
@@ -153,6 +172,14 @@ impl IdentityEvolutionRepository for InMemoryRepository {
         Ok(self.identity_context.clone())
     }
 
+    fn current_self_bundle_snapshot(&self) -> Result<Option<SelfBundleSnapshot>, RepositoryError> {
+        Ok(self.self_bundle_snapshot.clone())
+    }
+
+    fn counterpart_belief(&self, id: ClaimId) -> Result<Option<Claim>, RepositoryError> {
+        Ok(self.claims.get(&id).cloned())
+    }
+
     fn commit_identity_revision(
         &mut self,
         revision: IdentityRevisionCommit,
@@ -185,8 +212,29 @@ impl IdentityEvolutionRepository for InMemoryRepository {
             .self_bundle_version()
             .checked_add(1)
             .ok_or_else(|| RepositoryError::new("Self Bundle version space exhausted"))?;
+        let current_bundle = self
+            .self_bundle_snapshot
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new("Self Bundle is not initialized"))?;
+        if current_bundle.version() != current.self_bundle_version()
+            || current_bundle.constitution_version() != current.constitution_version()
+            || current_bundle.identity_state_version() != current.state().version()
+        {
+            return Err(RepositoryError::new(
+                "Self Bundle projection does not match the current identity",
+            ));
+        }
         let state = revision.state().clone();
         let identity_version = state.version();
+        self.self_bundle_snapshot = Some(SelfBundleSnapshot::restore(
+            self_bundle_version,
+            current_bundle.constitution_version(),
+            identity_version,
+            current_bundle.counterpart_experience_refs().to_vec(),
+            current_bundle.belief_refs().to_vec(),
+            current_bundle.relationship_state().to_owned(),
+            current_bundle.pending_intentions().to_vec(),
+        ));
         self.identity_history.push(state.clone());
         self.identity_context = Some(IdentityRuntimeContext::new(
             current.constitution_version(),

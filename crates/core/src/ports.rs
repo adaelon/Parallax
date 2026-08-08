@@ -10,9 +10,9 @@ use crate::{
     IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot,
     PatternMaturityCommitOutcome, PatternMaturityProposal, PersonTurnClassification,
     ReflectionInvitation, ReflectionInvitationId, ReflectionInvitationReceipt,
-    ReflectionInvitationState, RuntimeRequest, RuntimeResponse, SharedAgreementCandidate,
-    SharedAgreementCandidateId, SharedAgreementDecision, SharedAgreementResolution,
-    SharedExperience, Timestamp,
+    ReflectionInvitationState, RuntimeRequest, RuntimeResponse, SelfBundleSnapshot,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
+    SharedAgreementResolution, SharedExperience, Timestamp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +210,23 @@ pub trait IdentityEvolutionRepository: MemoryRepository {
     /// Returns an adapter error when identity and Self Bundle pointers are
     /// incomplete, inconsistent, or cannot be decoded.
     fn current_identity_context(&self) -> Result<Option<IdentityRuntimeContext>, RepositoryError>;
+
+    /// Loads the current immutable Self Bundle projection without resolving
+    /// belief references or selecting turn-relevant experiences.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the current bundle is missing children,
+    /// structurally invalid, or cannot be decoded.
+    fn current_self_bundle_snapshot(&self) -> Result<Option<SelfBundleSnapshot>, RepositoryError>;
+
+    /// Resolves one Self Bundle belief reference to its authoritative claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the ledger cannot be queried. A missing
+    /// claim is represented by `None` so Core can fail the context closed.
+    fn counterpart_belief(&self, id: ClaimId) -> Result<Option<Claim>, RepositoryError>;
 
     /// Atomically appends one validated identity state and advances the Self
     /// Bundle to that exact version.

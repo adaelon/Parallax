@@ -1604,6 +1604,7 @@ pub struct WorkingContext {
     retrieved: Vec<RetrievedContextItem>,
     retrieval_snapshot: Option<RetrievalSnapshot>,
     active_relational_constraints: Vec<ActiveRelationalConstraint>,
+    relevant_counterpart_experience_refs: Vec<String>,
     reflection_opportunity: ReflectionOpportunity,
     decision_impact: DecisionImpact,
     frozen_at: Timestamp,
@@ -1616,6 +1617,7 @@ impl WorkingContext {
             retrieved: Vec::new(),
             retrieval_snapshot: None,
             active_relational_constraints: Vec::new(),
+            relevant_counterpart_experience_refs: Vec::new(),
             reflection_opportunity: ReflectionOpportunity::UnrelatedTask,
             decision_impact: DecisionImpact::Ordinary,
             frozen_at,
@@ -1692,6 +1694,30 @@ impl WorkingContext {
         Ok(self)
     }
 
+    /// Attaches the Self Bundle experience references selected as relevant to
+    /// this frozen turn. Core still verifies every reference against the
+    /// current persisted Self Bundle before exposing it to a runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkingContextError`] for empty or duplicate references.
+    pub fn with_relevant_counterpart_experiences(
+        mut self,
+        references: Vec<String>,
+    ) -> Result<Self, WorkingContextError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for reference in &references {
+            if reference.trim().is_empty() {
+                return Err(WorkingContextError::EmptyCounterpartExperienceReference);
+            }
+            if !seen.insert(reference.as_str()) {
+                return Err(WorkingContextError::DuplicateCounterpartExperienceReference);
+            }
+        }
+        self.relevant_counterpart_experience_refs = references;
+        Ok(self)
+    }
+
     #[must_use]
     pub const fn with_decision_impact(mut self, impact: DecisionImpact) -> Self {
         self.decision_impact = impact;
@@ -1722,6 +1748,11 @@ impl WorkingContext {
     #[must_use]
     pub fn active_relational_constraints(&self) -> &[ActiveRelationalConstraint] {
         &self.active_relational_constraints
+    }
+
+    #[must_use]
+    pub fn relevant_counterpart_experience_refs(&self) -> &[String] {
+        &self.relevant_counterpart_experience_refs
     }
 
     #[must_use]
@@ -2080,6 +2111,8 @@ pub enum WorkingContextError {
     EmptyEvidenceWindow,
     InactiveRelationalConstraint(ClaimId),
     DuplicateRelationalConstraint(ClaimId),
+    EmptyCounterpartExperienceReference,
+    DuplicateCounterpartExperienceReference,
 }
 
 impl fmt::Display for WorkingContextError {
@@ -2095,6 +2128,12 @@ impl fmt::Display for WorkingContextError {
             }
             Self::DuplicateRelationalConstraint(_) => {
                 "working context contains the same relational constraint more than once"
+            }
+            Self::EmptyCounterpartExperienceReference => {
+                "working context contains an empty counterpart experience reference"
+            }
+            Self::DuplicateCounterpartExperienceReference => {
+                "working context contains the same counterpart experience reference more than once"
             }
         })
     }
@@ -2981,6 +3020,254 @@ impl IdentityRuntimeContext {
     }
 }
 
+/// Maximum dynamic content admitted into one ordinary-turn counterpart self
+/// context. The estimate includes a conservative allowance for JSON structure
+/// in addition to every emitted UTF-8 string.
+pub const MAX_COUNTERPART_SELF_CONTEXT_BYTES: usize = 64 * 1_024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelfBundleSnapshot {
+    version: u64,
+    constitution_version: u64,
+    identity_state_version: u64,
+    counterpart_experience_refs: Vec<String>,
+    belief_refs: Vec<ClaimId>,
+    relationship_state: String,
+    pending_intentions: Vec<String>,
+}
+
+impl SelfBundleSnapshot {
+    /// Restores the current immutable Self Bundle projection supplied by a
+    /// trusted repository adapter. Core validates it against readiness and the
+    /// current identity before any formal-conversation side effect.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        version: u64,
+        constitution_version: u64,
+        identity_state_version: u64,
+        counterpart_experience_refs: Vec<String>,
+        belief_refs: Vec<ClaimId>,
+        relationship_state: String,
+        pending_intentions: Vec<String>,
+    ) -> Self {
+        Self {
+            version,
+            constitution_version,
+            identity_state_version,
+            counterpart_experience_refs,
+            belief_refs,
+            relationship_state,
+            pending_intentions,
+        }
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn constitution_version(&self) -> u64 {
+        self.constitution_version
+    }
+
+    #[must_use]
+    pub const fn identity_state_version(&self) -> u64 {
+        self.identity_state_version
+    }
+
+    #[must_use]
+    pub fn counterpart_experience_refs(&self) -> &[String] {
+        &self.counterpart_experience_refs
+    }
+
+    #[must_use]
+    pub fn belief_refs(&self) -> &[ClaimId] {
+        &self.belief_refs
+    }
+
+    #[must_use]
+    pub fn relationship_state(&self) -> &str {
+        &self.relationship_state
+    }
+
+    #[must_use]
+    pub fn pending_intentions(&self) -> &[String] {
+        &self.pending_intentions
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CounterpartSelfContextError {
+    InvalidSelfBundleState,
+    BeliefNotFound(ClaimId),
+    BeliefNotActive(ClaimId),
+    BeliefEvidenceNotFound(EvidenceId),
+    BeliefEvidenceInvalid(EvidenceId),
+    RelevantExperienceNotFound(String),
+    BudgetExceeded,
+}
+
+impl fmt::Display for CounterpartSelfContextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for CounterpartSelfContextError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterpartSelfContext {
+    identity: IdentityRuntimeContext,
+    relationship_state: String,
+    active_beliefs: Vec<Claim>,
+    pending_intentions: Vec<String>,
+    relevant_counterpart_experiences: Vec<String>,
+    accounted_bytes: usize,
+}
+
+impl CounterpartSelfContext {
+    pub(crate) fn new(
+        identity: IdentityRuntimeContext,
+        relationship_state: String,
+        active_beliefs: Vec<Claim>,
+        pending_intentions: Vec<String>,
+        relevant_counterpart_experiences: Vec<String>,
+    ) -> Result<Self, CounterpartSelfContextError> {
+        if relationship_state.trim().is_empty()
+            || has_invalid_or_duplicate_strings(&pending_intentions)
+            || has_invalid_or_duplicate_strings(&relevant_counterpart_experiences)
+            || active_beliefs.iter().any(|claim| {
+                claim.owner() != ClaimOwner::Counterpart
+                    || claim.status() != ClaimStatus::Current
+                    || claim.support().is_empty()
+            })
+            || active_beliefs
+                .iter()
+                .map(Claim::id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != active_beliefs.len()
+        {
+            return Err(CounterpartSelfContextError::InvalidSelfBundleState);
+        }
+
+        let accounted_bytes = estimate_counterpart_self_context_bytes(
+            &identity,
+            &relationship_state,
+            &active_beliefs,
+            &pending_intentions,
+            &relevant_counterpart_experiences,
+        );
+        if accounted_bytes > MAX_COUNTERPART_SELF_CONTEXT_BYTES {
+            return Err(CounterpartSelfContextError::BudgetExceeded);
+        }
+
+        Ok(Self {
+            identity,
+            relationship_state,
+            active_beliefs,
+            pending_intentions,
+            relevant_counterpart_experiences,
+            accounted_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &IdentityRuntimeContext {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn constitution_version(&self) -> u64 {
+        self.identity.constitution_version()
+    }
+
+    #[must_use]
+    pub const fn self_bundle_version(&self) -> u64 {
+        self.identity.self_bundle_version()
+    }
+
+    #[must_use]
+    pub const fn identity_state(&self) -> &IdentityStateSnapshot {
+        self.identity.state()
+    }
+
+    #[must_use]
+    pub fn relationship_state(&self) -> &str {
+        &self.relationship_state
+    }
+
+    #[must_use]
+    pub fn active_beliefs(&self) -> &[Claim] {
+        &self.active_beliefs
+    }
+
+    #[must_use]
+    pub fn pending_intentions(&self) -> &[String] {
+        &self.pending_intentions
+    }
+
+    #[must_use]
+    pub fn relevant_counterpart_experiences(&self) -> &[String] {
+        &self.relevant_counterpart_experiences
+    }
+
+    #[must_use]
+    pub const fn accounted_bytes(&self) -> usize {
+        self.accounted_bytes
+    }
+}
+
+fn has_invalid_or_duplicate_strings(values: &[String]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    values
+        .iter()
+        .any(|value| value.trim().is_empty() || !seen.insert(value.as_str()))
+}
+
+fn estimate_counterpart_self_context_bytes(
+    identity: &IdentityRuntimeContext,
+    relationship_state: &str,
+    active_beliefs: &[Claim],
+    pending_intentions: &[String],
+    relevant_counterpart_experiences: &[String],
+) -> usize {
+    const STRUCTURAL_ALLOWANCE: usize = 1_024;
+    const ITEM_ALLOWANCE: usize = 128;
+    let state = identity.state();
+    let profile = state.profile();
+    let mut total = STRUCTURAL_ALLOWANCE
+        .saturating_add(profile.name().len())
+        .saturating_add(profile.expression_traits().len())
+        .saturating_add(profile.viewpoints().len())
+        .saturating_add(profile.value_priorities().len())
+        .saturating_add(profile.relationship_posture().len())
+        .saturating_add(profile.own_goals().len())
+        .saturating_add(state.change_reason().len())
+        .saturating_add(relationship_state.len());
+    for belief in active_beliefs {
+        total = total
+            .saturating_add(ITEM_ALLOWANCE)
+            .saturating_add(belief.statement().len());
+        for citation in belief.support() {
+            total = total
+                .saturating_add(ITEM_ALLOWANCE)
+                .saturating_add(citation.quote().len());
+        }
+    }
+    for value in pending_intentions
+        .iter()
+        .chain(relevant_counterpart_experiences)
+    {
+        total = total
+            .saturating_add(ITEM_ALLOWANCE)
+            .saturating_add(value.len());
+    }
+    total
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdentityRevisionAuthorship {
     Counterpart,
@@ -3653,7 +3940,7 @@ pub struct RuntimeRequest {
     prompt: ConversationEvidence,
     working_context: WorkingContext,
     pending_agreement_candidates: Vec<SharedAgreementCandidate>,
-    identity: IdentityRuntimeContext,
+    self_context: CounterpartSelfContext,
     reflection: Option<ReflectionRuntimeContext>,
 }
 
@@ -3662,14 +3949,14 @@ impl RuntimeRequest {
         prompt: ConversationEvidence,
         working_context: WorkingContext,
         pending_agreement_candidates: Vec<SharedAgreementCandidate>,
-        identity: IdentityRuntimeContext,
+        self_context: CounterpartSelfContext,
         reflection: Option<ReflectionRuntimeContext>,
     ) -> Self {
         Self {
             prompt,
             working_context,
             pending_agreement_candidates,
-            identity,
+            self_context,
             reflection,
         }
     }
@@ -3690,8 +3977,13 @@ impl RuntimeRequest {
     }
 
     #[must_use]
+    pub const fn self_context(&self) -> &CounterpartSelfContext {
+        &self.self_context
+    }
+
+    #[must_use]
     pub const fn identity(&self) -> &IdentityRuntimeContext {
-        &self.identity
+        self.self_context.identity()
     }
 
     #[must_use]

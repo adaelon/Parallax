@@ -4,14 +4,14 @@ use crate::{
     AgreementWithdrawal, AgreementWithdrawalActor, AgreementWithdrawalRejection,
     AgreementWithdrawalRejectionReason, ApplicableTime, Claim, ClaimCorrectionReceipt,
     ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, Clock, ConversationEvidence,
-    CounterpartReadiness, CounterpartReplyAttribution, CounterpartRuntime, EvidenceCitation,
-    EvidenceId, ForgetReceipt, ForgetRepository, ForgetRequest, G08_IMMEDIATE_SAFETY_QUOTE,
-    IdentityEvolutionRepository, IdentityField, IdentityPersonRepresentation,
-    IdentityProfileChanges, IdentityProfileSnapshot, IdentityReflectivePurposeStatus,
-    IdentityRevisionAuthorship, IdentityRevisionCommit, IdentityRevisionReceipt,
-    IdentityRevisionRejection, IdentityRevisionRejectionReason, IdentityRuntimeContext,
-    IdentityStateSnapshot, JudgmentProposal, JudgmentRejection, JudgmentRejectionReason,
-    MAX_OPEN_REFLECTION_INVITATIONS, MAX_REFLECTION_EVIDENCE_REFS,
+    CounterpartReadiness, CounterpartReplyAttribution, CounterpartRuntime, CounterpartSelfContext,
+    CounterpartSelfContextError, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository,
+    ForgetRequest, G08_IMMEDIATE_SAFETY_QUOTE, IdentityEvolutionRepository, IdentityField,
+    IdentityPersonRepresentation, IdentityProfileChanges, IdentityProfileSnapshot,
+    IdentityReflectivePurposeStatus, IdentityRevisionAuthorship, IdentityRevisionCommit,
+    IdentityRevisionReceipt, IdentityRevisionRejection, IdentityRevisionRejectionReason,
+    IdentityRuntimeContext, IdentityStateSnapshot, JudgmentProposal, JudgmentRejection,
+    JudgmentRejectionReason, MAX_OPEN_REFLECTION_INVITATIONS, MAX_REFLECTION_EVIDENCE_REFS,
     MAX_REFLECTION_OBSERVATION_BYTES, MAX_REFLECTION_TOPIC_BYTES, MAX_REFLECTION_WHY_NOW_BYTES,
     MemoryRepository, PatternMaturityCommitOutcome, PatternMaturityReceipt,
     PatternMaturityWriteRejection, PatternMaturityWriteRejectionReason, PersonTurnClassification,
@@ -36,6 +36,7 @@ pub enum CoreError {
     EmptyConversationTurn,
     CounterpartNotReady(CounterpartReadiness),
     CounterpartStateChanged,
+    CounterpartSelfContext(CounterpartSelfContextError),
     EmptyCorrection,
     UnchangedCorrection,
     InvalidCorrectionTime,
@@ -125,6 +126,9 @@ impl fmt::Display for CoreError {
             Self::CounterpartStateChanged => formatter.write_str(
                 "counterpart identity or Self Bundle changed while opening formal conversation",
             ),
+            Self::CounterpartSelfContext(error) => {
+                write!(formatter, "counterpart self context is invalid: {error}")
+            }
             Self::EmptyCorrection => formatter.write_str("correction statement cannot be empty"),
             Self::UnchangedCorrection => {
                 formatter.write_str("correction statement must change the claim")
@@ -490,7 +494,8 @@ where
         person_verbatim: impl Into<String>,
         working_context: WorkingContext,
     ) -> Result<TurnOutcome, CoreError> {
-        let (ready_identity_version, identity) = self.require_ready_identity_context()?;
+        let (ready_identity_version, identity, self_context) =
+            self.require_ready_counterpart_context(&working_context)?;
 
         let (person_evidence_id, classification) =
             self.record_person_turn(session_id.clone(), person_verbatim)?;
@@ -516,7 +521,7 @@ where
             prompt.clone(),
             working_context,
             pending_agreement_candidates,
-            identity.clone(),
+            self_context,
             reflection.clone(),
         );
         let validation_context = request.working_context().clone();
@@ -542,8 +547,7 @@ where
             &prompt,
             &counterpart_evidence,
         )?;
-        let agreement_assents =
-            self.persist_shared_agreement_assents(&response, &counterpart_evidence)?;
+        let assents = self.persist_shared_agreement_assents(&response, &counterpart_evidence)?;
         let departures = self.persist_relational_constraint_departures(
             &response,
             &validation_context,
@@ -582,7 +586,7 @@ where
             response.citations().to_vec(),
         )
         .with_judgments(judgments.accepted, judgments.rejected)
-        .with_agreement_assents(agreement_assents.assented, agreement_assents.rejected)
+        .with_agreement_assents(assents.assented, assents.rejected)
         .with_constraint_departures(departures.recorded, departures.rejected)
         .with_agreement_withdrawals(withdrawals.recorded, withdrawals.rejected)
         .with_identity_revision(identity_revision.accepted, identity_revision.rejected)
@@ -596,7 +600,10 @@ where
         .with_rejected_operations(rejected_structured_operations(&response)))
     }
 
-    fn require_ready_identity_context(&self) -> Result<(u64, IdentityRuntimeContext), CoreError> {
+    fn require_ready_counterpart_context(
+        &self,
+        working_context: &WorkingContext,
+    ) -> Result<(u64, IdentityRuntimeContext, CounterpartSelfContext), CoreError> {
         let (ready_identity_version, ready_self_bundle_version) =
             match self.repository.conversation_readiness()? {
                 CounterpartReadiness::Ready {
@@ -609,12 +616,84 @@ where
             .repository
             .current_identity_context()?
             .ok_or(CoreError::CounterpartStateChanged)?;
+        let self_bundle = self
+            .repository
+            .current_self_bundle_snapshot()?
+            .ok_or(CoreError::CounterpartStateChanged)?;
         if identity.state().version() != ready_identity_version
             || identity.self_bundle_version() != ready_self_bundle_version
+            || self_bundle.version() != ready_self_bundle_version
+            || self_bundle.constitution_version() != identity.constitution_version()
+            || self_bundle.identity_state_version() != ready_identity_version
         {
             return Err(CoreError::CounterpartStateChanged);
         }
-        Ok((ready_identity_version, identity))
+
+        let selected_experiences = working_context
+            .relevant_counterpart_experience_refs()
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        for selected in &selected_experiences {
+            if !self_bundle
+                .counterpart_experience_refs()
+                .iter()
+                .any(|stored| stored == selected)
+            {
+                return Err(CoreError::CounterpartSelfContext(
+                    CounterpartSelfContextError::RelevantExperienceNotFound((*selected).to_owned()),
+                ));
+            }
+        }
+        let relevant_counterpart_experiences = self_bundle
+            .counterpart_experience_refs()
+            .iter()
+            .filter(|stored| selected_experiences.contains(stored.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut active_beliefs = Vec::with_capacity(self_bundle.belief_refs().len());
+        for belief_id in self_bundle.belief_refs() {
+            let belief = self.repository.counterpart_belief(*belief_id)?.ok_or(
+                CoreError::CounterpartSelfContext(CounterpartSelfContextError::BeliefNotFound(
+                    *belief_id,
+                )),
+            )?;
+            if belief.owner() != ClaimOwner::Counterpart
+                || belief.status() != ClaimStatus::Current
+                || belief.support().is_empty()
+            {
+                return Err(CoreError::CounterpartSelfContext(
+                    CounterpartSelfContextError::BeliefNotActive(*belief_id),
+                ));
+            }
+            for citation in belief.support() {
+                let evidence = self.repository.evidence(citation.evidence_id())?.ok_or(
+                    CoreError::CounterpartSelfContext(
+                        CounterpartSelfContextError::BeliefEvidenceNotFound(citation.evidence_id()),
+                    ),
+                )?;
+                if citation.quote().is_empty()
+                    || !evidence.verbatim().contains(citation.quote())
+                    || !evidence.can_support_counterpart_knowledge()
+                {
+                    return Err(CoreError::CounterpartSelfContext(
+                        CounterpartSelfContextError::BeliefEvidenceInvalid(citation.evidence_id()),
+                    ));
+                }
+            }
+            active_beliefs.push(belief);
+        }
+
+        let self_context = CounterpartSelfContext::new(
+            identity.clone(),
+            self_bundle.relationship_state().to_owned(),
+            active_beliefs,
+            self_bundle.pending_intentions().to_vec(),
+            relevant_counterpart_experiences,
+        )
+        .map_err(CoreError::CounterpartSelfContext)?;
+        Ok((ready_identity_version, identity, self_context))
     }
 
     fn persist_pattern_maturity_proposals(

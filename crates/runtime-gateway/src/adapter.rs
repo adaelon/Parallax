@@ -2,15 +2,15 @@ use std::{collections::BTreeSet, fmt::Write, time::Duration};
 
 use eam_core::{
     ActiveRelationalConstraint, AgreementWithdrawalProposal, ApplicableTime, ClaimOwner,
-    ConversationEvidence, CounterpartRuntime, DecisionImpact, DisputeState, EvidenceCitation,
-    EvidenceId, IdentityPersonRepresentation, IdentityProfileChanges,
+    ConversationEvidence, CounterpartRuntime, CounterpartSelfContext, DecisionImpact, DisputeState,
+    EvidenceCitation, EvidenceId, IdentityPersonRepresentation, IdentityProfileChanges,
     IdentityReflectivePurposeStatus, IdentityRevisionAuthorship, IdentityRevisionProposal,
-    IdentityRuntimeContext, JudgmentProposal, PatternMaturityProposal, PersonTurnClassification,
-    ReflectionImportance, ReflectionInvitationBasis, ReflectionInvitationProposal,
-    ReflectionInvitationState, ReflectionRuntimeContext, ReflectionRuntimeDisposition,
-    RelationalConstraintDeparture, RelationalConstraintPriority, RetrievedContextItem,
-    RuntimeError, RuntimeRequest, RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate,
-    SharedExperienceKind, SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
+    JudgmentProposal, PatternMaturityProposal, PersonTurnClassification, ReflectionImportance,
+    ReflectionInvitationBasis, ReflectionInvitationProposal, ReflectionInvitationState,
+    ReflectionRuntimeContext, ReflectionRuntimeDisposition, RelationalConstraintDeparture,
+    RelationalConstraintPriority, RetrievedContextItem, RuntimeError, RuntimeRequest,
+    RuntimeResponse, SharedAgreementAssent, SharedAgreementCandidate, SharedExperienceKind,
+    SharedExperienceProposal, SourceCurrentness, Speaker, Uncertainty,
 };
 use eam_identity::{
     IdentityAuthorship, IdentityProfile, IdentityRuntime, InitialIdentityProposal,
@@ -271,7 +271,7 @@ where
         let input = serde_json::to_string(&TurnInput {
             kind: "response",
             prompt: EvidenceInput::from(request.prompt()),
-            identity: IdentityRuntimeInput::from(request.identity()),
+            self_context: CounterpartSelfContextInput::from(request.self_context()),
             reflection: request.reflection().map(ReflectionRuntimeInput::from),
             pending_agreement_candidates: request
                 .pending_agreement_candidates()
@@ -420,9 +420,32 @@ fn response_outbound_selection(
             retrieved_sources.push(source);
         }
     }
-    retrieved_sources.push(OutboundContextSource::IdentityState {
-        version: request.identity().state().version(),
-    });
+    let self_context = request.self_context();
+    for source in [
+        OutboundContextSource::SelfBundleState {
+            version: self_context.self_bundle_version(),
+        },
+        OutboundContextSource::IdentityState {
+            version: self_context.identity_state().version(),
+        },
+    ] {
+        if !retrieved_sources.contains(&source) {
+            retrieved_sources.push(source);
+        }
+    }
+    for claim in self_context.active_beliefs() {
+        let source = OutboundContextSource::LedgerClaim {
+            claim_id: claim.id(),
+        };
+        if !retrieved_sources.contains(&source) {
+            retrieved_sources.push(source);
+        }
+        for evidence_id in claim.support().iter().map(EvidenceCitation::evidence_id) {
+            if !evidence_ids.contains(&evidence_id) {
+                evidence_ids.push(evidence_id);
+            }
+        }
+    }
     if let Some(reflection) = request.reflection() {
         for id in reflection
             .invitation()
@@ -515,18 +538,22 @@ const fn self_introduction_category_name(category: SelfIntroductionCategory) -> 
 struct TurnInput<'a> {
     kind: &'static str,
     prompt: EvidenceInput<'a>,
-    identity: IdentityRuntimeInput<'a>,
+    self_context: CounterpartSelfContextInput<'a>,
     reflection: Option<ReflectionRuntimeInput<'a>>,
     pending_agreement_candidates: Vec<PendingAgreementCandidateInput<'a>>,
     working_context: WorkingContextInput<'a>,
 }
 
 #[derive(Serialize)]
-struct IdentityRuntimeInput<'a> {
+struct CounterpartSelfContextInput<'a> {
     constitution_version: u64,
     reflective_purpose: &'static str,
     self_bundle_version: u64,
-    state: IdentityStateInput<'a>,
+    identity: IdentityStateInput<'a>,
+    relationship_state: &'a str,
+    active_beliefs: Vec<RetrievedClaimInput<'a>>,
+    pending_intentions: Vec<&'a str>,
+    relevant_counterpart_experiences: Vec<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -544,14 +571,14 @@ struct IdentityStateInput<'a> {
     formed_at_millis: i64,
 }
 
-impl<'a> From<&'a IdentityRuntimeContext> for IdentityRuntimeInput<'a> {
-    fn from(value: &'a IdentityRuntimeContext) -> Self {
-        let state = value.state();
+impl<'a> From<&'a CounterpartSelfContext> for CounterpartSelfContextInput<'a> {
+    fn from(value: &'a CounterpartSelfContext) -> Self {
+        let state = value.identity_state();
         Self {
             constitution_version: value.constitution_version(),
             reflective_purpose: "help_the_person_build_a_more_accurate_complete_and_change_explaining_self_understanding",
             self_bundle_version: value.self_bundle_version(),
-            state: IdentityStateInput {
+            identity: IdentityStateInput {
                 version: state.version(),
                 predecessor_version: state.predecessor_version(),
                 name: state.profile().name(),
@@ -564,6 +591,22 @@ impl<'a> From<&'a IdentityRuntimeContext> for IdentityRuntimeInput<'a> {
                 evidence_ids: state.evidence_refs().iter().map(|id| id.get()).collect(),
                 formed_at_millis: state.formed_at().as_millis(),
             },
+            relationship_state: value.relationship_state(),
+            active_beliefs: value
+                .active_beliefs()
+                .iter()
+                .map(RetrievedClaimInput::from)
+                .collect(),
+            pending_intentions: value
+                .pending_intentions()
+                .iter()
+                .map(String::as_str)
+                .collect(),
+            relevant_counterpart_experiences: value
+                .relevant_counterpart_experiences()
+                .iter()
+                .map(String::as_str)
+                .collect(),
         }
     }
 }

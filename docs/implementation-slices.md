@@ -1,6 +1,6 @@
 # 首版完整实现切片方案
 
-状态：实施中；S01～S31、S06R-1～S06R-5、S06D 与 S07C-1～S07C-3 已完成；下一片为 S07C-4，S32 在 S07C-9 重新验收并冻结构建前保持锁定
+状态：实施中；S01～S31、S06R-1～S06R-5、S06D 与 S07C-1～S07C-4 已完成；下一片为 S07C-5，S32 在 S07C-9 重新验收并冻结构建前保持锁定
 
 本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 曾形成可安装构建。实机审计发现桌面正式对话绕过 S04/S05 的创建链，且普通运行时允许缺少身份与完整自我包，因此 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 新增 S07C 修订组；任何旧冻结构建都不得再进入 S32。
 
@@ -561,9 +561,9 @@ save(draft) -> validate/build -> Vault commit -> replace active runtime -> Runti
 
 ### S07C 第二自我创建与认识闭环修订
 
-**状态**：已由 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 接受；S07C-1～S07C-3 已完成，S07C-4～S07C-9 尚未实施；重新冻结构建前，S32 保持锁定。
+**状态**：已由 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 接受；S07C-1～S07C-4 已完成，S07C-5～S07C-9 尚未实施；重新冻结构建前，S32 保持锁定。
 
-当前领域层分别具备初始身份和 Self Bundle 能力，但桌面端没有创建入口，正式对话允许 `identity=None`，运行时只收到 Self Bundle 版本号。修订后的可信状态只从持久化事实派生：
+修订前领域层分别具备初始身份和 Self Bundle 能力，但桌面端没有创建入口，正式对话允许 `identity=None`，运行时只收到 Self Bundle 版本号。修订后的可信状态只从持久化事实派生：
 
 ```text
 CounterpartReadiness =
@@ -626,7 +626,7 @@ send_message(message):
 
 #### S07C-4 当前主体状态的最小运行时出口
 
-**状态**：待实施。
+**状态**：已完成；Core 现在从当前身份与完整 Self Bundle 构造有界 `CounterpartSelfContext`，解析并校验活动信念与证据，只选择本轮相关经历，并由 Runtime Gateway 以同一模型无关结构和精确外发记录发送。
 
 **依赖/输入**：S07C-3 的必填普通对话请求、当前 `IdentityStateVersion` 与 `SelfBundleVersion`。
 

@@ -1186,3 +1186,18 @@
 
 **入口**：React 启动调用 `list_conversation`；本人提交 composer 时调用 `send_message({ verbatim })`，两条路径均只经过 Tauri invoke 白名单进入内嵌 Core。
 **测试**：`apps/desktop/src-tauri/src/state.rs::tests::ordinary_conversation_survives_sqlcipher_reopen_without_claims` 覆盖逐字重启恢复与普通问答零 Claim；同模块覆盖输入拒绝和既往上下文冻结；`apps/desktop/src/App.test.tsx` 覆盖恢复、成功发送及运行时失败后的已落盘发言回读。
+
+## 2026-08-08 S07C-4 当前主体状态的最小运行时出口
+
+**触达**:
+- `crates/core/src/domain.rs:WorkingContext::with_relevant_counterpart_experiences/SelfBundleSnapshot/CounterpartSelfContext/RuntimeRequest::self_context` — 冻结本轮相关经历选择，并把当前身份、关系状态、活动信念、未完成意图和相关经历收口为 64 KiB 有界主体上下文。
+- `crates/core/src/ports.rs:IdentityEvolutionRepository::current_self_bundle_snapshot/counterpart_belief` — 让可信 Core 加载完整当前 Self Bundle 并解引用权威信念，运行时仍无 repository 能力。
+- `crates/core/src/memory_loop.rs:MemoryCore::require_ready_counterpart_context` — 在本人证据写入前复核身份/Self Bundle 版本、经历选择、信念活动性及逐字支持证据，任一不一致均失败关闭。
+- `crates/core/src/in_memory.rs:IdentityEvolutionRepository` — 为确定性测试维护完整 Self Bundle 投影，并随身份修订推进同一状态链。
+- `crates/vault/src/repository.rs:IdentityEvolutionRepository` — 从当前加密 Self Bundle 恢复 Core 快照并按 Claim ID 回读权威信念。
+- `crates/runtime-gateway/src/adapter.rs:CounterpartSelfContextInput/response_outbound_selection` — 为 Responses 与 DeepSeek 序列化同一主体状态，并精确登记 Self Bundle、身份、Claim 与实际支持 Evidence。
+- `crates/runtime-gateway/src/transport.rs:OutboundContextSource::SelfBundleState` — 使当前 Self Bundle 版本进入可检查外发来源账本。
+- `docs/runtime-contract-v3.md:普通回应的当前主体状态`、`docs/architecture.md:模型运行时/最小记忆闭环`、`docs/implementation-slices.md:S07C-4` — 同步已实现的运行时契约、主数据流与下一切片状态。
+
+**入口**：`MemoryCore::run_counterpart_turn` 在保存本人消息前构造 `CounterpartSelfContext`；可信上下文构造器可通过 `WorkingContext::with_relevant_counterpart_experiences` 只选择当前 Self Bundle 内与本轮相关的经历引用。
+**测试**：`crates/runtime-gateway/tests/runtime_contract.rs::current_counterpart_self_context_is_complete_bounded_and_model_portable` 覆盖完整选择、双模型等价与未选资料隔离；同文件的 `dangling_belief_fails_before_person_evidence_or_runtime_invocation`、`mismatched_self_bundle_identity_fails_before_formal_conversation`、`oversized_counterpart_self_context_fails_before_formal_conversation` 覆盖三条失败关闭门禁；`cargo test --workspace` 与全目标 Clippy 通过。

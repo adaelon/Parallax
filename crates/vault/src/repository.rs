@@ -23,10 +23,11 @@ use eam_core::{
     MemoryRepository, PatternMaturityCommitOutcome, PatternMaturityProposal,
     PatternMaturityReceipt, ReflectionImportance, ReflectionInvitation, ReflectionInvitationBasis,
     ReflectionInvitationId, ReflectionInvitationReceipt, ReflectionInvitationRepository,
-    ReflectionInvitationState, RelationalConstraintDeparture, RepositoryError, SessionId,
-    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
-    SharedExperienceRepository, Speaker, Timestamp, Uncertainty,
+    ReflectionInvitationState, RelationalConstraintDeparture, RepositoryError, SelfBundleSnapshot,
+    SessionId, SharedAgreementCandidate, SharedAgreementCandidateId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
+    SharedExperience, SharedExperienceKind, SharedExperienceRepository, Speaker, Timestamp,
+    Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -5961,6 +5962,27 @@ impl IdentityEvolutionRepository for VaultRepository {
                 Ok(Some(identity_runtime_context(&identity, &bundle)))
             }
         }
+    }
+
+    fn current_self_bundle_snapshot(&self) -> Result<Option<SelfBundleSnapshot>, RepositoryError> {
+        self.current_self_bundle().map(|bundle| {
+            bundle.map(|bundle| {
+                let state = bundle.state();
+                SelfBundleSnapshot::restore(
+                    bundle.version(),
+                    state.constitution_version(),
+                    state.identity_state_version(),
+                    state.counterpart_experience_refs().to_vec(),
+                    state.belief_refs().to_vec(),
+                    state.relationship_state().to_owned(),
+                    state.pending_intentions().to_vec(),
+                )
+            })
+        })
+    }
+
+    fn counterpart_belief(&self, id: ClaimId) -> Result<Option<Claim>, RepositoryError> {
+        load_claim(self.connection(), id)
     }
 
     fn commit_identity_revision(
