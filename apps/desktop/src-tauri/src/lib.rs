@@ -17,10 +17,11 @@ use eam_desktop_host::{ExitReason, LaunchMode};
 use serde::Serialize;
 use state::{
     ActiveSharedAgreementView, ActivityTimelineEntryView, CaptureStatusView,
-    ConversationTurnResult, ConversationTurnView, HostStatusView, IdentityStateView,
-    ImportContextFileView, ManagedHost, RecoveryKeyView, ReflectionInvitationDecisionView,
-    ReflectionInvitationView, RuntimeProfileDraft, RuntimeProfileTestView, RuntimeProfileView,
-    SharedAgreementResolutionView, SharedAgreementRevisionView, SharedExperienceCeremonyView,
+    ConversationTurnResult, ConversationTurnView, CounterpartReadinessView, HostStatusView,
+    IdentityStateView, ImportContextFileView, InitialSelfIntroductionDraft, ManagedHost,
+    RecoveryKeyView, ReflectionInvitationDecisionView, ReflectionInvitationView,
+    RuntimeProfileDraft, RuntimeProfileTestView, RuntimeProfileView, SharedAgreementResolutionView,
+    SharedAgreementRevisionView, SharedExperienceCeremonyView,
 };
 use tauri::{
     AppHandle, Manager, RunEvent, WindowEvent,
@@ -135,6 +136,36 @@ fn list_conversation(
     host: tauri::State<'_, ManagedHost>,
 ) -> Result<Vec<ConversationTurnView>, String> {
     host.list_conversation()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects command guards by value.
+fn get_counterpart_readiness(
+    host: tauri::State<'_, ManagedHost>,
+) -> Result<CounterpartReadinessView, String> {
+    host.get_counterpart_readiness()
+}
+
+#[tauri::command]
+async fn record_initial_self_introduction(
+    app: AppHandle,
+    draft: InitialSelfIntroductionDraft,
+) -> Result<CounterpartReadinessView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>()
+            .record_initial_self_introduction(draft)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn form_initial_counterpart(app: AppHandle) -> Result<CounterpartReadinessView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedHost>().form_initial_counterpart()
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -440,6 +471,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             list_activity_timeline,
             set_capture_paused,
             list_conversation,
+            get_counterpart_readiness,
+            record_initial_self_introduction,
+            form_initial_counterpart,
             list_shared_experience_ceremonies,
             list_active_shared_agreements,
             list_identity_history,

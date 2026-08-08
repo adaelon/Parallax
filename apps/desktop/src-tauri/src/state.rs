@@ -21,6 +21,10 @@ use eam_core::{
     SystemClock, Timestamp, WorkingContext, agreement_is_active_at,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
+use eam_identity::{
+    CounterpartInconsistencyReason, CounterpartReadiness, CounterpartRepository, IdentityError,
+    IdentityFormation, IdentityRuntime, IntroductionAnswer, SelfIntroductionCategory,
+};
 use eam_ingestion::{
     ArchiveRepository, ArchiveStatus, ImportOutcome, ImportPolicy, RejectReason, UnparsedReason,
     ingest_inbox_file,
@@ -46,8 +50,13 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_TURNS: usize = 32;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 const VAULT_SETUP_INCOMPLETE: &str = "vault setup is not complete";
+const INITIAL_SELF_INTRODUCTION_SESSION_ID: &str = "initial-self-introduction";
 
-type AppRuntime = Box<dyn CounterpartRuntime + Send>;
+trait AppRuntimeContract: CounterpartRuntime + IdentityRuntime {}
+
+impl<T> AppRuntimeContract for T where T: CounterpartRuntime + IdentityRuntime {}
+
+type AppRuntime = Box<dyn AppRuntimeContract + Send>;
 type AppCore = MemoryCore<VaultRepository, AppRuntime, SystemClock>;
 
 pub struct ManagedHost {
@@ -174,6 +183,58 @@ pub struct ConversationTurnResult {
     counterpart: ConversationTurnView,
     ceremonies: Vec<SharedExperienceCeremonyView>,
     reflection_invitations: Vec<ReflectionInvitationView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CounterpartReadinessView {
+    state: &'static str,
+    identity_version: Option<u64>,
+    self_bundle_version: Option<u64>,
+    inconsistency_reason: Option<&'static str>,
+}
+
+/// The fixed six-category input accepted by the initial-introduction command.
+///
+/// The draft is intentionally neither serializable nor debuggable: it flows
+/// from the `WebView` into the trusted host but is never echoed back.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InitialSelfIntroductionDraft {
+    basic_identity_and_address: String,
+    current_life: String,
+    important_people: String,
+    long_term_goals: String,
+    current_concerns: String,
+    desired_reflection: String,
+}
+
+impl InitialSelfIntroductionDraft {
+    fn into_answers(self) -> [IntroductionAnswer; 6] {
+        [
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::BasicIdentityAndAddress,
+                self.basic_identity_and_address,
+            ),
+            IntroductionAnswer::new(SelfIntroductionCategory::CurrentLife, self.current_life),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::ImportantPeople,
+                self.important_people,
+            ),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::LongTermGoals,
+                self.long_term_goals,
+            ),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::CurrentConcerns,
+                self.current_concerns,
+            ),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::DesiredReflection,
+                self.desired_reflection,
+            ),
+        ]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -640,9 +701,80 @@ impl ManagedHost {
         }
     }
 
+    pub fn get_counterpart_readiness(&self) -> Result<CounterpartReadinessView, String> {
+        match &*self.lock() {
+            HostSlot::Ready(host) => load_counterpart_readiness(host.core.repository())
+                .map(CounterpartReadinessView::from),
+            slot => Err(counterpart_slot_error(slot)),
+        }
+    }
+
+    pub fn record_initial_self_introduction(
+        &self,
+        draft: InitialSelfIntroductionDraft,
+    ) -> Result<CounterpartReadinessView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                match load_counterpart_readiness(host.core.repository())? {
+                    CounterpartReadiness::NeedsIntroduction => {}
+                    CounterpartReadiness::IntroductionRecorded
+                    | CounterpartReadiness::Ready { .. } => {
+                        return Err("initial self introduction is already recorded".to_owned());
+                    }
+                    CounterpartReadiness::Inconsistent { .. } => {
+                        return Err("counterpart state is inconsistent".to_owned());
+                    }
+                }
+                let answers = draft.into_answers();
+                let (repository, runtime, clock) = host.core.parts_mut();
+                let mut formation = IdentityFormation::new(repository, runtime.as_mut(), clock);
+                formation
+                    .record_initial_self_introduction(
+                        &SessionId::new(INITIAL_SELF_INTRODUCTION_SESSION_ID),
+                        &answers,
+                    )
+                    .map_err(sanitized_identity_error)?;
+                formation
+                    .counterpart_readiness()
+                    .map(CounterpartReadinessView::from)
+                    .map_err(sanitized_identity_error)
+            }
+            slot => Err(counterpart_slot_error(slot)),
+        }
+    }
+
+    pub fn form_initial_counterpart(&self) -> Result<CounterpartReadinessView, String> {
+        match &mut *self.lock() {
+            HostSlot::Ready(host) => {
+                match load_counterpart_readiness(host.core.repository())? {
+                    CounterpartReadiness::NeedsIntroduction => {
+                        return Err("initial self introduction is required".to_owned());
+                    }
+                    CounterpartReadiness::IntroductionRecorded => {}
+                    CounterpartReadiness::Ready { .. } => {
+                        return Err("counterpart is already created".to_owned());
+                    }
+                    CounterpartReadiness::Inconsistent { .. } => {
+                        return Err("counterpart state is inconsistent".to_owned());
+                    }
+                }
+                let (repository, runtime, clock) = host.core.parts_mut();
+                let mut formation = IdentityFormation::new(repository, runtime.as_mut(), clock);
+                formation
+                    .form_initial_counterpart()
+                    .map(CounterpartReadinessView::from)
+                    .map_err(sanitized_identity_error)
+            }
+            slot => Err(counterpart_slot_error(slot)),
+        }
+    }
+
     pub fn send_message(&self, verbatim: String) -> Result<ConversationTurnResult, String> {
         match &mut *self.lock() {
-            HostSlot::Ready(host) => send_message_with_retrieval(&mut host.core, verbatim),
+            HostSlot::Ready(host) => {
+                require_ready_for_formal_conversation(host.core.repository())?;
+                send_message_with_retrieval(&mut host.core, verbatim)
+            }
             HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
                 Err(VAULT_SETUP_INCOMPLETE.to_owned())
             }
@@ -1070,6 +1202,120 @@ fn runtime_profile_slot_error(slot: &HostSlot) -> String {
         HostSlot::FailedClosed(detail) => format!("Core is closed: {detail}"),
         HostSlot::Closed => "desktop host is already stopped".to_owned(),
         HostSlot::Ready(_) => unreachable!("ready hosts are handled by the command path"),
+    }
+}
+
+fn counterpart_slot_error(slot: &HostSlot) -> String {
+    match slot {
+        HostSlot::NeedsInitialization | HostSlot::AwaitingRecoveryConfirmation(_) => {
+            VAULT_SETUP_INCOMPLETE.to_owned()
+        }
+        HostSlot::Locked(detail) => format!("vault is locked: {detail}"),
+        HostSlot::FailedClosed(detail) => format!("Core is closed: {detail}"),
+        HostSlot::Closed => "desktop host is already stopped".to_owned(),
+        HostSlot::Ready(_) => unreachable!("ready hosts are handled by the command path"),
+    }
+}
+
+fn load_counterpart_readiness<R: CounterpartRepository + ?Sized>(
+    repository: &R,
+) -> Result<CounterpartReadiness, String> {
+    repository
+        .counterpart_readiness()
+        .map_err(|_| "counterpart readiness could not be loaded".to_owned())
+}
+
+fn require_ready_for_formal_conversation<R: CounterpartRepository + ?Sized>(
+    repository: &R,
+) -> Result<(), String> {
+    match load_counterpart_readiness(repository)? {
+        CounterpartReadiness::Ready { .. } => Ok(()),
+        CounterpartReadiness::NeedsIntroduction
+        | CounterpartReadiness::IntroductionRecorded
+        | CounterpartReadiness::Inconsistent { .. } => {
+            Err("counterpart is not ready for formal conversation".to_owned())
+        }
+    }
+}
+
+fn sanitized_identity_error(error: IdentityError) -> String {
+    match error {
+        IdentityError::MissingCategories(_)
+        | IdentityError::DuplicateCategory(_)
+        | IdentityError::EmptyAnswer(_) => {
+            "initial self introduction must contain six non-empty answers".to_owned()
+        }
+        IdentityError::IntroductionAlreadyRecorded => {
+            "initial self introduction is already recorded".to_owned()
+        }
+        IdentityError::IntroductionNotRecorded => {
+            "initial self introduction is required".to_owned()
+        }
+        IdentityError::IdentityAlreadyFormed | IdentityError::CounterpartAlreadyCreated => {
+            "counterpart is already created".to_owned()
+        }
+        IdentityError::InconsistentCounterpartState(_) => {
+            "counterpart state is inconsistent".to_owned()
+        }
+        IdentityError::InvalidProposal(_) => {
+            "counterpart formation was rejected by trusted validation".to_owned()
+        }
+        IdentityError::Repository(_) => "counterpart storage operation failed".to_owned(),
+        IdentityError::Runtime(error) => match error.kind() {
+            RuntimeErrorKind::Timeout => "counterpart formation runtime timed out".to_owned(),
+            RuntimeErrorKind::Unavailable => {
+                "counterpart formation runtime is unavailable".to_owned()
+            }
+            RuntimeErrorKind::InvalidResponse => {
+                "counterpart formation returned an invalid strict response".to_owned()
+            }
+            RuntimeErrorKind::Other => "counterpart formation runtime failed".to_owned(),
+        },
+    }
+}
+
+impl From<CounterpartReadiness> for CounterpartReadinessView {
+    fn from(value: CounterpartReadiness) -> Self {
+        match value {
+            CounterpartReadiness::NeedsIntroduction => Self {
+                state: "NEEDS_INTRODUCTION",
+                identity_version: None,
+                self_bundle_version: None,
+                inconsistency_reason: None,
+            },
+            CounterpartReadiness::IntroductionRecorded => Self {
+                state: "INTRODUCTION_RECORDED",
+                identity_version: None,
+                self_bundle_version: None,
+                inconsistency_reason: None,
+            },
+            CounterpartReadiness::Ready {
+                identity_version,
+                self_bundle_version,
+            } => Self {
+                state: "READY",
+                identity_version: Some(identity_version),
+                self_bundle_version: Some(self_bundle_version),
+                inconsistency_reason: None,
+            },
+            CounterpartReadiness::Inconsistent { reason } => Self {
+                state: "INCONSISTENT",
+                identity_version: None,
+                self_bundle_version: None,
+                inconsistency_reason: Some(encode_counterpart_inconsistency(&reason)),
+            },
+        }
+    }
+}
+
+const fn encode_counterpart_inconsistency(reason: &CounterpartInconsistencyReason) -> &'static str {
+    match reason {
+        CounterpartInconsistencyReason::IntroductionMissing { .. } => "INTRODUCTION_MISSING",
+        CounterpartInconsistencyReason::IdentityMissing { .. } => "IDENTITY_MISSING",
+        CounterpartInconsistencyReason::SelfBundleMissing { .. } => "SELF_BUNDLE_MISSING",
+        CounterpartInconsistencyReason::IdentityVersionMismatch { .. } => {
+            "IDENTITY_VERSION_MISMATCH"
+        }
     }
 }
 
@@ -2215,7 +2461,11 @@ mod tests {
         lifecycle
             .complete_recovery(start.session().id(), LaunchMode::Foreground)
             .unwrap();
-        let runtime: AppRuntime = Box::new(ScriptedRuntime::new([], []));
+        let runtime = runtime_from_target(
+            RuntimeTarget::new("http://127.0.0.1:1/v1", "unused-test-runtime").unwrap(),
+            None,
+        )
+        .unwrap();
         let managed = ManagedHost {
             inner: Mutex::new(HostSlot::Ready(HostCore {
                 core: MemoryCore::new(repository, runtime, SystemClock),
@@ -2268,7 +2518,11 @@ mod tests {
         lifecycle
             .complete_recovery(start.session().id(), LaunchMode::Foreground)
             .unwrap();
-        let runtime: AppRuntime = Box::new(ScriptedRuntime::new([], []));
+        let runtime = runtime_from_target(
+            RuntimeTarget::new("http://127.0.0.1:1/v1", "unused-test-runtime").unwrap(),
+            None,
+        )
+        .unwrap();
         let managed = ManagedHost {
             inner: Mutex::new(HostSlot::Ready(HostCore {
                 core: MemoryCore::new(repository, runtime, SystemClock),
@@ -3134,5 +3388,6 @@ mod tests {
         assert!(repository.statuses.is_empty());
     }
 
+    mod counterpart_creation;
     mod runtime_profile;
 }

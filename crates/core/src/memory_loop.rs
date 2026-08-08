@@ -408,6 +408,13 @@ where
         &mut self.repository
     }
 
+    /// Borrows the trusted components together for host-only orchestration
+    /// that must reuse the active repository, runtime, and clock.
+    #[must_use]
+    pub fn parts_mut(&mut self) -> (&mut R, &mut T, &mut C) {
+        (&mut self.repository, &mut self.runtime, &mut self.clock)
+    }
+
     #[must_use]
     pub const fn runtime(&self) -> &T {
         &self.runtime

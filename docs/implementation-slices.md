@@ -1,6 +1,6 @@
 # 首版完整实现切片方案
 
-状态：实施中；S01～S31、S06R-1～S06R-5、S06D 与 S07C-1～S07C-4 已完成；下一片为 S07C-5，S32 在 S07C-9 重新验收并冻结构建前保持锁定
+状态：实施中；S01～S31、S06R-1～S06R-5、S06D 与 S07C-1～S07C-5 已完成；下一片为 S07C-6，S32 在 S07C-9 重新验收并冻结构建前保持锁定
 
 本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 曾形成可安装构建。实机审计发现桌面正式对话绕过 S04/S05 的创建链，且普通运行时允许缺少身份与完整自我包，因此 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 新增 S07C 修订组；任何旧冻结构建都不得再进入 S32。
 
@@ -561,7 +561,7 @@ save(draft) -> validate/build -> Vault commit -> replace active runtime -> Runti
 
 ### S07C 第二自我创建与认识闭环修订
 
-**状态**：已由 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 接受；S07C-1～S07C-4 已完成，S07C-5～S07C-9 尚未实施；重新冻结构建前，S32 保持锁定。
+**状态**：已由 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 接受；S07C-1～S07C-5 已完成，S07C-6～S07C-9 尚未实施；重新冻结构建前，S32 保持锁定。
 
 修订前领域层分别具备初始身份和 Self Bundle 能力，但桌面端没有创建入口，正式对话允许 `identity=None`，运行时只收到 Self Bundle 版本号。修订后的可信状态只从持久化事实派生：
 
@@ -640,15 +640,15 @@ send_message(message):
 
 #### S07C-5 宿主创建 API 与双层失败关闭
 
-**状态**：待实施。
+**状态**：已完成；桌面宿主现以同一 `ManagedHost` 单写锁持有同时实现普通对话与初始身份形成的活动运行时，开放三个固定 DTO command，并在进入检索/Core 前先复核就绪状态；Core 原门禁保持为不可绕过的第二层。
 
 **依赖/输入**：S07C-1～S07C-4、`ManagedHost` 单写锁、现有 Tauri 白名单 command 边界。
 
-**新增/输出**：增加 `get_counterpart_readiness`、`record_initial_self_introduction`、`form_initial_counterpart` 三个窄 command；宿主与 Core 都拒绝未就绪的 `send_message`。身份形成失败时保留已提交介绍并允许幂等重试，不暴露模型原始响应。
+**新增/输出**：`get_counterpart_readiness` 只返回四态、就绪版本和固定不一致原因码；`record_initial_self_introduction` 只接收六个命名字段且不回显；`form_initial_counterpart` 复用当前活动运行时和 Identity 领域入口。宿主与 Core 都拒绝未就绪的 `send_message`，形成失败保留已提交介绍并允许安全重试，所有形成错误压缩为固定脱敏类别。
 
 **明确不做**：WebView 直接获得 Repository、一个 command 同时隐式填写介绍和聊天、后台自动创建、React 界面或旧对话删除。
 
-**确定性完成**：command 顺序、重复调用、运行时失败重试、宿主重启和 `INCONSISTENT` 状态均有 Rust 测试；任何旁路 `send_message` 都不能越过 Core 门禁。
+**确定性完成**：`state::tests::counterpart_creation` 覆盖四态投影、空介绍、command 顺序、重复调用、运行时失败脱敏重试、两阶段宿主重启、`INCONSISTENT` 和创建后对话；宿主门禁测试证明未就绪时零运行时调用，既有 Core 旁路测试继续证明零证据、零账本写入。
 
 **主决策**：ADR-0004、ADR-0008、ADR-0045、ADR-0055。
 

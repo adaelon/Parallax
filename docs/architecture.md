@@ -214,7 +214,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 
 ### 3.6 模型运行时
 
-本地与远程模型实现同一 Core 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：默认适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格分类 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。S06D 对 URL 解析后的精确 host `api.deepseek.com` 派生 Chat Completions：发送 `messages` 与 `response_format=json_object`、显式关闭默认思考、从 `choices[0].message.content` 提取正文，再走同一严格领域解析；其他 host 继续使用 Responses。S07C-4 要求普通回应请求携带有界 `CounterpartSelfContext`：当前身份、关系状态、经 Core 解引用并复核证据的活动信念、未完成意图与本轮选中的第二自我经历，同时保留宪法、身份和 Self Bundle 版本；缺失、错位、悬空或超过 64 KiB 预算时请求不会被构造。模型只接收 Core 显式选择的本轮状态与允许的结构化操作，不拥有保险库连接、身份版本链或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v3](runtime-contract-v3.md)。
+本地与远程模型实现同一 Core 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：默认适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格分类 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。S06D 对 URL 解析后的精确 host `api.deepseek.com` 派生 Chat Completions：发送 `messages` 与 `response_format=json_object`、显式关闭默认思考、从 `choices[0].message.content` 提取正文，再走同一严格领域解析；其他 host 继续使用 Responses。S07C-4 要求普通回应请求携带有界 `CounterpartSelfContext`：当前身份、关系状态、经 Core 解引用并复核证据的活动信念、未完成意图与本轮选中的第二自我经历，同时保留宪法、身份和 Self Bundle 版本；缺失、错位、悬空或超过 64 KiB 预算时请求不会被构造。S07C-5 让唯一活动运行时同时履行 `CounterpartRuntime` 与 `IdentityRuntime`，三个创建 command 在 `ManagedHost` 同一单写锁内借用当前 Repository、运行时和时钟；形成错误只返回固定脱敏类别，运行时档案切换与创建/对话不会混用实例。模型只接收 Core 显式选择的本轮状态与允许的结构化操作，不拥有保险库连接、身份版本链或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v3](runtime-contract-v3.md)。
 
 ### 3.7 技术职责
 
@@ -791,7 +791,7 @@ Core freezes WorkingContext
 
 供应商响应结构错误不会触发换档重试；运行时不可用时，本人原始发言已经作为证据提交，既有证据和 Self Bundle 不回滚。S06 的具体 HTTP 传输强制 Cloud 使用 HTTPS 与非空 bearer token、禁止重定向，Local 不携带 bearer；token 只注入请求头并以清零内存持有，不写入请求体或检查记录。S07 只负责从宿主配置注入端点和凭据并管理桌面生命周期，不改变 contract。
 
-S07 通过两个白名单 command 接通持续对话，不把 Core 能力面传给 WebView：
+S07 的持续对话只通过两个白名单 command 接通，不把 Core 能力面传给 WebView：
 
 ```text
 list_conversation()
@@ -808,9 +808,32 @@ send_message(verbatim)
   -> 返回本人与第二自我的两个逐字证据视图
 ```
 
+S07C-5 在同一白名单和宿主锁内补齐创建入口：
+
+```text
+get_counterpart_readiness()
+  -> 从介绍、身份与 Self Bundle 持久化事实派生四态
+  -> 只返回状态、READY 版本与固定 INCONSISTENT 原因码
+
+record_initial_self_introduction(six_named_fields)
+  -> require NEEDS_INTRODUCTION
+  -> IdentityFormation 原子提交六条本人证据与事实
+  -> return INTRODUCTION_RECORDED；不回显介绍正文
+
+form_initial_counterpart()
+  -> require INTRODUCTION_RECORDED
+  -> 复用当前活动 IdentityRuntime 形成严格结构化提议
+  -> Identity/Vault 原子提交 identity v1 + Self Bundle v1
+  -> return READY；运行时/解析/领域/存储错误压缩为固定类别
+
+send_message(verbatim)
+  -> ManagedHost 在检索前 require READY
+  -> MemoryCore 在任何本人证据前重新派生并复核 READY 与精确版本
+```
+
 运行时失败时，本人发言仍按 Core 既有语义保留；React 重新调用 `list_conversation`，显示已落盘原文与错误。普通问答只有运行时显式提出并通过 Core 校验的结构化操作才可能入账，保留原文本身不产生 Claim。
 
-实机审计确认该 S07 入口尚未接通前述 `CreateCounterpartRequested`。S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭，并令运行时身份输入必填；S07C-4 进一步把当前完整主体状态投影为有界、可审计且模型可替换的 `CounterpartSelfContext`。桌面端仍没有初始介绍和身份形成 command，因此新 Vault 暂时只能被门禁拒绝，宿主创建接线留给 S07C-5。旧回复继续逐字可读，但 schema v27 将其投影为 `PRE_IDENTITY_UNBOUND`，不得支持当前第二自我的判断、共同关系历史或身份修订。[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
+S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 Core 的 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭；S07C-4 把当前完整主体状态投影为有界、可审计且模型可替换的 `CounterpartSelfContext`；S07C-5 现已接通三个宿主创建 command，并把发送门禁前移到检索之前，同时保留 Core 第二层复核。React 尚未调用这些创建 command，六类介绍与创建仪式路由留给 S07C-6；旧回复继续逐字可读，但 schema v27 将其投影为 `PRE_IDENTITY_UNBOUND`，不得支持当前第二自我的判断、共同关系历史或身份修订。[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -1392,8 +1415,8 @@ React runtime settings open
 
 ```text
 apps/desktop/src-tauri/src/
-  lib.rs                # 宿主事件循环、对话与运行时档案白名单 command
-  state.rs              # Vault/Core/运行时装配、热切换、持续会话、心跳与安全退出
+  lib.rs                # 宿主事件循环、创建/对话与运行时档案白名单 command
+  state.rs              # Vault/Core/双能力运行时装配、创建门禁、持续会话、心跳与安全退出
 apps/desktop/src/
   App.tsx               # 持续对话、运行时设置模态、重启恢复、发送与错误恢复界面
 crates/desktop-host/src/
@@ -1405,6 +1428,9 @@ crates/vault/src/
 ```text
 first process -> single-instance plugin -> unlock Vault -> load RuntimeProfile -> build runtime -> begin_host_session -> tray event loop
 second process -> activate_existing_window(first process) -> exit
+creation state -> get_counterpart_readiness -> fixed four-state projection
+six introductions -> record_initial_self_introduction -> atomic person evidence/facts
+form counterpart -> current IdentityRuntime -> atomic identity v1 + Self Bundle v1 -> READY
 React send -> send_message -> freeze recent conversation context -> MemoryCore -> exact turn views
 React restore -> list_conversation -> SQLCipher evidence -> exact turn views
 React settings open -> get_runtime_profile -> redacted view + empty Key input
@@ -1412,7 +1438,7 @@ React settings test/save -> explicit KEEP | REPLACE | CLEAR draft -> ManagedHost
 explicit exit -> finish_host_session -> close Vault -> zeroize key -> release lock -> process exit
 ```
 
-主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater、首次创建、持续对话和运行时配置只能经宿主白名单 command 使用。运行时设置入口只在 Vault 就绪的持续对话页出现；打开时按需读取 Base URL、模型、Key 是否存在和安全末四位，Key 密码框永远从空值开始且关闭即丢弃。测试连接不清草稿，保存失败保留草稿，保存成功才清空 Key 输入并刷新返回的脱敏视图；读取和操作失败都使用不拼接 provider 正文或 Key 的固定提示，键盘关闭把焦点交还入口。测试与保存草稿中的完整 Key 不可序列化回 WebView，并在 Rust 草稿析构时清零。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。首次创建的 Recovery Key 是 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 限定的一次性展示例外，不赋予 UI 任何 Vault Key 或持久密钥能力。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md)、[ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)、[ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 和 [ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)。
+主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater、首次创建、持续对话和运行时配置只能经宿主白名单 command 使用。创建 API 只接收六个命名介绍字段并只返回 readiness 投影；当前活动运行时同时支持身份形成与普通对话，但只能在 `ManagedHost` 单写锁内由 Identity/Core 可信入口调用。介绍形成失败后保持 `INTRODUCTION_RECORDED`，允许重启或原地重试；所有 provider/解析错误均压缩为固定类别。运行时设置入口只在 Vault 就绪的持续对话页出现；打开时按需读取 Base URL、模型、Key 是否存在和安全末四位，Key 密码框永远从空值开始且关闭即丢弃。测试连接不清草稿，保存失败保留草稿，保存成功才清空 Key 输入并刷新返回的脱敏视图；读取和操作失败都使用不拼接 provider 正文或 Key 的固定提示，键盘关闭把焦点交还入口。测试与保存草稿中的完整 Key 不可序列化回 WebView，并在 Rust 草稿析构时清零。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。首次创建的 Recovery Key 是 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 限定的一次性展示例外，不赋予 UI 任何 Vault Key 或持久密钥能力。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md)、[ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)、[ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md)、[ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
 
 ### 9.8 S08 Context Inbox 先归档当前实现边界
 

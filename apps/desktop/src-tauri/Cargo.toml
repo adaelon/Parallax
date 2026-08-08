@@ -18,6 +18,7 @@ eam_capture_browser = { package = "capture-browser", path = "../../../crates/cap
 eam_capture_windows = { package = "capture-windows", path = "../../../crates/capture-windows" }
 eam_core = { package = "core", path = "../../../crates/core" }
 eam_desktop_host = { package = "desktop-host", path = "../../../crates/desktop-host" }
+eam_identity = { package = "identity", path = "../../../crates/identity" }
 eam_ingestion = { package = "ingestion", path = "../../../crates/ingestion" }
 eam_retrieval = { package = "retrieval", path = "../../../crates/retrieval" }
 eam_runtime_gateway = { package = "runtime-gateway", path = "../../../crates/runtime-gateway" }
@@ -31,7 +32,6 @@ url = "=2.5.7"
 zeroize = "=1.9.0"
 
 [dev-dependencies]
-eam_identity = { package = "identity", path = "../../../crates/identity" }
 tempfile = "=3.27.0"
 
 [lints.rust]

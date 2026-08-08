@@ -1201,3 +1201,16 @@
 
 **入口**：`MemoryCore::run_counterpart_turn` 在保存本人消息前构造 `CounterpartSelfContext`；可信上下文构造器可通过 `WorkingContext::with_relevant_counterpart_experiences` 只选择当前 Self Bundle 内与本轮相关的经历引用。
 **测试**：`crates/runtime-gateway/tests/runtime_contract.rs::current_counterpart_self_context_is_complete_bounded_and_model_portable` 覆盖完整选择、双模型等价与未选资料隔离；同文件的 `dangling_belief_fails_before_person_evidence_or_runtime_invocation`、`mismatched_self_bundle_identity_fails_before_formal_conversation`、`oversized_counterpart_self_context_fails_before_formal_conversation` 覆盖三条失败关闭门禁；`cargo test --workspace` 与全目标 Clippy 通过。
+
+## 2026-08-08 S07C-5 宿主创建 API 与双层失败关闭
+
+**触达**:
+- `apps/desktop/src-tauri/src/state.rs:AppRuntimeContract/InitialSelfIntroductionDraft/CounterpartReadinessView` — 将唯一活动运行时收口为普通对话与初始身份双能力，并只允许六类命名输入和固定四态输出跨越 command 边界。
+- `apps/desktop/src-tauri/src/state.rs:ManagedHost::get_counterpart_readiness/record_initial_self_introduction/form_initial_counterpart/send_message` — 在同一宿主锁内派生状态、调用 Identity 可信入口、脱敏形成错误，并在检索前增加第一层 READY 门禁。
+- `apps/desktop/src-tauri/src/lib.rs:get_counterpart_readiness/record_initial_self_introduction/form_initial_counterpart/builder` — 注册三个窄 Tauri 白名单 command；阻塞身份形成不占用事件循环线程。
+- `crates/core/src/memory_loop.rs:MemoryCore::parts_mut`、`crates/core/src/ports.rs:Clock for &mut C`、`crates/identity/src/ports.rs:&mut forwarding adapters` — 让宿主借用同一个 Core 内的 Vault、活动运行时和时钟，不复制 Repository 或绕过 `IdentityFormation`。
+- `apps/desktop/src-tauri/src/state/tests/counterpart_creation.rs` — 用合成双能力运行时覆盖顺序、重复、失败重试、重启、四态投影、脱敏和零调用失败关闭。
+- `docs/architecture.md:模型运行时/第二自我醒来和对话/S07 桌面宿主`、`docs/implementation-slices.md:S07C-5` — 同步已实现的数据流、双层门禁与下一片 S07C-6。
+
+**入口**：WebView 只能依次 invoke `get_counterpart_readiness`、`record_initial_self_introduction({ draft })`、`form_initial_counterpart`；正式发送仍经 `send_message({ verbatim })`，并由宿主和 Core 各自重新派生 READY。
+**测试**：`state::tests::counterpart_creation` 的 6 个 S07C-5 用例加既有 Core 旁路用例全绿；`cargo test --workspace --no-fail-fast` 与 `cargo clippy --workspace --all-targets -- -D warnings` 通过。

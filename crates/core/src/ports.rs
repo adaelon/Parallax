@@ -461,6 +461,15 @@ pub trait Clock {
     fn now(&mut self) -> Timestamp;
 }
 
+impl<C> Clock for &mut C
+where
+    C: Clock + ?Sized,
+{
+    fn now(&mut self) -> Timestamp {
+        (**self).now()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
 

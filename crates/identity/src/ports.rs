@@ -68,6 +68,18 @@ pub trait IdentityRuntime {
     ) -> Result<InitialIdentityProposal, RuntimeError>;
 }
 
+impl<T> IdentityRuntime for &mut T
+where
+    T: IdentityRuntime + ?Sized,
+{
+    fn form_initial_identity(
+        &mut self,
+        request: InitialIdentityRequest,
+    ) -> Result<InitialIdentityProposal, RuntimeError> {
+        (**self).form_initial_identity(request)
+    }
+}
+
 pub trait SelfBundleRepository {
     /// Appends one complete immutable Self Bundle version atomically.
     ///
@@ -153,6 +165,67 @@ pub trait CounterpartRepository: IdentityRepository + SelfBundleRepository {
         identity: IdentityStateVersion,
         bundle: SelfBundleVersion,
     ) -> Result<(), RepositoryError>;
+}
+
+impl<R> IdentityRepository for &mut R
+where
+    R: IdentityRepository + ?Sized,
+{
+    fn record_initial_self_introduction(
+        &mut self,
+        session_id: &SessionId,
+        answers: &[IntroductionAnswer],
+        recorded_at: Timestamp,
+    ) -> Result<InitialSelfIntroduction, RepositoryError> {
+        (**self).record_initial_self_introduction(session_id, answers, recorded_at)
+    }
+
+    fn initial_self_introduction(
+        &self,
+    ) -> Result<Option<InitialSelfIntroduction>, RepositoryError> {
+        (**self).initial_self_introduction()
+    }
+
+    fn append_identity_state(
+        &mut self,
+        identity: IdentityStateVersion,
+    ) -> Result<(), RepositoryError> {
+        (**self).append_identity_state(identity)
+    }
+
+    fn current_identity_state(&self) -> Result<Option<IdentityStateVersion>, RepositoryError> {
+        (**self).current_identity_state()
+    }
+
+    fn all_identity_states(&self) -> Result<Vec<IdentityStateVersion>, RepositoryError> {
+        (**self).all_identity_states()
+    }
+}
+
+impl<R> SelfBundleRepository for &mut R
+where
+    R: SelfBundleRepository + ?Sized,
+{
+    fn append_self_bundle(&mut self, bundle: SelfBundleVersion) -> Result<(), RepositoryError> {
+        (**self).append_self_bundle(bundle)
+    }
+
+    fn current_self_bundle(&self) -> Result<Option<SelfBundleVersion>, RepositoryError> {
+        (**self).current_self_bundle()
+    }
+}
+
+impl<R> CounterpartRepository for &mut R
+where
+    R: CounterpartRepository + ?Sized,
+{
+    fn commit_initial_counterpart(
+        &mut self,
+        identity: IdentityStateVersion,
+        bundle: SelfBundleVersion,
+    ) -> Result<(), RepositoryError> {
+        (**self).commit_initial_counterpart(identity, bundle)
+    }
 }
 
 /// Executes bounded wake-cycle work without receiving repository access.
