@@ -156,39 +156,6 @@ impl InitialSelfIntroduction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CounterpartInconsistencyReason {
-    IntroductionMissing {
-        identity_version: Option<u64>,
-        self_bundle_version: Option<u64>,
-    },
-    IdentityMissing {
-        self_bundle_version: u64,
-        referenced_identity_version: u64,
-    },
-    SelfBundleMissing {
-        identity_version: u64,
-    },
-    IdentityVersionMismatch {
-        identity_version: u64,
-        self_bundle_version: u64,
-        referenced_identity_version: u64,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CounterpartReadiness {
-    NeedsIntroduction,
-    IntroductionRecorded,
-    Ready {
-        identity_version: u64,
-        self_bundle_version: u64,
-    },
-    Inconsistent {
-        reason: CounterpartInconsistencyReason,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitialIdentityRequest {
     introduction: InitialSelfIntroduction,
 }

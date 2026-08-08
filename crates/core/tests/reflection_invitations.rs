@@ -1,13 +1,16 @@
 use eam_core::{
     EvidenceCitation, EvidenceId, ForgetRepository, ForgetTarget, G08_IMMEDIATE_SAFETY_QUOTE,
-    InMemoryRepository, IncrementingClock, MemoryCore, PersonTurnClassification,
-    REFLECTION_DEFER_MILLIS, ReflectionDecision, ReflectionDelivery, ReflectionImportance,
-    ReflectionInvitation, ReflectionInvitationBasis, ReflectionInvitationId,
-    ReflectionInvitationProposal, ReflectionInvitationRejectionReason,
-    ReflectionInvitationRepository, ReflectionInvitationState, ReflectionOpportunity,
-    ReflectionRuntimeDisposition, RuntimeResponse, ScriptedRuntime, SessionId, Timestamp,
-    decide_reflection_invitation, offer_reflection_invitation, reflection_delivery,
+    IncrementingClock, MemoryCore, PersonTurnClassification, REFLECTION_DEFER_MILLIS,
+    ReflectionDecision, ReflectionDelivery, ReflectionImportance, ReflectionInvitation,
+    ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationProposal,
+    ReflectionInvitationRejectionReason, ReflectionInvitationRepository, ReflectionInvitationState,
+    ReflectionOpportunity, ReflectionRuntimeDisposition, RuntimeResponse, ScriptedRuntime,
+    SessionId, Timestamp, decide_reflection_invitation, offer_reflection_invitation,
+    reflection_delivery,
 };
+
+mod support;
+use support::ready_repository;
 
 fn invitation(
     state: ReflectionInvitationState,
@@ -115,11 +118,7 @@ fn ordinary_invitation_queues_on_unrelated_work_then_offers_on_related_topic() {
         .with_reflection_invitation(proposal(ReflectionImportance::Important, "工作节奏"));
     let second = RuntimeResponse::new("既然现在谈到节奏，我想邀请你一起看看。 ");
     let runtime = ScriptedRuntime::new([PersonTurnClassification::Question; 2], [first, second]);
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(1_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
 
     let unrelated = core.freeze_working_context(&[]).unwrap();
     let first_outcome = core
@@ -256,11 +255,7 @@ fn only_the_fixed_immediate_safety_fixture_can_interrupt_or_override_mute() {
         [PersonTurnClassification::DirectSelfReport],
         [RuntimeResponse::new("我需要先关心你的即时安全。").with_reflection_invitation(exact)],
     );
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(2_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(2_000));
     let context = core.freeze_working_context(&[]).unwrap();
     let outcome = core
         .run_counterpart_turn(
@@ -280,7 +275,7 @@ fn only_the_fixed_immediate_safety_fixture_can_interrupt_or_override_mute() {
 
     let invalid = proposal(ReflectionImportance::ImmediateSafetyRisk, "工作节奏");
     let mut invalid_core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_repository(),
         ScriptedRuntime::new(
             [PersonTurnClassification::Question],
             [RuntimeResponse::new("普通变化不能冒充即时风险。")
@@ -319,7 +314,7 @@ fn counterpart_quote_cannot_impersonate_person_immediate_safety_evidence() {
         ReflectionInvitationBasis::ImportantSingleChange,
     );
     let mut speaker_core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_repository(),
         ScriptedRuntime::new(
             [PersonTurnClassification::Question; 2],
             [
@@ -373,7 +368,7 @@ fn s26_rejects_pattern_basis_and_forget_removes_sourced_invitation() {
     );
     let accepted = proposal(ReflectionImportance::Important, "工作节奏");
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_repository(),
         ScriptedRuntime::new(
             [PersonTurnClassification::Question; 2],
             [

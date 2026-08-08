@@ -13,23 +13,28 @@ const KDF_SALT: &[u8] = b"evrything-about-me/v1/vault-subkeys";
 const DATABASE_INFO: &[u8] = b"database";
 
 #[test]
-fn v25_reopens_through_v26_with_one_default_runtime_profile() {
+fn v25_reopens_through_v27_with_one_default_runtime_profile() {
     let directory = tempdir().unwrap();
     let key = [0x26; 32];
     let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let database_path = repository.database_path().to_path_buf();
     repository.close().unwrap();
 
     let connection = Connection::open(&database_path).unwrap();
     key_sqlcipher_connection(&connection, key);
     connection
-        .execute_batch("DROP TABLE runtime_profiles; PRAGMA user_version = 25;")
+        .execute_batch(
+            "DROP TABLE runtime_profiles;
+             DROP INDEX conversation_evidence_counterpart_identity;
+             ALTER TABLE conversation_evidence DROP COLUMN counterpart_identity_version;
+             PRAGMA user_version = 25;",
+        )
         .unwrap();
     connection.close().unwrap();
 
     let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let profile = repository.runtime_profile().unwrap();
     assert_eq!(profile.base_url(), DEFAULT_RUNTIME_BASE_URL);
     assert_eq!(profile.model(), DEFAULT_RUNTIME_MODEL);

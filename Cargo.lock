@@ -874,6 +874,7 @@ dependencies = [
  "capture-windows",
  "core",
  "desktop-host",
+ "identity",
  "ingestion",
  "retrieval",
  "runtime-gateway",

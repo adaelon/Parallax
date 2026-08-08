@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 26;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 27;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1555,6 +1555,17 @@ INSERT INTO runtime_profiles (singleton_id, base_url, model, bearer_key)
 VALUES (1, 'http://127.0.0.1:11434/v1', 'gpt-oss-20b', NULL);
 ";
 
+const MIGRATION_27: &str = r"
+ALTER TABLE conversation_evidence
+ADD COLUMN counterpart_identity_version INTEGER
+    REFERENCES identity_state_versions(version) ON DELETE RESTRICT
+    CHECK (speaker = 1 OR counterpart_identity_version IS NULL);
+
+CREATE INDEX conversation_evidence_counterpart_identity
+    ON conversation_evidence(counterpart_identity_version)
+    WHERE speaker = 1;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1598,6 +1609,7 @@ where
             24 => transaction.execute_batch(MIGRATION_24)?,
             25 => transaction.execute_batch(MIGRATION_25)?,
             26 => transaction.execute_batch(MIGRATION_26)?,
+            27 => transaction.execute_batch(MIGRATION_27)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1640,6 +1652,87 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v26_counterpart_replies_migrate_as_pre_identity_unbound() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+
+        migrate_with_hook(&mut connection, |target, transaction| {
+            if target == 26 {
+                transaction.execute(
+                    "INSERT INTO conversation_evidence
+                     (id, session_id, speaker, verbatim, recorded_at)
+                     VALUES (1, 'legacy', 1, 'legacy counterpart reply', 123)",
+                    [],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let restored = connection
+            .query_row(
+                "SELECT verbatim, counterpart_identity_version
+                 FROM conversation_evidence WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(restored.0, "legacy counterpart reply");
+        assert_eq!(restored.1, None);
+    }
+
+    #[test]
+    fn interrupted_counterpart_attribution_migration_keeps_v26_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 27 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(27))));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            26
+        );
+        let column_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversation_evidence')
+                    WHERE name = 'counterpart_identity_version'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!column_exists);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        let column_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversation_evidence')
+                    WHERE name = 'counterpart_identity_version'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(column_exists);
     }
 
     #[test]

@@ -5,13 +5,14 @@ use std::{
 };
 
 use crate::{
-    Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, EvidenceCitation, EvidenceId,
-    ForgetReceipt, ForgetTarget, IdentityRevisionCommit, IdentityRevisionReceipt,
-    IdentityRuntimeContext, IdentityStateSnapshot, PatternMaturityCommitOutcome,
-    PatternMaturityProposal, PersonTurnClassification, ReflectionInvitation,
-    ReflectionInvitationId, ReflectionInvitationReceipt, ReflectionInvitationState, RuntimeRequest,
-    RuntimeResponse, SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
-    SharedAgreementResolution, SharedExperience, Timestamp,
+    Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, CounterpartReadiness,
+    EvidenceCitation, EvidenceId, ForgetReceipt, ForgetTarget, IdentityRevisionCommit,
+    IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot,
+    PatternMaturityCommitOutcome, PatternMaturityProposal, PersonTurnClassification,
+    ReflectionInvitation, ReflectionInvitationId, ReflectionInvitationReceipt,
+    ReflectionInvitationState, RuntimeRequest, RuntimeResponse, SharedAgreementCandidate,
+    SharedAgreementCandidateId, SharedAgreementDecision, SharedAgreementResolution,
+    SharedExperience, Timestamp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +194,14 @@ pub trait ForgetRepository: MemoryRepository {
 }
 
 pub trait IdentityEvolutionRepository: MemoryRepository {
+    /// Re-derives the formal-conversation gate from persisted introduction,
+    /// identity, and Self Bundle facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when persisted readiness facts cannot be read.
+    fn conversation_readiness(&self) -> Result<CounterpartReadiness, RepositoryError>;
+
     /// Loads the current immutable identity together with the Self Bundle and
     /// constitution versions that make it portable across model runtimes.
     ///

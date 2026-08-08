@@ -31,6 +31,7 @@ url = "=2.5.7"
 zeroize = "=1.9.0"
 
 [dev-dependencies]
+eam_identity = { package = "identity", path = "../../../crates/identity" }
 tempfile = "=3.27.0"
 
 [lints.rust]

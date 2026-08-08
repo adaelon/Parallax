@@ -102,7 +102,7 @@ fn correction_propagates_only_to_affected_memory_and_survives_reopen() {
 
     let mut repository =
         VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let claims = repository.all_claims().unwrap();
     assert_eq!(claims.len(), 3);
     assert_eq!(claims[0].status(), ClaimStatus::Superseded);

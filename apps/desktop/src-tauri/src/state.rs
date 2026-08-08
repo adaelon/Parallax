@@ -2023,6 +2023,10 @@ mod tests {
         RelationalConstraintDeparture, RuntimeResponse, ScriptedRuntime, SharedAgreementAssent,
         SharedExperienceProposal, Timestamp,
     };
+    use eam_identity::{
+        IdentityFormation, IdentityProfile, InitialIdentityProposal, IntroductionAnswer,
+        ScriptedIdentityRuntime, SelfIntroductionCategory,
+    };
     use eam_ingestion::{ArchiveInput, ArchiveReceipt};
     use eam_vault::RecoveryKey;
     use tempfile::tempdir;
@@ -2036,6 +2040,90 @@ mod tests {
         SQLCIPHER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn ready_identity_context() -> IdentityRuntimeContext {
+        IdentityRuntimeContext::new(
+            1,
+            1,
+            IdentityStateSnapshot::restore(
+                1,
+                None,
+                IdentityProfileSnapshot::new(
+                    "测试第二自我",
+                    "清晰表达",
+                    "保留独立判断",
+                    "可追溯性优先",
+                    "共同回看的同行者",
+                    "帮助本人形成更准确的自我理解",
+                ),
+                "桌面测试夹具",
+                Vec::new(),
+                Timestamp::from_millis(1),
+            ),
+        )
+    }
+
+    fn ready_in_memory_repository() -> InMemoryRepository {
+        InMemoryRepository::new()
+            .with_identity_context(ready_identity_context())
+            .unwrap()
+    }
+
+    fn seed_ready_counterpart(repository: VaultRepository) -> VaultRepository {
+        let answers = [
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::BasicIdentityAndAddress,
+                "我是桌面测试中的本人。",
+            ),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::CurrentLife,
+                "我正在验证持续对话。",
+            ),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::ImportantPeople,
+                "测试不包含真实人物资料。",
+            ),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::LongTermGoals,
+                "保持可信且可追溯。",
+            ),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::CurrentConcerns,
+                "防止未就绪对话旁路。",
+            ),
+            IntroductionAnswer::new(
+                SelfIntroductionCategory::DesiredReflection,
+                "请保留独立判断。",
+            ),
+        ];
+        let proposal = InitialIdentityProposal::new(
+            IdentityProfile::new(
+                "测试第二自我",
+                "清晰表达",
+                "保留独立判断",
+                "可追溯性优先",
+                "共同回看的同行者",
+                "帮助本人形成更准确的自我理解",
+            ),
+            "基于合成介绍形成",
+            (1..=6).map(EvidenceId::from_raw).collect(),
+        );
+        let mut formation = IdentityFormation::new(
+            repository,
+            ScriptedIdentityRuntime::new([proposal]),
+            IncrementingClock::new(1_000),
+        );
+        formation
+            .record_initial_self_introduction(&SessionId::new("desktop-test-onboarding"), &answers)
+            .unwrap();
+        formation.form_initial_counterpart().unwrap();
+        let (repository, _, _) = formation.into_parts();
+        repository
+    }
+
+    fn ready_vault_repository(path: &Path) -> VaultRepository {
+        seed_ready_counterpart(VaultRepository::open(path, VaultKey::new(TEST_VAULT_KEY)).unwrap())
     }
 
     #[test]
@@ -2355,7 +2443,7 @@ mod tests {
 
     #[test]
     fn person_topic_reentry_reaches_muted_reflection_as_discuss_only() {
-        let mut repository = InMemoryRepository::new();
+        let mut repository = ready_in_memory_repository();
         let evidence_id = repository.next_evidence_id();
         repository
             .append_evidence(ConversationEvidence::restore(
@@ -2433,22 +2521,25 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_conversation_survives_sqlcipher_reopen_without_claims() {
+    fn ordinary_conversation_survives_sqlcipher_reopen_without_ordinary_claims() {
         let _guard = sqlcipher_test_lock();
         let directory = tempdir().unwrap();
-        let repository =
-            VaultRepository::open(directory.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+        let repository = ready_vault_repository(directory.path());
         let runtime = ScriptedRuntime::new(
             [PersonTurnClassification::Question],
             [RuntimeResponse::new("我会记得这段原话。")],
         );
         let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(10_000));
+        let baseline_claim_count = core.repository().all_claims().unwrap().len();
 
         let result =
             send_message_with_retrieval(&mut core, "你会记得这句话吗？".to_owned()).unwrap();
         assert_eq!(result.person.verbatim, "你会记得这句话吗？");
         assert_eq!(result.counterpart.verbatim, "我会记得这段原话。");
-        assert!(core.repository().all_claims().unwrap().is_empty());
+        assert_eq!(
+            core.repository().all_claims().unwrap().len(),
+            baseline_claim_count
+        );
         assert_eq!(
             core.runtime().seen_requests()[0]
                 .working_context()
@@ -2470,7 +2561,10 @@ mod tests {
 
         let restored = list_conversation_from_core(&core).unwrap();
         assert_eq!(restored, vec![result.person, result.counterpart]);
-        assert!(core.repository().all_claims().unwrap().is_empty());
+        assert_eq!(
+            core.repository().all_claims().unwrap().len(),
+            baseline_claim_count
+        );
         let (repository, _, _) = core.into_parts();
         repository.close().unwrap();
     }
@@ -2479,8 +2573,7 @@ mod tests {
     fn non_searchable_message_still_reaches_the_runtime_without_retrieval_failure() {
         let _guard = sqlcipher_test_lock();
         let directory = tempdir().unwrap();
-        let repository =
-            VaultRepository::open(directory.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+        let repository = ready_vault_repository(directory.path());
         let runtime = ScriptedRuntime::new(
             [PersonTurnClassification::Question],
             [RuntimeResponse::new("🙂")],
@@ -2514,6 +2607,26 @@ mod tests {
     }
 
     #[test]
+    fn send_message_fails_closed_before_counterpart_creation() {
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            ScriptedRuntime::new(
+                [PersonTurnClassification::Question],
+                [RuntimeResponse::new("这条回复不应被调用。")],
+            ),
+            IncrementingClock::new(35_000),
+        );
+
+        send_message_with_core(&mut core, "这条本人消息不应落盘。".to_owned())
+            .expect_err("desktop send must fail closed before counterpart creation");
+
+        assert!(core.repository().all_evidence().unwrap().is_empty());
+        assert!(core.repository().all_claims().unwrap().is_empty());
+        assert!(core.runtime().seen_classification_inputs().is_empty());
+        assert!(core.runtime().seen_requests().is_empty());
+    }
+
+    #[test]
     fn later_turn_receives_prior_continuous_conversation_as_frozen_context() {
         let runtime = ScriptedRuntime::new(
             [
@@ -2526,7 +2639,7 @@ mod tests {
             ],
         );
         let mut core = MemoryCore::new(
-            InMemoryRepository::new(),
+            ready_in_memory_repository(),
             runtime,
             IncrementingClock::new(40_000),
         );
@@ -2568,7 +2681,7 @@ mod tests {
             ),
         );
         let mut core = MemoryCore::new(
-            InMemoryRepository::new(),
+            ready_in_memory_repository(),
             ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
             IncrementingClock::new(50_000),
         );
@@ -2648,7 +2761,7 @@ mod tests {
                 .with_superseded_agreements(vec![ClaimId::from_raw(1)]),
             );
         let mut core = MemoryCore::new(
-            InMemoryRepository::new(),
+            ready_in_memory_repository(),
             ScriptedRuntime::new(
                 [
                     PersonTurnClassification::Question,
@@ -2707,7 +2820,7 @@ mod tests {
                 reason,
             ));
         let mut core = MemoryCore::new(
-            InMemoryRepository::new(),
+            ready_in_memory_repository(),
             ScriptedRuntime::new(
                 [
                     PersonTurnClassification::Question,
@@ -2762,7 +2875,7 @@ mod tests {
                 ),
             );
         let mut core = MemoryCore::new(
-            InMemoryRepository::new(),
+            ready_in_memory_repository(),
             ScriptedRuntime::new([PersonTurnClassification::Question], [agreement]),
             IncrementingClock::new(90_000),
         );
@@ -2842,7 +2955,7 @@ mod tests {
                 "我明确接受第二版全部边界",
             ));
         let mut core = MemoryCore::new(
-            InMemoryRepository::new(),
+            ready_in_memory_repository(),
             ScriptedRuntime::new(
                 [
                     PersonTurnClassification::Question,
@@ -2900,7 +3013,7 @@ mod tests {
             ),
         );
         let mut core = MemoryCore::new(
-            InMemoryRepository::new(),
+            ready_in_memory_repository(),
             ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
             IncrementingClock::new(60_000),
         );

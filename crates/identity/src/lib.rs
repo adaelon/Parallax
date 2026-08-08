@@ -9,11 +9,11 @@ mod self_bundle;
 mod service;
 
 pub use domain::{
-    CounterpartInconsistencyReason, CounterpartReadiness, IdentityAuthorship, IdentityProfile,
-    IdentityStateVersion, InitialIdentityProposal, InitialIdentityRequest, InitialSelfIntroduction,
-    IntroductionAnswer, IntroductionItem, PersonRepresentation, ReflectivePurposeStatus,
-    SelfIntroductionCategory,
+    IdentityAuthorship, IdentityProfile, IdentityStateVersion, InitialIdentityProposal,
+    InitialIdentityRequest, InitialSelfIntroduction, IntroductionAnswer, IntroductionItem,
+    PersonRepresentation, ReflectivePurposeStatus, SelfIntroductionCategory,
 };
+pub use eam_core::{CounterpartInconsistencyReason, CounterpartReadiness};
 pub use in_memory::InMemoryIdentityRepository;
 pub use ports::{
     CounterpartRepository, IdentityRepository, IdentityRuntime, SelfBundleRepository, WakeWork,

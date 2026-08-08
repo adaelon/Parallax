@@ -16,17 +16,17 @@ use eam_capture_windows::{
 use eam_core::{
     AgreementWithdrawal, AgreementWithdrawalActor, ApplicableTime, Claim, ClaimCorrectionReceipt,
     ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, ConversationEvidence,
-    DisputeState, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository, ForgetTarget,
-    IdentityEvolutionRepository, IdentityProfileSnapshot, IdentityRevisionCommit,
-    IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot,
-    MAX_OPEN_REFLECTION_INVITATIONS, MemoryRepository, PatternMaturityCommitOutcome,
-    PatternMaturityProposal, PatternMaturityReceipt, ReflectionImportance, ReflectionInvitation,
-    ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationReceipt,
-    ReflectionInvitationRepository, ReflectionInvitationState, RelationalConstraintDeparture,
-    RepositoryError, SessionId, SharedAgreementCandidate, SharedAgreementCandidateId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
-    SharedExperience, SharedExperienceKind, SharedExperienceRepository, Speaker, Timestamp,
-    Uncertainty,
+    CounterpartReadiness, CounterpartReplyAttribution, DisputeState, EvidenceCitation, EvidenceId,
+    ForgetReceipt, ForgetRepository, ForgetTarget, IdentityEvolutionRepository,
+    IdentityProfileSnapshot, IdentityRevisionCommit, IdentityRevisionReceipt,
+    IdentityRuntimeContext, IdentityStateSnapshot, MAX_OPEN_REFLECTION_INVITATIONS,
+    MemoryRepository, PatternMaturityCommitOutcome, PatternMaturityProposal,
+    PatternMaturityReceipt, ReflectionImportance, ReflectionInvitation, ReflectionInvitationBasis,
+    ReflectionInvitationId, ReflectionInvitationReceipt, ReflectionInvitationRepository,
+    ReflectionInvitationState, RelationalConstraintDeparture, RepositoryError, SessionId,
+    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
+    SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
+    SharedExperienceRepository, Speaker, Timestamp, Uncertainty,
 };
 use eam_desktop_host::{
     ExitReason, HostGapId, HostGapReason, HostLifecycleRepository, HostRuntimeGap, HostSession,
@@ -2464,14 +2464,19 @@ fn insert_correction_evidence(
     connection
         .execute(
             "INSERT INTO conversation_evidence
-             (id, session_id, speaker, verbatim, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (id, session_id, speaker, verbatim, recorded_at, counterpart_identity_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 to_sql_id(evidence.id().get())?,
                 evidence.session_id().as_str(),
                 encode_speaker(evidence.speaker()),
                 evidence.verbatim(),
                 evidence.recorded_at().as_millis(),
+                evidence
+                    .counterpart_reply_attribution()
+                    .and_then(CounterpartReplyAttribution::identity_version)
+                    .map(to_sql_id)
+                    .transpose()?,
             ],
         )
         .map_err(repository_error)?;
@@ -3519,7 +3524,8 @@ fn load_conversation_evidence(
 ) -> Result<Option<ConversationEvidence>, RepositoryError> {
     let stored = connection
         .query_row(
-            "SELECT id, session_id, speaker, verbatim, recorded_at
+            "SELECT id, session_id, speaker, verbatim, recorded_at,
+                    counterpart_identity_version
              FROM conversation_evidence WHERE id = ?1",
             [to_sql_id(id.get())?],
             stored_evidence_from_row,
@@ -3939,7 +3945,8 @@ impl MemoryRepository for VaultRepository {
         let stored = self
             .connection()
             .query_row(
-                "SELECT id, session_id, speaker, verbatim, recorded_at
+                "SELECT id, session_id, speaker, verbatim, recorded_at,
+                        counterpart_identity_version
                  FROM conversation_evidence WHERE id = ?1",
                 [to_sql_id(id.get())?],
                 stored_evidence_from_row,
@@ -3953,7 +3960,8 @@ impl MemoryRepository for VaultRepository {
         let mut statement = self
             .connection()
             .prepare(
-                "SELECT id, session_id, speaker, verbatim, recorded_at
+                "SELECT id, session_id, speaker, verbatim, recorded_at,
+                        counterpart_identity_version
                  FROM conversation_evidence ORDER BY id",
             )
             .map_err(repository_error)?;
@@ -4697,14 +4705,19 @@ fn insert_conversation_evidence(
     connection
         .execute(
             "INSERT INTO conversation_evidence
-             (id, session_id, speaker, verbatim, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (id, session_id, speaker, verbatim, recorded_at, counterpart_identity_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 to_sql_id(evidence.id().get())?,
                 evidence.session_id().as_str(),
                 encode_speaker(evidence.speaker()),
                 evidence.verbatim(),
                 evidence.recorded_at().as_millis(),
+                evidence
+                    .counterpart_reply_attribution()
+                    .and_then(CounterpartReplyAttribution::identity_version)
+                    .map(to_sql_id)
+                    .transpose()?,
             ],
         )
         .map_err(repository_error)?;
@@ -4905,9 +4918,16 @@ fn validate_exact_support(
     for citation in support {
         let source = connection
             .query_row(
-                "SELECT speaker, verbatim FROM conversation_evidence WHERE id = ?1",
+                "SELECT speaker, verbatim, counterpart_identity_version
+                 FROM conversation_evidence WHERE id = ?1",
                 [to_sql_id(citation.evidence_id().get())?],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(repository_error)?
@@ -4919,7 +4939,12 @@ fn validate_exact_support(
         }
         match decode_speaker(source.0)? {
             Speaker::Person => has_person = true,
-            Speaker::Counterpart => has_counterpart = true,
+            Speaker::Counterpart if source.2.is_some() => has_counterpart = true,
+            Speaker::Counterpart => {
+                return Err(RepositoryError::new(
+                    "shared support counterpart evidence is not identity-bound",
+                ));
+            }
         }
     }
     Ok((has_person, has_counterpart))
@@ -4934,15 +4959,19 @@ fn has_exact_counterpart_reason(
         if citation.quote() != reason {
             continue;
         }
-        let speaker = connection
+        let speaker_and_identity = connection
             .query_row(
-                "SELECT speaker FROM conversation_evidence WHERE id = ?1",
+                "SELECT speaker, counterpart_identity_version
+                 FROM conversation_evidence WHERE id = ?1",
                 [to_sql_id(citation.evidence_id().get())?],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
             .optional()
             .map_err(repository_error)?;
-        if speaker.is_some_and(|value| matches!(decode_speaker(value), Ok(Speaker::Counterpart))) {
+        if speaker_and_identity.is_some_and(|(speaker, identity_version)| {
+            identity_version.is_some()
+                && matches!(decode_speaker(speaker), Ok(Speaker::Counterpart))
+        }) {
             return Ok(true);
         }
     }
@@ -4957,7 +4986,7 @@ fn has_exact_withdrawal_actor_evidence(
     for citation in support {
         let source = connection
             .query_row(
-                "SELECT speaker, verbatim, recorded_at
+                "SELECT speaker, verbatim, recorded_at, counterpart_identity_version
                  FROM conversation_evidence WHERE id = ?1",
                 [to_sql_id(citation.evidence_id().get())?],
                 |row| {
@@ -4965,12 +4994,13 @@ fn has_exact_withdrawal_actor_evidence(
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(repository_error)?;
-        let Some((speaker, verbatim, recorded_at)) = source else {
+        let Some((speaker, verbatim, recorded_at, counterpart_identity_version)) = source else {
             continue;
         };
         if recorded_at != withdrawal.effective_at().as_millis()
@@ -4986,6 +5016,7 @@ fn has_exact_withdrawal_actor_evidence(
             }
             AgreementWithdrawalActor::Counterpart => {
                 decode_speaker(speaker)? == Speaker::Counterpart
+                    && counterpart_identity_version.is_some()
                     && withdrawal.reason() == Some(citation.quote())
             }
         };
@@ -5906,6 +5937,10 @@ impl CounterpartRepository for VaultRepository {
 }
 
 impl IdentityEvolutionRepository for VaultRepository {
+    fn conversation_readiness(&self) -> Result<CounterpartReadiness, RepositoryError> {
+        CounterpartRepository::counterpart_readiness(self)
+    }
+
     fn current_identity_context(&self) -> Result<Option<IdentityRuntimeContext>, RepositoryError> {
         let identity = self.current_identity_state()?;
         let bundle = self.current_self_bundle()?;
@@ -12169,18 +12204,44 @@ struct StoredEvidence {
     speaker: i64,
     verbatim: String,
     recorded_at: i64,
+    counterpart_identity_version: Option<i64>,
 }
 
 impl StoredEvidence {
     fn decode(self) -> Result<ConversationEvidence, RepositoryError> {
         let id = u64::try_from(self.id).map_err(repository_error)?;
-        Ok(ConversationEvidence::restore(
-            EvidenceId::from_raw(id),
-            SessionId::new(self.session_id),
-            decode_speaker(self.speaker)?,
-            self.verbatim,
-            Timestamp::from_millis(self.recorded_at),
-        ))
+        let speaker = decode_speaker(self.speaker)?;
+        let identity_version = self
+            .counterpart_identity_version
+            .map(u64::try_from)
+            .transpose()
+            .map_err(repository_error)?;
+        match (speaker, identity_version) {
+            (Speaker::Person, None) => Ok(ConversationEvidence::restore(
+                EvidenceId::from_raw(id),
+                SessionId::new(self.session_id),
+                Speaker::Person,
+                self.verbatim,
+                Timestamp::from_millis(self.recorded_at),
+            )),
+            (Speaker::Person, Some(_)) => Err(RepositoryError::new(
+                "person evidence cannot carry counterpart identity attribution",
+            )),
+            (Speaker::Counterpart, None) => Ok(ConversationEvidence::restore_counterpart(
+                EvidenceId::from_raw(id),
+                SessionId::new(self.session_id),
+                self.verbatim,
+                Timestamp::from_millis(self.recorded_at),
+                CounterpartReplyAttribution::PreIdentityUnbound,
+            )),
+            (Speaker::Counterpart, Some(version)) => Ok(ConversationEvidence::restore_counterpart(
+                EvidenceId::from_raw(id),
+                SessionId::new(self.session_id),
+                self.verbatim,
+                Timestamp::from_millis(self.recorded_at),
+                CounterpartReplyAttribution::IdentityBound(version),
+            )),
+        }
     }
 }
 
@@ -12191,6 +12252,7 @@ fn stored_evidence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredE
         speaker: row.get(2)?,
         verbatim: row.get(3)?,
         recorded_at: row.get(4)?,
+        counterpart_identity_version: row.get(5)?,
     })
 }
 
@@ -12390,6 +12452,43 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn pre_identity_reply_cannot_authorize_a_counterpart_agreement_withdrawal() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let mut repository =
+            VaultRepository::open(directory.path(), VaultKey::new([0x58; 32])).unwrap();
+        let evidence_id = repository.next_evidence_id();
+        let reason = "这条创建前回复不能代表当前第二自我";
+        let effective_at = Timestamp::from_millis(500);
+        repository
+            .append_evidence(ConversationEvidence::restore(
+                evidence_id,
+                SessionId::new("legacy-withdrawal"),
+                Speaker::Counterpart,
+                reason.to_owned(),
+                effective_at,
+            ))
+            .unwrap();
+        let withdrawal = AgreementWithdrawal::restore(
+            ClaimId::from_raw(2),
+            ClaimId::from_raw(1),
+            AgreementWithdrawalActor::Counterpart,
+            effective_at,
+            Some(reason.to_owned()),
+            vec![EvidenceCitation::new(evidence_id, reason)],
+        );
+
+        assert!(
+            !has_exact_withdrawal_actor_evidence(
+                repository.connection(),
+                withdrawal.evidence_refs(),
+                &withdrawal,
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn close_clears_owned_vault_key_after_sqlcipher_is_closed() {

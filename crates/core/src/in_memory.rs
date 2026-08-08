@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 
 use crate::{
     AgreementWithdrawalActor, Claim, ClaimCorrectionReceipt, ClaimCorrectionRepository, ClaimId,
-    ClaimOwner, ClaimStatus, ConversationEvidence, EvidenceId, ForgetReceipt, ForgetRepository,
-    ForgetTarget, IdentityEvolutionRepository, IdentityRevisionCommit, IdentityRevisionReceipt,
-    IdentityRuntimeContext, IdentityStateSnapshot, MAX_OPEN_REFLECTION_INVITATIONS,
-    MemoryRepository, ReflectionInvitation, ReflectionInvitationId, ReflectionInvitationReceipt,
-    ReflectionInvitationRepository, ReflectionInvitationState, RepositoryError,
-    SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementResolution, SharedExperience, SharedExperienceKind,
-    SharedExperienceRepository, Speaker, Timestamp, agreement_is_active_at,
+    ClaimOwner, ClaimStatus, ConversationEvidence, CounterpartReadiness, EvidenceId, ForgetReceipt,
+    ForgetRepository, ForgetTarget, IdentityEvolutionRepository, IdentityRevisionCommit,
+    IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot,
+    MAX_OPEN_REFLECTION_INVITATIONS, MemoryRepository, ReflectionInvitation,
+    ReflectionInvitationId, ReflectionInvitationReceipt, ReflectionInvitationRepository,
+    ReflectionInvitationState, RepositoryError, SharedAgreementCandidate,
+    SharedAgreementCandidateId, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    SharedAgreementResolution, SharedExperience, SharedExperienceKind, SharedExperienceRepository,
+    Speaker, Timestamp, agreement_is_active_at,
 };
 
 #[derive(Debug)]
@@ -21,6 +22,7 @@ pub struct InMemoryRepository {
     next_shared_agreement_candidate_id: u64,
     shared_agreement_candidates: BTreeMap<SharedAgreementCandidateId, SharedAgreementCandidate>,
     shared_experiences: BTreeMap<ClaimId, SharedExperience>,
+    counterpart_readiness: CounterpartReadiness,
     identity_context: Option<IdentityRuntimeContext>,
     identity_history: Vec<IdentityStateSnapshot>,
     next_reflection_invitation_id: u64,
@@ -46,6 +48,7 @@ impl InMemoryRepository {
             next_shared_agreement_candidate_id: 1,
             shared_agreement_candidates: BTreeMap::new(),
             shared_experiences: BTreeMap::new(),
+            counterpart_readiness: CounterpartReadiness::NeedsIntroduction,
             identity_context: None,
             identity_history: Vec::new(),
             next_reflection_invitation_id: 1,
@@ -74,8 +77,19 @@ impl InMemoryRepository {
             ));
         }
         self.identity_history.push(context.state().clone());
+        self.counterpart_readiness = CounterpartReadiness::Ready {
+            identity_version: context.state().version(),
+            self_bundle_version: context.self_bundle_version(),
+        };
         self.identity_context = Some(context);
         Ok(self)
+    }
+
+    /// Overrides the derived state for deterministic non-ready adapter tests.
+    #[must_use]
+    pub fn with_counterpart_readiness(mut self, readiness: CounterpartReadiness) -> Self {
+        self.counterpart_readiness = readiness;
+        self
     }
 
     fn collect_shared_agreement_forget_closure(
@@ -131,6 +145,10 @@ impl InMemoryRepository {
 }
 
 impl IdentityEvolutionRepository for InMemoryRepository {
+    fn conversation_readiness(&self) -> Result<CounterpartReadiness, RepositoryError> {
+        Ok(self.counterpart_readiness.clone())
+    }
+
     fn current_identity_context(&self) -> Result<Option<IdentityRuntimeContext>, RepositoryError> {
         Ok(self.identity_context.clone())
     }
@@ -175,6 +193,10 @@ impl IdentityEvolutionRepository for InMemoryRepository {
             self_bundle_version,
             state,
         ));
+        self.counterpart_readiness = CounterpartReadiness::Ready {
+            identity_version,
+            self_bundle_version,
+        };
         Ok(IdentityRevisionReceipt::new(
             identity_version,
             self_bundle_version,
@@ -397,6 +419,7 @@ impl SharedExperienceRepository for InMemoryRepository {
             .get(&citation.evidence_id())
             .ok_or_else(|| RepositoryError::new("counterpart assent evidence does not exist"))?;
         if source.speaker() != Speaker::Counterpart
+            || !source.can_support_counterpart_knowledge()
             || citation.quote().is_empty()
             || !source.verbatim().contains(citation.quote())
         {
@@ -545,6 +568,7 @@ impl SharedExperienceRepository for InMemoryRepository {
                     .get(&citation.evidence_id())
                     .is_some_and(|source| {
                         source.speaker() == Speaker::Counterpart
+                            && source.can_support_counterpart_knowledge()
                             && citation.quote() == departure.reason()
                     })
             })
@@ -641,6 +665,7 @@ impl SharedExperienceRepository for InMemoryRepository {
                         }
                         AgreementWithdrawalActor::Counterpart => {
                             source.speaker() == Speaker::Counterpart
+                                && source.can_support_counterpart_knowledge()
                                 && withdrawal.reason() == Some(citation.quote())
                         }
                     }
@@ -819,7 +844,14 @@ fn validate_exact_support(
         }
         match source.speaker() {
             Speaker::Person => has_person = true,
-            Speaker::Counterpart => has_counterpart = true,
+            Speaker::Counterpart if source.can_support_counterpart_knowledge() => {
+                has_counterpart = true;
+            }
+            Speaker::Counterpart => {
+                return Err(RepositoryError::new(
+                    "shared support counterpart evidence is not identity-bound",
+                ));
+            }
         }
     }
     Ok((has_person, has_counterpart))

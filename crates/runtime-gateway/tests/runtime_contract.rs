@@ -37,6 +37,10 @@ use eam_vault::{VaultKey, VaultRepository};
 use serde_json::Value;
 use tempfile::tempdir;
 
+mod support;
+
+use support::{make_vault_ready, ready_in_memory_repository};
+
 const CLASSIFICATION_RESPONSE: &str = include_str!("fixtures/classification-response.json");
 const TURN_RESPONSE: &str = include_str!("fixtures/turn-response.json");
 const DEEPSEEK_CLASSIFICATION_RESPONSE: &str =
@@ -379,7 +383,7 @@ fn run_contract(
     OpenAiResponsesRuntime<ScriptedTransport>,
 ) {
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(1_000),
     );
@@ -938,7 +942,7 @@ fn response_payload_contains_only_prompt_and_core_selected_evidence() {
     ];
     let runtime = cloud_runtime(replies);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(2_000),
     );
@@ -1030,7 +1034,7 @@ fn runtime_receives_the_current_self_bundle_identity_and_emits_a_strict_revision
 
 #[test]
 fn runtime_receives_one_scheduled_reflection_and_emits_a_strict_sourced_invitation() {
-    let mut repository = InMemoryRepository::new();
+    let mut repository = ready_in_memory_repository();
     let source_id = repository.next_evidence_id();
     repository
         .append_evidence(ConversationEvidence::restore(
@@ -1131,7 +1135,7 @@ fn runtime_strict_pattern_maturity_schema_rejects_an_incomplete_operation() {
         Ok(PATTERN_MATURITY_MALFORMED_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(2_800),
     );
@@ -1259,7 +1263,7 @@ fn response_payload_and_disclosure_contain_only_the_frozen_retrieval_result() {
         Ok(TURN_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(2_500),
     );
@@ -1304,10 +1308,13 @@ fn response_payload_and_disclosure_contain_only_the_frozen_retrieval_result() {
     assert!(!input.contains("embedding"));
     assert_eq!(
         disclosure.retrieved_sources(),
-        [OutboundContextSource::EvidenceBlock {
-            evidence_id: 900,
-            block_id: 901,
-        }]
+        [
+            OutboundContextSource::EvidenceBlock {
+                evidence_id: 900,
+                block_id: 901,
+            },
+            OutboundContextSource::IdentityState { version: 1 },
+        ]
     );
 }
 
@@ -1390,7 +1397,7 @@ fn core_rejects_an_operation_outside_the_structured_whitelist() {
         Ok(UNSUPPORTED_OPERATION_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(3_000),
     );
@@ -1414,7 +1421,7 @@ fn core_rejects_an_operation_outside_the_structured_whitelist() {
 fn shared_experience_operation_is_whitelisted_and_keeps_typed_evidence() {
     let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(SHARED_EXPERIENCE_RESPONSE)]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(1_000),
     );
@@ -1457,7 +1464,7 @@ fn agreement_boundaries_and_pending_exact_version_are_in_the_runtime_contract() 
         Ok(SHARED_AGREEMENT_ASSENT_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(1_000),
     );
@@ -1544,7 +1551,7 @@ fn explicit_whole_supersession_is_in_the_strict_runtime_contract() {
         Ok(SHARED_AGREEMENT_SUPERSESSION_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(1_000),
     );
@@ -1625,7 +1632,7 @@ fn active_constraint_and_reasoned_departure_share_the_strict_runtime_contract() 
         Ok(RELATIONAL_CONSTRAINT_DEPARTURE_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(1_000),
     );
@@ -1710,7 +1717,7 @@ fn counterpart_withdrawal_is_distinct_immediate_and_non_vetoable() {
         Ok(AGREEMENT_WITHDRAWAL_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(2_000),
     );
@@ -1777,7 +1784,7 @@ fn withdrawal_missing_required_reason_fails_the_strict_runtime_contract() {
         Ok(AGREEMENT_WITHDRAWAL_MISSING_REASON_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(4_000),
     );
@@ -1947,6 +1954,9 @@ fn seed_pattern_vault(directory: &Path) -> VaultRepository {
     assert_eq!(pattern.version(), 1);
     let (repository, _) = maintenance.into_parts();
     repository.close().unwrap();
+    let repository = VaultRepository::open(directory, VaultKey::new([0x72; 32])).unwrap();
+    let repository = make_vault_ready(repository);
+    repository.close().unwrap();
     VaultRepository::open(directory, VaultKey::new([0x72; 32])).unwrap()
 }
 
@@ -2013,7 +2023,7 @@ fn run_disputed_contract(
         Ok(response),
     ]);
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_in_memory_repository(),
         runtime,
         IncrementingClock::new(7_000),
     );

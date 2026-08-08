@@ -212,7 +212,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 
 ### 3.6 模型运行时
 
-本地与远程模型实现同一 Core 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：默认适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格分类 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。S06D 对 URL 解析后的精确 host `api.deepseek.com` 派生 Chat Completions：发送 `messages` 与 `response_format=json_object`、显式关闭默认思考、从 `choices[0].message.content` 提取正文，再走同一严格领域解析；其他 host 继续使用 Responses。模型只接收本轮工作上下文和允许的结构化操作，不拥有保险库连接、长期身份或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v3](runtime-contract-v3.md)。
+本地与远程模型实现同一 Core 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：默认适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格分类 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。S06D 对 URL 解析后的精确 host `api.deepseek.com` 派生 Chat Completions：发送 `messages` 与 `response_format=json_object`、显式关闭默认思考、从 `choices[0].message.content` 提取正文，再走同一严格领域解析；其他 host 继续使用 Responses。S07C-3 要求普通回应请求始终携带当前身份和 Self Bundle 版本，缺少完整第二自我状态时请求本身不会被构造。模型只接收 Core 显式选择的本轮状态与允许的结构化操作，不拥有保险库连接、身份版本链或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v3](runtime-contract-v3.md)。
 
 ### 3.7 技术职责
 
@@ -664,6 +664,9 @@ CreateCounterpartRequested
   -> CounterpartCreated
 
 PersonMessageReceived
+  -> rederive CounterpartReadiness from persisted introduction + identity + Self Bundle
+  -> require READY(identity_version, self_bundle_version)
+  -> require current identity context matches both frozen versions
   -> append verbatim ConversationEvidence(speaker=person)
   -> classify statement context
   -> clear direct self-report:
@@ -677,15 +680,20 @@ ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
   -> classify_intent(input, trigger)
   -> active_relational_constraints = project_relevant_shared_agreements(intent)
   -> build_context(intent, budget)
-  -> invoke_runtime(constitution, active_relational_constraints, identity_state, working_context)
+  -> invoke_runtime(required identity_state + self_bundle_version,
+                    constitution, active_relational_constraints, working_context)
   -> express response in counterpart identity and relationship voice
        do not narrate internal status names or fixed disclosure templates
        preserve the meaning of any materially used disagreement
        expand paired positions, sources and uncertainty when person requests details
        if decision is high-impact:
          naturally state material uncertainty and attach evidence entry point
-  -> append verbatim ConversationEvidence(speaker=counterpart)
+  -> append verbatim ConversationEvidence(
+       speaker=counterpart,
+       attribution=IDENTITY_BOUND(identity_version))
   -> validate_structured_outputs()
+       reject PRE_IDENTITY_UNBOUND evidence as support for judgments,
+       shared relationship history or identity revisions
   -> for each depart_relational_constraint(agreement_claim_id, reason):
        require agreement_claim_id is active in this frozen WorkingContext
        require reason is non-empty and appears verbatim in the response
@@ -793,13 +801,14 @@ send_message(verbatim)
   -> 拒绝空白或超过 16 KiB 的输入
   -> 从固定持续会话选取最近 32 轮且不超过 64 KiB 的已有原文
   -> Core 冻结 WorkingContext
-  -> MemoryCore::run_counterpart_turn
+  -> MemoryCore::run_counterpart_turn 先复核 READY 与当前版本
+  -> 非 READY 或版本不一致时零证据、零运行时调用、零账本写入
   -> 返回本人与第二自我的两个逐字证据视图
 ```
 
 运行时失败时，本人发言仍按 Core 既有语义保留；React 重新调用 `list_conversation`，显示已落盘原文与错误。普通问答只有运行时显式提出并通过 Core 校验的结构化操作才可能入账，保留原文本身不产生 Claim。
 
-实机审计确认该 S07 入口尚未接通前述 `CreateCounterpartRequested`：桌面端没有初始介绍和身份形成 command，`send_message` 在身份与 Self Bundle 缺失时仍可进入普通运行时，且后者只获得 Self Bundle 版本号。S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`，但宿主接线和正式对话失败关闭仍分别留给 S07C-5 与 S07C-3。当前宿主状态仍违反 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)；[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
+实机审计确认该 S07 入口尚未接通前述 `CreateCounterpartRequested`。S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭，并令运行时身份输入必填。桌面端仍没有初始介绍和身份形成 command，因此新 Vault 暂时只能被门禁拒绝，宿主创建接线留给 S07C-5。旧回复继续逐字可读，但 schema v27 将其投影为 `PRE_IDENTITY_UNBOUND`，不得支持当前第二自我的判断、共同关系历史或身份修订。[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -1152,15 +1161,18 @@ freeze_working_context(selected evidence ids)
   -> clone ordered evidence into immutable WorkingContext
 
 run_counterpart_turn(prompt, WorkingContext)
+  -> derive CounterpartReadiness from persisted facts
+  -> require READY and matching identity/Self Bundle versions before any local write
   -> retain person prompt as ConversationEvidence
-  -> runtime.respond(RuntimeRequest { prompt, working_context })
+  -> runtime.respond(RuntimeRequest { prompt, working_context, required identity })
   -> validate response citations against prompt or frozen context
-  -> retain counterpart free text as ConversationEvidence only
+  -> retain counterpart free text as IDENTITY_BOUND(identity_version) evidence
   -> validate each structured JudgmentProposal
+  -> reject PRE_IDENTITY_UNBOUND support from judgment/shared/identity knowledge paths
   -> append Claim(owner=counterpart) only when source, quote and fields pass
 ```
 
-`CounterpartRuntime` 的两个方法都不接收 `MemoryRepository`；运行时只能看到 Core 显式复制进请求的值。即使运行时猜中仓储 ID，未进入冻结工作上下文的引用也会被拒绝。该实现首次落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0003](adr/0003-temporal-three-ledger-model.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0025](adr/0025-direct-self-reports-enter-person-ledger.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md) 和 [ADR-0027](adr/0027-counterpart-explicitly-proposes-persistent-judgments.md)。
+`CounterpartRuntime` 的两个方法都不接收 `MemoryRepository`；运行时只能看到 Core 显式复制进请求的值。即使运行时猜中仓储 ID，未进入冻结工作上下文的引用也会被拒绝。S07C-3 在该入口增加持久化 READY 复核和回复身份归属：普通请求不再存在 `identity=None`，且身份前未绑定的旧回复只保留审计价值。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0003](adr/0003-temporal-three-ledger-model.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0025](adr/0025-direct-self-reports-enter-person-ledger.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0027](adr/0027-counterpart-explicitly-proposes-persistent-judgments.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
 
 ### 9.2 S02 当前实现边界
 
@@ -1183,7 +1195,8 @@ VaultRepository::open(vault_root, VaultKey)
   -> cache next append-only evidence/claim ids
 
 MemoryRepository append/read
-  -> evidence rows retain verbatim text, speaker, session and recorded time
+  -> evidence rows retain verbatim text, speaker, session, recorded time and reply identity version
+  -> schema v27 maps legacy counterpart NULL attribution to PRE_IDENTITY_UNBOUND
   -> claim + ordered support citations commit atomically
   -> reopen decodes the same domain values and resumes ids from persisted maxima
 
@@ -1191,7 +1204,7 @@ VaultRepository::close
   -> checkpoint encrypted WAL -> close SQLCipher -> zeroize owned VaultKey -> unlock writer
 ```
 
-`cipher_memory_security` 未启用：G01 的 Windows spike 证明 `VirtualLock` 配额失败会导致崩溃；关闭契约改为先释放 SQLCipher 的连接内密钥，再显式清零 Rust 持有的 Vault Key。S02 先用 HKDF 与 XChaCha20-Poly1305 固定向量锁定兼容性，S08 再落地对象文件与归档引用。该实现落实 [ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md) 和 [ADR-0046](adr/0046-vault-cryptographic-profile.md)。
+`cipher_memory_security` 未启用：G01 的 Windows spike 证明 `VirtualLock` 配额失败会导致崩溃；关闭契约改为先释放 SQLCipher 的连接内密钥，再显式清零 Rust 持有的 Vault Key。S02 先用 HKDF 与 XChaCha20-Poly1305 固定向量锁定兼容性，S08 再落地对象文件与归档引用。S07C-3 的 v27 migration 只增加回复归属列与索引；旧回复不改写、不删除，也不追溯绑定后来身份。该实现落实 [ADR-0009](adr/0009-hybrid-encrypted-vault-storage.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md) 和 [ADR-0046](adr/0046-vault-cryptographic-profile.md)。
 
 ### 9.3 S03 当前实现边界
 
@@ -1305,8 +1318,8 @@ crates/runtime-gateway/src/
   adapter.rs            # 初始身份/分类/回应的 Responses 或 DeepSeek 编码、严格 schema、外发记录和错误分类
   fallback.rs           # 保留的 runtime 组合原语与回归夹具；桌面宿主不再接线固定双档案
 crates/vault/src/
-  schema.rs             # v26 单例 runtime_profiles 与默认本地档案
-  repository.rs         # 完整档案、脱敏视图及 KEEP/REPLACE/CLEAR 原子更新
+  schema.rs             # v26 单例 runtime_profiles；v27 第二自我回复身份归属
+  repository.rs         # 完整档案、脱敏视图、档案原子更新及身份归属恢复
 crates/core/src/
   ports.rs              # RuntimeErrorKind 确定错误语义
   domain.rs             # 未知结构化操作与 Core 拒绝结果

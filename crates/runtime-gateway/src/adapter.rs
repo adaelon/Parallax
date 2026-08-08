@@ -271,7 +271,7 @@ where
         let input = serde_json::to_string(&TurnInput {
             kind: "response",
             prompt: EvidenceInput::from(request.prompt()),
-            identity: request.identity().map(IdentityRuntimeInput::from),
+            identity: IdentityRuntimeInput::from(request.identity()),
             reflection: request.reflection().map(ReflectionRuntimeInput::from),
             pending_agreement_candidates: request
                 .pending_agreement_candidates()
@@ -420,11 +420,9 @@ fn response_outbound_selection(
             retrieved_sources.push(source);
         }
     }
-    if let Some(identity) = request.identity() {
-        retrieved_sources.push(OutboundContextSource::IdentityState {
-            version: identity.state().version(),
-        });
-    }
+    retrieved_sources.push(OutboundContextSource::IdentityState {
+        version: request.identity().state().version(),
+    });
     if let Some(reflection) = request.reflection() {
         for id in reflection
             .invitation()
@@ -517,7 +515,7 @@ const fn self_introduction_category_name(category: SelfIntroductionCategory) -> 
 struct TurnInput<'a> {
     kind: &'static str,
     prompt: EvidenceInput<'a>,
-    identity: Option<IdentityRuntimeInput<'a>>,
+    identity: IdentityRuntimeInput<'a>,
     reflection: Option<ReflectionRuntimeInput<'a>>,
     pending_agreement_candidates: Vec<PendingAgreementCandidateInput<'a>>,
     working_context: WorkingContextInput<'a>,

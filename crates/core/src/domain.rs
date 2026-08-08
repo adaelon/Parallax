@@ -204,6 +204,22 @@ pub enum Speaker {
     Counterpart,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterpartReplyAttribution {
+    PreIdentityUnbound,
+    IdentityBound(u64),
+}
+
+impl CounterpartReplyAttribution {
+    #[must_use]
+    pub const fn identity_version(self) -> Option<u64> {
+        match self {
+            Self::PreIdentityUnbound => None,
+            Self::IdentityBound(version) => Some(version),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationEvidence {
     id: EvidenceId,
@@ -211,6 +227,7 @@ pub struct ConversationEvidence {
     speaker: Speaker,
     verbatim: String,
     recorded_at: Timestamp,
+    counterpart_reply_attribution: Option<CounterpartReplyAttribution>,
 }
 
 impl ConversationEvidence {
@@ -220,6 +237,7 @@ impl ConversationEvidence {
         speaker: Speaker,
         verbatim: String,
         recorded_at: Timestamp,
+        counterpart_reply_attribution: Option<CounterpartReplyAttribution>,
     ) -> Self {
         Self {
             id,
@@ -227,6 +245,7 @@ impl ConversationEvidence {
             speaker,
             verbatim,
             recorded_at,
+            counterpart_reply_attribution,
         }
     }
 
@@ -239,7 +258,37 @@ impl ConversationEvidence {
         verbatim: String,
         recorded_at: Timestamp,
     ) -> Self {
-        Self::new(id, session_id, speaker, verbatim, recorded_at)
+        let counterpart_reply_attribution = match speaker {
+            Speaker::Person => None,
+            Speaker::Counterpart => Some(CounterpartReplyAttribution::PreIdentityUnbound),
+        };
+        Self::new(
+            id,
+            session_id,
+            speaker,
+            verbatim,
+            recorded_at,
+            counterpart_reply_attribution,
+        )
+    }
+
+    /// Restores a counterpart reply together with its persisted identity attribution.
+    #[must_use]
+    pub fn restore_counterpart(
+        id: EvidenceId,
+        session_id: SessionId,
+        verbatim: String,
+        recorded_at: Timestamp,
+        attribution: CounterpartReplyAttribution,
+    ) -> Self {
+        Self::new(
+            id,
+            session_id,
+            Speaker::Counterpart,
+            verbatim,
+            recorded_at,
+            Some(attribution),
+        )
     }
 
     #[must_use]
@@ -265,6 +314,22 @@ impl ConversationEvidence {
     #[must_use]
     pub const fn recorded_at(&self) -> Timestamp {
         self.recorded_at
+    }
+
+    #[must_use]
+    pub const fn counterpart_reply_attribution(&self) -> Option<CounterpartReplyAttribution> {
+        self.counterpart_reply_attribution
+    }
+
+    #[must_use]
+    pub const fn can_support_counterpart_knowledge(&self) -> bool {
+        match self.speaker {
+            Speaker::Person => true,
+            Speaker::Counterpart => matches!(
+                self.counterpart_reply_attribution,
+                Some(CounterpartReplyAttribution::IdentityBound(_))
+            ),
+        }
     }
 }
 
@@ -2725,6 +2790,39 @@ pub enum IdentityField {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CounterpartInconsistencyReason {
+    IntroductionMissing {
+        identity_version: Option<u64>,
+        self_bundle_version: Option<u64>,
+    },
+    IdentityMissing {
+        self_bundle_version: u64,
+        referenced_identity_version: u64,
+    },
+    SelfBundleMissing {
+        identity_version: u64,
+    },
+    IdentityVersionMismatch {
+        identity_version: u64,
+        self_bundle_version: u64,
+        referenced_identity_version: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CounterpartReadiness {
+    NeedsIntroduction,
+    IntroductionRecorded,
+    Ready {
+        identity_version: u64,
+        self_bundle_version: u64,
+    },
+    Inconsistent {
+        reason: CounterpartInconsistencyReason,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityProfileSnapshot {
     name: String,
     expression_traits: String,
@@ -3085,6 +3183,7 @@ pub enum IdentityRevisionRejectionReason {
     EmptyChangeReason,
     MissingEvidence,
     EvidenceOutsideWorkingContext(EvidenceId),
+    PreIdentityUnbound(EvidenceId),
     EmptyQuote(EvidenceId),
     QuoteMismatch(EvidenceId),
     VersionOverflow,
@@ -3554,7 +3653,7 @@ pub struct RuntimeRequest {
     prompt: ConversationEvidence,
     working_context: WorkingContext,
     pending_agreement_candidates: Vec<SharedAgreementCandidate>,
-    identity: Option<IdentityRuntimeContext>,
+    identity: IdentityRuntimeContext,
     reflection: Option<ReflectionRuntimeContext>,
 }
 
@@ -3563,7 +3662,7 @@ impl RuntimeRequest {
         prompt: ConversationEvidence,
         working_context: WorkingContext,
         pending_agreement_candidates: Vec<SharedAgreementCandidate>,
-        identity: Option<IdentityRuntimeContext>,
+        identity: IdentityRuntimeContext,
         reflection: Option<ReflectionRuntimeContext>,
     ) -> Self {
         Self {
@@ -3591,8 +3690,8 @@ impl RuntimeRequest {
     }
 
     #[must_use]
-    pub const fn identity(&self) -> Option<&IdentityRuntimeContext> {
-        self.identity.as_ref()
+    pub const fn identity(&self) -> &IdentityRuntimeContext {
+        &self.identity
     }
 
     #[must_use]
@@ -3606,6 +3705,7 @@ pub enum JudgmentRejectionReason {
     EmptyStatement,
     MissingSupport,
     EvidenceOutsideWorkingContext(EvidenceId),
+    PreIdentityUnbound(EvidenceId),
     EmptyQuote(EvidenceId),
     QuoteMismatch(EvidenceId),
     InvalidApplicableTime,

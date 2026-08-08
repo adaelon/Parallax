@@ -1,11 +1,14 @@
 use eam_core::{
-    ActiveRelationalConstraint, EvidenceCitation, EvidenceId, InMemoryRepository,
-    IncrementingClock, MemoryCore, PersonTurnClassification, RelationalConstraintDeparture,
+    ActiveRelationalConstraint, EvidenceCitation, EvidenceId, IncrementingClock, MemoryCore,
+    PersonTurnClassification, RelationalConstraintDeparture,
     RelationalConstraintDepartureRejectionReason, RelationalConstraintPriority, RuntimeResponse,
     ScriptedRuntime, SessionId, SharedAgreementDecision, SharedExperienceKind,
     SharedExperienceProposal, SharedExperienceRejectionReason, SharedExperienceRepository,
     StructuredOperationRejectionReason, Timestamp, WorkingContext, WorkingContextError,
 };
+
+mod support;
+use support::ready_repository;
 
 fn session() -> SessionId {
     SessionId::new("relational-constraints")
@@ -77,11 +80,7 @@ fn working_context_accepts_only_active_unique_subconstitutional_constraints() {
         [RuntimeResponse::new("约定不能授予写入能力。")
             .with_unsupported_operation(0, "write_vault")],
     );
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(2_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(2_000));
     let context = WorkingContext::from_selected_evidence(Vec::new(), Timestamp::from_millis(2_000))
         .with_active_relational_constraints(vec![active])
         .unwrap();
@@ -109,11 +108,7 @@ fn reasoned_departure_is_atomically_admitted_as_shared_history() {
         ],
         [agreement_response(), departure_response],
     );
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(1_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
 
     let first_context = core.freeze_working_context(&[]).unwrap();
     let first = core
@@ -175,11 +170,7 @@ fn departure_without_an_explicit_reason_is_rejected_by_core() {
         ],
         [agreement_response(), departure_response],
     );
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(1_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
     let context = core.freeze_working_context(&[]).unwrap();
     let first = core
         .run_counterpart_turn(
@@ -231,7 +222,7 @@ fn generic_shared_experience_operation_cannot_forge_an_agreement_breach() {
         ),
     );
     let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
+        ready_repository(),
         ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
         IncrementingClock::new(1_000),
     );

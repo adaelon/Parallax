@@ -1,13 +1,93 @@
 use eam_core::{
-    ApplicableTime, ClaimOwner, CoreError, EvidenceCitation, FrozenEvidenceBlock,
-    FrozenRetrievalWindow, InMemoryRepository, IncrementingClock, JudgmentProposal,
-    JudgmentRejectionReason, MemoryCore, MemoryRepository, PersonTurnClassification,
-    RetrievalSnapshot, RetrievedContextItem, RuntimeResponse, ScriptedRuntime, SessionId,
-    SourceCurrentness, Speaker, Timestamp, Uncertainty, WorkingContextError,
+    ApplicableTime, ClaimOwner, CoreError, CounterpartInconsistencyReason, CounterpartReadiness,
+    EvidenceCitation, FrozenEvidenceBlock, FrozenRetrievalWindow, InMemoryRepository,
+    IncrementingClock, JudgmentProposal, JudgmentRejectionReason, MemoryCore, MemoryRepository,
+    PersonTurnClassification, RetrievalSnapshot, RetrievedContextItem, RuntimeResponse,
+    ScriptedRuntime, SessionId, SourceCurrentness, Speaker, Timestamp, Uncertainty,
+    WorkingContextError,
 };
+
+mod support;
+use support::ready_repository;
 
 fn session(id: &str) -> SessionId {
     SessionId::new(id)
+}
+
+#[test]
+fn every_non_ready_state_fails_before_any_formal_conversation_side_effect() {
+    let cases = [
+        CounterpartReadiness::NeedsIntroduction,
+        CounterpartReadiness::IntroductionRecorded,
+        CounterpartReadiness::Inconsistent {
+            reason: CounterpartInconsistencyReason::IntroductionMissing {
+                identity_version: Some(1),
+                self_bundle_version: Some(1),
+            },
+        },
+        CounterpartReadiness::Inconsistent {
+            reason: CounterpartInconsistencyReason::IdentityMissing {
+                self_bundle_version: 1,
+                referenced_identity_version: 1,
+            },
+        },
+        CounterpartReadiness::Inconsistent {
+            reason: CounterpartInconsistencyReason::SelfBundleMissing {
+                identity_version: 1,
+            },
+        },
+        CounterpartReadiness::Inconsistent {
+            reason: CounterpartInconsistencyReason::IdentityVersionMismatch {
+                identity_version: 1,
+                self_bundle_version: 1,
+                referenced_identity_version: 2,
+            },
+        },
+    ];
+
+    for readiness in cases {
+        let runtime = ScriptedRuntime::new(
+            [PersonTurnClassification::Question],
+            [RuntimeResponse::new("这条回复不应被调用。")],
+        );
+        let repository = InMemoryRepository::new().with_counterpart_readiness(readiness.clone());
+        let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(50));
+        let context = core.freeze_working_context(&[]).unwrap();
+
+        let error = core
+            .run_counterpart_turn(session("blocked"), "这条本人消息不应落盘。", context)
+            .expect_err("formal conversation must fail closed before counterpart creation");
+
+        assert_eq!(error, CoreError::CounterpartNotReady(readiness));
+        assert!(core.repository().all_evidence().unwrap().is_empty());
+        assert!(core.repository().all_claims().unwrap().is_empty());
+        assert!(core.runtime().seen_classification_inputs().is_empty());
+        assert!(core.runtime().seen_requests().is_empty());
+    }
+}
+
+#[test]
+fn ready_versions_are_revalidated_before_any_formal_conversation_side_effect() {
+    let repository = ready_repository().with_counterpart_readiness(CounterpartReadiness::Ready {
+        identity_version: 2,
+        self_bundle_version: 2,
+    });
+    let runtime = ScriptedRuntime::new(
+        [PersonTurnClassification::Question],
+        [RuntimeResponse::new("这条回复不应被调用。")],
+    );
+    let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(60));
+    let context = core.freeze_working_context(&[]).unwrap();
+
+    let error = core
+        .run_counterpart_turn(session("stale-ready"), "这条本人消息不应落盘。", context)
+        .expect_err("formal conversation must reject stale ready versions");
+
+    assert_eq!(error, CoreError::CounterpartStateChanged);
+    assert!(core.repository().all_evidence().unwrap().is_empty());
+    assert!(core.repository().all_claims().unwrap().is_empty());
+    assert!(core.runtime().seen_classification_inputs().is_empty());
+    assert!(core.runtime().seen_requests().is_empty());
 }
 
 #[test]
@@ -63,11 +143,7 @@ fn closes_the_minimal_memory_loop_with_exact_sources_and_separate_ledgers() {
         ],
         [response],
     );
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(1_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
 
     let (source_id, classification) = core
         .record_person_turn(session("first"), first_statement)
@@ -165,11 +241,7 @@ fn rejects_unsourced_and_out_of_context_judgments() {
         ],
         [response],
     );
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(3_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(3_000));
 
     core.record_person_turn(session("first"), "一条不会暴露给运行时的事实")
         .unwrap();
@@ -205,11 +277,7 @@ fn free_text_response_is_evidence_but_cannot_write_a_ledger() {
         [PersonTurnClassification::Question],
         [RuntimeResponse::new("这是普通回答，不是持久判断提议。")],
     );
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(4_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(4_000));
 
     let context = core.freeze_working_context(&[]).unwrap();
     let outcome = core
@@ -235,11 +303,7 @@ fn rejects_a_response_citation_that_is_not_a_verbatim_match() {
         [RuntimeResponse::new("错误地改写了来源。")
             .with_citation(EvidenceCitation::new(source_id, "并不存在的逐字内容"))],
     );
-    let mut core = MemoryCore::new(
-        InMemoryRepository::new(),
-        runtime,
-        IncrementingClock::new(5_000),
-    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(5_000));
 
     core.record_person_turn(session("first"), "原始逐字内容")
         .unwrap();

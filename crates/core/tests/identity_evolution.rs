@@ -97,7 +97,7 @@ fn counterpart_revision_appends_one_immutable_version_and_advances_self_bundle()
         [EvidenceId::from_raw(1), EvidenceId::from_raw(2)]
     );
 
-    let request_identity = core.runtime().seen_requests()[0].identity().unwrap();
+    let request_identity = core.runtime().seen_requests()[0].identity();
     assert_eq!(request_identity.state().version(), 1);
     assert_eq!(request_identity.constitution_version(), 7);
 }
@@ -212,7 +212,6 @@ fn a_model_switch_reads_the_committed_identity_chain_instead_of_owning_it() {
     assert_eq!(
         second_core.runtime().seen_requests()[0]
             .identity()
-            .unwrap()
             .state()
             .version(),
         2

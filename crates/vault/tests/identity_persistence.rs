@@ -1,10 +1,12 @@
 use std::{fmt::Write as _, fs};
 
 use eam_core::{
-    ClaimOwner, EvidenceCitation, EvidenceId, IdentityEvolutionRepository, IdentityProfileChanges,
-    IdentityProfileSnapshot, IdentityRevisionCommit, IdentityRevisionProposal,
-    IdentityStateSnapshot, IncrementingClock, MemoryCore, MemoryRepository,
-    PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId, Speaker, Timestamp,
+    ClaimOwner, CounterpartReplyAttribution, EvidenceCitation, EvidenceId,
+    IdentityEvolutionRepository, IdentityProfileChanges, IdentityProfileSnapshot,
+    IdentityRevisionCommit, IdentityRevisionProposal, IdentityRevisionRejectionReason,
+    IdentityStateSnapshot, IncrementingClock, JudgmentRejectionReason, MemoryCore,
+    MemoryRepository, PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId,
+    SharedExperienceKind, SharedExperienceProposal, SharedExperienceRepository, Speaker, Timestamp,
 };
 use eam_identity::{
     CounterpartReadiness, CounterpartRepository, IdentityFormation, IdentityProfile,
@@ -120,7 +122,7 @@ fn repository_with_identity_bundle(path: &std::path::Path) -> VaultRepository {
 fn reopens_the_same_first_identity_with_its_person_evidence_and_facts() {
     let directory = tempdir().unwrap();
     let repository = VaultRepository::open(directory.path(), key()).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let runtime = ScriptedIdentityRuntime::new([proposal()]);
     let mut formation = IdentityFormation::new(repository, runtime, IncrementingClock::new(10_000));
 
@@ -424,6 +426,110 @@ fn failed_identity_evidence_link_rolls_back_identity_and_self_bundle_together() 
     let current = repository.current_identity_context().unwrap().unwrap();
     assert_eq!(current.state().version(), 1);
     assert_eq!(current.self_bundle_version(), 1);
+    repository.close().unwrap();
+}
+
+#[test]
+fn legacy_unbound_reply_remains_verbatim_but_cannot_support_current_counterpart_knowledge() {
+    let directory = tempdir().unwrap();
+    let mut repository = repository_with_identity_bundle(directory.path());
+    let legacy_reply_id = repository.next_evidence_id();
+    repository
+        .append_evidence(eam_core::ConversationEvidence::restore(
+            legacy_reply_id,
+            SessionId::new("legacy-conversation"),
+            Speaker::Counterpart,
+            "这是身份归属尚不可证明的旧回复。".to_owned(),
+            Timestamp::from_millis(19_000),
+        ))
+        .unwrap();
+    repository.close().unwrap();
+
+    let repository = VaultRepository::open(directory.path(), key()).unwrap();
+    let restored = repository.evidence(legacy_reply_id).unwrap().unwrap();
+    assert_eq!(restored.verbatim(), "这是身份归属尚不可证明的旧回复。");
+    assert_eq!(restored.speaker(), Speaker::Counterpart);
+    assert_eq!(
+        restored.counterpart_reply_attribution(),
+        Some(CounterpartReplyAttribution::PreIdentityUnbound)
+    );
+
+    let legacy_citation = EvidenceCitation::new(legacy_reply_id, "身份归属尚不可证明");
+    let prompt_id = EvidenceId::from_raw(legacy_reply_id.get() + 1);
+    let response = RuntimeResponse::new("我不会把旧回复当成当前身份的判断来源。")
+        .with_judgment(eam_core::JudgmentProposal::new(
+            "旧回复不能支撑第二自我判断。",
+            vec![legacy_citation.clone()],
+            eam_core::Uncertainty::Low,
+            eam_core::ApplicableTime::Unknown,
+        ))
+        .with_shared_experience(SharedExperienceProposal::new(
+            SharedExperienceKind::SubstantiveDisagreement,
+            "旧回复是否代表当前第二自我存在分歧",
+            vec![
+                legacy_citation.clone(),
+                EvidenceCitation::new(prompt_id, "这条旧回复能支撑你的判断吗"),
+            ],
+            "我不会把旧回复当成当前身份的判断来源",
+            Timestamp::from_millis(20_000),
+        ))
+        .with_identity_revision(IdentityRevisionProposal::new(
+            1,
+            1,
+            IdentityProfileChanges::new(
+                None,
+                Some("更依赖创建后的可归属证据".to_owned()),
+                None,
+                None,
+                None,
+                None,
+            ),
+            "旧回复支持这次身份修订",
+            vec![legacy_citation],
+        ));
+    let mut core = MemoryCore::new(
+        repository,
+        ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+        IncrementingClock::new(20_000),
+    );
+    let context = core.freeze_working_context(&[legacy_reply_id]).unwrap();
+    let outcome = core
+        .run_counterpart_turn(
+            SessionId::new("identity-bound-conversation"),
+            "这条旧回复能支撑你的判断吗？",
+            context,
+        )
+        .unwrap();
+
+    assert!(outcome.accepted_judgment_ids().is_empty());
+    assert_eq!(outcome.rejected_judgments().len(), 1);
+    assert_eq!(
+        outcome.rejected_judgments()[0].reason(),
+        &JudgmentRejectionReason::PreIdentityUnbound(legacy_reply_id)
+    );
+    assert_eq!(outcome.rejected_shared_experiences().len(), 1);
+    assert!(
+        core.repository()
+            .all_shared_experiences()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(outcome.accepted_identity_revision(), None);
+    assert_eq!(outcome.rejected_identity_revisions().len(), 1);
+    assert_eq!(
+        outcome.rejected_identity_revisions()[0].reason(),
+        &IdentityRevisionRejectionReason::PreIdentityUnbound(legacy_reply_id)
+    );
+    assert_eq!(core.repository().identity_history().unwrap().len(), 1);
+    assert_eq!(
+        core.repository()
+            .evidence(outcome.counterpart_evidence_id())
+            .unwrap()
+            .unwrap()
+            .counterpart_reply_attribution(),
+        Some(CounterpartReplyAttribution::IdentityBound(1))
+    );
+    let (repository, _, _) = core.into_parts();
     repository.close().unwrap();
 }
 

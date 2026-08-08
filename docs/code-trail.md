@@ -1,5 +1,21 @@
 # 代码链路
 
+## 2026-08-08 S07C-3 正式对话门禁与回复身份归属
+
+**触达**:
+- `crates/core/src/domain.rs:ConversationEvidence/RuntimeRequest` — 为第二自我回复记录身份前未绑定或指定身份版本归属，并把普通运行时请求的身份与 Self Bundle 版本改为必填。
+- `crates/core/src/ports.rs:IdentityEvolutionRepository` — 向 Core 暴露从持久化介绍、当前身份和当前 Self Bundle 重建就绪状态所需的只读能力。
+- `crates/core/src/memory_loop.rs:MemoryCore::require_ready_identity_context/run_counterpart_turn` — 在保存本人证据和调用运行时前复核 `READY` 与冻结版本，绑定成功回复，并拒绝未绑定旧回复支持判断、共同经历或身份修订。
+- `crates/runtime-gateway/src/adapter.rs:TurnInput` — 保持 `/v1/responses` 出口，只序列化 Core 必填身份状态与冻结 `WorkingContext.evidence`。
+- `crates/runtime-gateway/tests/support/mod.rs:ready_in_memory_repository/make_vault_ready` — 为运行时契约测试显式建立 READY 内存与 SQLCipher 仓储，不放宽生产默认状态。
+- `crates/runtime-gateway/tests/runtime_contract.rs:run_contract/seed_pattern_vault` — 令既有 Responses、DeepSeek、关系和模式成熟度契约在完整第二自我状态下运行，并断言身份状态是必填外发来源。
+- `crates/vault/src/schema.rs:MIGRATION_27` — 原子增加回复身份版本归属与索引，把既有第二自我回复投影为 `PRE_IDENTITY_UNBOUND`。
+- `crates/vault/src/repository.rs:MemoryRepository/IdentityEvolutionRepository` — 持久化并恢复回复归属，复核当前就绪版本，并在认识链路查询中排除身份前未绑定回复。
+- `apps/desktop/src-tauri/src/state.rs:ManagedHost::send_message` — 复用 Core 的失败关闭门禁，使非 READY 或版本错位在真实桌面入口保持零本人证据、零运行时调用、零账本写入。
+
+**入口**：桌面 `send_message({ verbatim })` 经 `ManagedHost::send_message` 进入 `MemoryCore::run_counterpart_turn`；Core 先从 Vault 重建并核对 `CounterpartReadiness::Ready`，再允许冻结上下文、运行时调用和带身份版本的回复落盘。
+**测试**：`crates/core/tests/minimal_memory_loop.rs` 覆盖四种非 READY/版本错位失败关闭及成功回复绑定；`crates/vault/tests/identity_persistence.rs` 覆盖 schema v27 迁移、中断回滚、跨重启归属与旧回复隔离；`apps/desktop/src-tauri/src/state.rs::tests` 覆盖真实宿主入口零写入与 READY 成功路径。
+
 ## 2026-08-08 S07C-2 首个身份与自我包原子创建
 
 **触达**:

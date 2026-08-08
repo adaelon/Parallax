@@ -44,7 +44,7 @@ fn same_user_and_recovery_paths_unlock_the_same_vault_without_a_dpapi_copy() {
     let (initial_key, recovery_key) = initialized.into_parts();
 
     let repository = VaultRepository::open(directory.path(), initial_key).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     repository.close().unwrap();
 
     let local_key = VaultKeyStore::unlock_local(directory.path()).unwrap();

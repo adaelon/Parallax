@@ -11,6 +11,10 @@ use eam_core::{
 use eam_vault::{VaultError, VaultKey, VaultRepository};
 use tempfile::tempdir;
 
+mod support;
+
+use support::ready_repository;
+
 const VAULT_KEY_BYTES: [u8; 32] = [0x42; 32];
 static SQLCIPHER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -34,8 +38,8 @@ fn preserves_exact_citations_and_separate_ledgers_across_reopen() {
     let directory = tempdir().unwrap();
     let marker = "S02-固定明文-不应出现在数据库字节中";
     let runtime = ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []);
-    let repository = VaultRepository::open(directory.path(), key()).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    let repository = ready_repository(directory.path(), VAULT_KEY_BYTES);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_000));
 
     let (source_id, classification) = core
@@ -67,12 +71,14 @@ fn preserves_exact_citations_and_separate_ledgers_across_reopen() {
     assert_eq!(core.resolve_citation(&citation).unwrap(), marker);
     let evidence = core.repository().all_evidence().unwrap();
     let claims = core.repository().all_claims().unwrap();
-    assert_eq!(evidence.len(), 3);
-    assert_eq!(claims.len(), 2);
-    assert_eq!(claims[0].owner(), ClaimOwner::Person);
-    assert_eq!(claims[1].owner(), ClaimOwner::Counterpart);
-    assert_eq!(claims[0].support(), std::slice::from_ref(&citation));
-    assert_eq!(claims[1].support(), std::slice::from_ref(&citation));
+    let cited_claims = claims
+        .iter()
+        .filter(|claim| claim.support() == std::slice::from_ref(&citation))
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 9);
+    assert_eq!(cited_claims.len(), 2);
+    assert_eq!(cited_claims[0].owner(), ClaimOwner::Person);
+    assert_eq!(cited_claims[1].owner(), ClaimOwner::Counterpart);
 
     let (repository, _, _) = core.into_parts();
     repository.close().unwrap();

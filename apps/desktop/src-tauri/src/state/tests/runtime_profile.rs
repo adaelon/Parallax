@@ -155,6 +155,7 @@ fn seed_profile(root: &Path, base_url: &str, model: &str, bearer: Option<&str>) 
             ),
         )
         .unwrap();
+    let repository = seed_ready_counterpart(repository);
     repository.close().unwrap();
 }
 
@@ -237,7 +238,14 @@ fn strict_profile_test_uses_only_synthetic_input_without_persisting_or_switching
         let HostSlot::Ready(host) = &mut *slot else {
             panic!("managed host should stay ready");
         };
-        assert!(host.core.repository().all_evidence().unwrap().is_empty());
+        assert!(
+            host.core
+                .repository()
+                .all_evidence()
+                .unwrap()
+                .iter()
+                .all(|evidence| evidence.session_id().as_str() == "desktop-test-onboarding")
+        );
         let persisted = host.core.repository().runtime_profile().unwrap();
         assert_eq!(persisted.model(), "old-model");
         assert_eq!(persisted.bearer_key(), Some(OLD_BEARER));
@@ -327,7 +335,14 @@ fn profile_test_failure_is_sanitized_and_keeps_the_active_profile() {
         let HostSlot::Ready(host) = &mut *slot else {
             panic!("managed host should stay ready");
         };
-        assert!(host.core.repository().all_evidence().unwrap().is_empty());
+        assert!(
+            host.core
+                .repository()
+                .all_evidence()
+                .unwrap()
+                .iter()
+                .all(|evidence| evidence.session_id().as_str() == "desktop-test-onboarding")
+        );
         host.core
             .record_person_turn(
                 SessionId::new("active-after-rejected-test"),

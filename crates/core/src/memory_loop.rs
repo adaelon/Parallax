@@ -4,13 +4,14 @@ use crate::{
     AgreementWithdrawal, AgreementWithdrawalActor, AgreementWithdrawalRejection,
     AgreementWithdrawalRejectionReason, ApplicableTime, Claim, ClaimCorrectionReceipt,
     ClaimCorrectionRepository, ClaimId, ClaimOwner, ClaimStatus, Clock, ConversationEvidence,
-    CounterpartRuntime, EvidenceCitation, EvidenceId, ForgetReceipt, ForgetRepository,
-    ForgetRequest, G08_IMMEDIATE_SAFETY_QUOTE, IdentityEvolutionRepository, IdentityField,
-    IdentityPersonRepresentation, IdentityProfileChanges, IdentityProfileSnapshot,
-    IdentityReflectivePurposeStatus, IdentityRevisionAuthorship, IdentityRevisionCommit,
-    IdentityRevisionReceipt, IdentityRevisionRejection, IdentityRevisionRejectionReason,
-    IdentityRuntimeContext, IdentityStateSnapshot, JudgmentProposal, JudgmentRejection,
-    JudgmentRejectionReason, MAX_OPEN_REFLECTION_INVITATIONS, MAX_REFLECTION_EVIDENCE_REFS,
+    CounterpartReadiness, CounterpartReplyAttribution, CounterpartRuntime, EvidenceCitation,
+    EvidenceId, ForgetReceipt, ForgetRepository, ForgetRequest, G08_IMMEDIATE_SAFETY_QUOTE,
+    IdentityEvolutionRepository, IdentityField, IdentityPersonRepresentation,
+    IdentityProfileChanges, IdentityProfileSnapshot, IdentityReflectivePurposeStatus,
+    IdentityRevisionAuthorship, IdentityRevisionCommit, IdentityRevisionReceipt,
+    IdentityRevisionRejection, IdentityRevisionRejectionReason, IdentityRuntimeContext,
+    IdentityStateSnapshot, JudgmentProposal, JudgmentRejection, JudgmentRejectionReason,
+    MAX_OPEN_REFLECTION_INVITATIONS, MAX_REFLECTION_EVIDENCE_REFS,
     MAX_REFLECTION_OBSERVATION_BYTES, MAX_REFLECTION_TOPIC_BYTES, MAX_REFLECTION_WHY_NOW_BYTES,
     MemoryRepository, PatternMaturityCommitOutcome, PatternMaturityReceipt,
     PatternMaturityWriteRejection, PatternMaturityWriteRejectionReason, PersonTurnClassification,
@@ -33,6 +34,8 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoreError {
     EmptyConversationTurn,
+    CounterpartNotReady(CounterpartReadiness),
+    CounterpartStateChanged,
     EmptyCorrection,
     UnchangedCorrection,
     InvalidCorrectionTime,
@@ -113,6 +116,15 @@ impl fmt::Display for CoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyConversationTurn => formatter.write_str("conversation turn cannot be empty"),
+            Self::CounterpartNotReady(readiness) => {
+                write!(
+                    formatter,
+                    "counterpart is not ready for formal conversation: {readiness:?}"
+                )
+            }
+            Self::CounterpartStateChanged => formatter.write_str(
+                "counterpart identity or Self Bundle changed while opening formal conversation",
+            ),
             Self::EmptyCorrection => formatter.write_str("correction statement cannot be empty"),
             Self::UnchangedCorrection => {
                 formatter.write_str("correction statement must change the claim")
@@ -245,6 +257,7 @@ where
             Speaker::Person,
             corrected_statement.clone(),
             recorded_at,
+            None,
         );
         let replacement = Claim::correction(
             self.repository.next_claim_id(),
@@ -309,7 +322,8 @@ where
         session_id: SessionId,
         verbatim: impl Into<String>,
     ) -> Result<(EvidenceId, PersonTurnClassification), CoreError> {
-        let evidence = self.append_conversation_evidence(session_id, Speaker::Person, verbatim)?;
+        let evidence =
+            self.append_conversation_evidence(session_id, Speaker::Person, verbatim, None)?;
         let classification = self.runtime.classify_person_turn(&evidence)?;
 
         if classification == PersonTurnClassification::DirectSelfReport {
@@ -414,6 +428,7 @@ where
         session_id: SessionId,
         speaker: Speaker,
         verbatim: impl Into<String>,
+        counterpart_reply_attribution: Option<CounterpartReplyAttribution>,
     ) -> Result<ConversationEvidence, CoreError> {
         let verbatim = verbatim.into();
         if verbatim.is_empty() {
@@ -425,6 +440,7 @@ where
             speaker,
             verbatim,
             self.clock.now(),
+            counterpart_reply_attribution,
         );
         self.repository.append_evidence(evidence.clone())?;
         Ok(evidence)
@@ -474,6 +490,8 @@ where
         person_verbatim: impl Into<String>,
         working_context: WorkingContext,
     ) -> Result<TurnOutcome, CoreError> {
+        let (ready_identity_version, identity) = self.require_ready_identity_context()?;
+
         let (person_evidence_id, classification) =
             self.record_person_turn(session_id.clone(), person_verbatim)?;
         let prompt = self
@@ -489,7 +507,6 @@ where
                 candidate.status() == SharedAgreementCandidateStatus::AwaitingCounterpart
             })
             .collect();
-        let identity = self.repository.current_identity_context()?;
         let reflection = select_reflection_runtime_context(
             &self.repository.all_reflection_invitations()?,
             working_context.reflection_opportunity(),
@@ -511,6 +528,9 @@ where
             session_id,
             Speaker::Counterpart,
             response.text().to_owned(),
+            Some(CounterpartReplyAttribution::IdentityBound(
+                ready_identity_version,
+            )),
         )?;
         let offered_reflection = self.persist_scheduled_reflection_offer(
             reflection.as_ref(),
@@ -536,7 +556,7 @@ where
         )?;
         let identity_revision = self.persist_identity_revisions(
             &response,
-            identity.as_ref(),
+            &identity,
             &validation_context,
             &prompt,
             &counterpart_evidence,
@@ -555,7 +575,6 @@ where
             &prompt,
             &counterpart_evidence,
         )?;
-        let rejected_operations = rejected_structured_operations(&response);
         Ok(TurnOutcome::new(
             person_evidence_id,
             counterpart_evidence.id(),
@@ -574,7 +593,28 @@ where
         )
         .with_pattern_maturities(pattern_maturities.accepted, pattern_maturities.rejected)
         .with_shared_experiences(shared.pending_agreements, shared.admitted, shared.rejected)
-        .with_rejected_operations(rejected_operations))
+        .with_rejected_operations(rejected_structured_operations(&response)))
+    }
+
+    fn require_ready_identity_context(&self) -> Result<(u64, IdentityRuntimeContext), CoreError> {
+        let (ready_identity_version, ready_self_bundle_version) =
+            match self.repository.conversation_readiness()? {
+                CounterpartReadiness::Ready {
+                    identity_version,
+                    self_bundle_version,
+                } => (identity_version, self_bundle_version),
+                readiness => return Err(CoreError::CounterpartNotReady(readiness)),
+            };
+        let identity = self
+            .repository
+            .current_identity_context()?
+            .ok_or(CoreError::CounterpartStateChanged)?;
+        if identity.state().version() != ready_identity_version
+            || identity.self_bundle_version() != ready_self_bundle_version
+        {
+            return Err(CoreError::CounterpartStateChanged);
+        }
+        Ok((ready_identity_version, identity))
     }
 
     fn persist_pattern_maturity_proposals(
@@ -706,7 +746,7 @@ where
     fn persist_identity_revisions(
         &mut self,
         response: &crate::RuntimeResponse,
-        identity: Option<&IdentityRuntimeContext>,
+        identity: &IdentityRuntimeContext,
         validation_context: &WorkingContext,
         prompt: &ConversationEvidence,
         counterpart_evidence: &ConversationEvidence,
@@ -1208,6 +1248,7 @@ where
             Speaker::Person,
             canonical.clone(),
             revised_at,
+            None,
         );
         let revised = SharedAgreementCandidate::awaiting_counterpart(
             self.repository.next_shared_agreement_candidate_id(),
@@ -1356,6 +1397,7 @@ where
             Speaker::Person,
             canonical.clone(),
             effective_at,
+            None,
         );
         let support = agreement
             .claim()
@@ -1432,6 +1474,13 @@ fn validate_judgment(
     }
     for citation in proposal.support() {
         validate_citation(citation, working_context, prompt)?;
+        if citation_source(citation, working_context, prompt)
+            .is_some_and(|evidence| !evidence.can_support_counterpart_knowledge())
+        {
+            return Err(JudgmentRejectionReason::PreIdentityUnbound(
+                citation.evidence_id(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1745,12 +1794,11 @@ fn validate_reflection_citation(
 
 fn validate_identity_revision(
     proposal: &crate::IdentityRevisionProposal,
-    identity: Option<&IdentityRuntimeContext>,
+    identity: &IdentityRuntimeContext,
     working_context: &WorkingContext,
     prompt: &ConversationEvidence,
     counterpart_evidence: &ConversationEvidence,
 ) -> Result<IdentityRevisionCommit, IdentityRevisionRejectionReason> {
-    let identity = identity.ok_or(IdentityRevisionRejectionReason::IdentityUnavailable)?;
     if proposal.authorship() != IdentityRevisionAuthorship::Counterpart {
         return Err(IdentityRevisionRejectionReason::PersonAuthoredRoleCard);
     }
@@ -1894,6 +1942,11 @@ fn validate_identity_citation(
             citation.evidence_id(),
         ));
     }
+    if !evidence.can_support_counterpart_knowledge() {
+        return Err(IdentityRevisionRejectionReason::PreIdentityUnbound(
+            citation.evidence_id(),
+        ));
+    }
     Ok(())
 }
 
@@ -1934,4 +1987,19 @@ fn validate_citation(
         ));
     }
     Ok(())
+}
+
+fn citation_source<'a>(
+    citation: &EvidenceCitation,
+    working_context: &'a WorkingContext,
+    prompt: &'a ConversationEvidence,
+) -> Option<&'a ConversationEvidence> {
+    if prompt.id() == citation.evidence_id() {
+        Some(prompt)
+    } else {
+        working_context
+            .evidence()
+            .iter()
+            .find(|evidence| evidence.id() == citation.evidence_id())
+    }
 }

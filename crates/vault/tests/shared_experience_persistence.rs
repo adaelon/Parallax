@@ -10,6 +10,10 @@ use eam_retrieval::{RetrievalQuery, project_active_relational_constraints};
 use eam_vault::{VaultKey, VaultRepository};
 use tempfile::tempdir;
 
+mod support;
+
+use support::ready_repository;
+
 const TEST_VAULT_KEY: [u8; 32] = [0xE7; 32];
 
 fn agreement_response() -> RuntimeResponse {
@@ -18,7 +22,7 @@ fn agreement_response() -> RuntimeResponse {
             SharedExperienceKind::Agreement,
             "发现关键逃避时直接指出",
             vec![EvidenceCitation::new(
-                EvidenceId::from_raw(1),
+                EvidenceId::from_raw(7),
                 "我同意以后直接指出关键逃避",
             )],
             "我也同意以后直接指出关键逃避",
@@ -39,7 +43,7 @@ fn disagreement_response() -> RuntimeResponse {
             SharedExperienceKind::SubstantiveDisagreement,
             "双方对这件事的重要性持不相容立场",
             vec![EvidenceCitation::new(
-                EvidenceId::from_raw(1),
+                EvidenceId::from_raw(7),
                 "这件事无关紧要",
             )],
             "我不同意把它视为无关紧要",
@@ -54,10 +58,10 @@ fn persist_person_withdrawal_with_breach(
 ) -> (ClaimId, ClaimId) {
     let departure = RuntimeResponse::new("我会偏离一次，因为当前安全边界优先。")
         .with_relational_constraint_departure(RelationalConstraintDeparture::new(
-            ClaimId::from_raw(1),
+            ClaimId::from_raw(7),
             "当前安全边界优先",
         ));
-    let repository = VaultRepository::open(vault_path, VaultKey::new([0x98; 32])).unwrap();
+    let repository = ready_repository(vault_path, [0x98; 32]);
     let mut core = MemoryCore::new(
         repository,
         ScriptedRuntime::new(
@@ -117,7 +121,7 @@ fn persist_person_withdrawal_with_breach(
 #[test]
 fn agreement_candidate_survives_reopen_without_entering_shared_ledger_until_confirmed() {
     let vault = tempdir().unwrap();
-    let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    let repository = ready_repository(vault.path(), TEST_VAULT_KEY);
     let mut core = MemoryCore::new(
         repository,
         ScriptedRuntime::new([PersonTurnClassification::Question], [agreement_response()]),
@@ -143,7 +147,7 @@ fn agreement_candidate_survives_reopen_without_entering_shared_ledger_until_conf
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].id(), candidate_id);
@@ -197,11 +201,11 @@ fn reasoned_agreement_breach_survives_reopen_and_forgets_with_its_agreement() {
     let reason = "因为安全边界禁止把约定当作现实行动授权";
     let departure = RuntimeResponse::new(format!("这次我会偏离约定，{reason}。"))
         .with_relational_constraint_departure(RelationalConstraintDeparture::new(
-            ClaimId::from_raw(1),
+            ClaimId::from_raw(7),
             reason,
         ));
     let vault = tempdir().unwrap();
-    let repository = VaultRepository::open(vault.path(), VaultKey::new([0xC7; 32])).unwrap();
+    let repository = ready_repository(vault.path(), [0xC7; 32]);
     let mut core = MemoryCore::new(
         repository,
         ScriptedRuntime::new(
@@ -248,7 +252,7 @@ fn reasoned_agreement_breach_survives_reopen_and_forgets_with_its_agreement() {
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0xC7; 32])).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let experiences = repository.all_shared_experiences().unwrap();
     assert_eq!(experiences.len(), 2);
     let breach = experiences
@@ -267,7 +271,7 @@ fn reasoned_agreement_breach_survives_reopen_and_forgets_with_its_agreement() {
         IncrementingClock::new(4_000),
     );
     core.forget(ForgetRequest::new(
-        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
+        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(7)),
         true,
     ))
     .unwrap();
@@ -293,7 +297,7 @@ fn withdrawal_survives_reopen_preserves_breach_and_forgets_as_one_closure() {
         persist_person_withdrawal_with_breach(vault.path(), reason);
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0x98; 32])).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     let experiences = repository.all_shared_experiences().unwrap();
     assert_eq!(experiences.len(), 3);
@@ -336,7 +340,7 @@ fn withdrawal_survives_reopen_preserves_breach_and_forgets_as_one_closure() {
         IncrementingClock::new(9_000),
     );
     core.forget(ForgetRequest::new(
-        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
+        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(7)),
         true,
     ))
     .unwrap();
@@ -357,7 +361,7 @@ fn withdrawal_survives_reopen_preserves_breach_and_forgets_as_one_closure() {
 #[test]
 fn disagreement_and_notice_dismissal_survive_reopen_without_retracting_history() {
     let vault = tempdir().unwrap();
-    let repository = VaultRepository::open(vault.path(), VaultKey::new([0xF7; 32])).unwrap();
+    let repository = ready_repository(vault.path(), [0xF7; 32]);
     let mut core = MemoryCore::new(
         repository,
         ScriptedRuntime::new(
@@ -405,7 +409,7 @@ fn disagreement_and_notice_dismissal_survive_reopen_without_retracting_history()
         IncrementingClock::new(3_000),
     );
     core.forget(ForgetRequest::new(
-        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
+        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(7)),
         true,
     ))
     .unwrap();
@@ -427,7 +431,7 @@ fn disagreement_and_notice_dismissal_survive_reopen_without_retracting_history()
 #[test]
 fn forgetting_support_removes_an_unconfirmed_candidate_without_foreign_key_leakage() {
     let vault = tempdir().unwrap();
-    let repository = VaultRepository::open(vault.path(), VaultKey::new([0xA7; 32])).unwrap();
+    let repository = ready_repository(vault.path(), [0xA7; 32]);
     let mut core = MemoryCore::new(
         repository,
         ScriptedRuntime::new([PersonTurnClassification::Question], [agreement_response()]),
@@ -442,7 +446,7 @@ fn forgetting_support_removes_an_unconfirmed_candidate_without_foreign_key_leaka
     .unwrap();
 
     core.forget(ForgetRequest::new(
-        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
+        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(7)),
         true,
     ))
     .unwrap();
@@ -468,7 +472,7 @@ fn forgetting_support_removes_an_unconfirmed_candidate_without_foreign_key_leaka
 #[allow(clippy::too_many_lines)] // Reopen checkpoints make the persistence lifecycle explicit.
 fn revised_candidate_and_exact_dual_signatures_survive_reopen_and_forget_as_a_chain() {
     let vault = tempdir().unwrap();
-    let repository = VaultRepository::open(vault.path(), VaultKey::new([0xB7; 32])).unwrap();
+    let repository = ready_repository(vault.path(), [0xB7; 32]);
     let mut core = MemoryCore::new(
         repository,
         ScriptedRuntime::new([PersonTurnClassification::Question], [agreement_response()]),
@@ -551,7 +555,7 @@ fn revised_candidate_and_exact_dual_signatures_survive_reopen_and_forget_as_a_ch
         IncrementingClock::new(4_000),
     );
     core.forget(ForgetRequest::new(
-        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
+        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(7)),
         true,
     ))
     .unwrap();
@@ -583,7 +587,7 @@ fn supersession_survives_reopen_preserves_old_breach_and_forgets_as_one_closure(
     let original = agreement_response();
     let breach = RuntimeResponse::new(format!("这次我会偏离旧约定，{reason}。"))
         .with_relational_constraint_departure(RelationalConstraintDeparture::new(
-            ClaimId::from_raw(1),
+            ClaimId::from_raw(7),
             reason,
         ));
     let replacement = RuntimeResponse::new("我同意新约定整份取代旧约定。").with_shared_experience(
@@ -591,7 +595,7 @@ fn supersession_survives_reopen_preserves_old_breach_and_forgets_as_one_closure(
             SharedExperienceKind::Agreement,
             "重要议题中不要直接指出关键逃避",
             vec![EvidenceCitation::new(
-                EvidenceId::from_raw(5),
+                EvidenceId::from_raw(11),
                 "我同意新约定整份取代旧约定",
             )],
             "我同意新约定整份取代旧约定",
@@ -603,10 +607,10 @@ fn supersession_survives_reopen_preserves_old_breach_and_forgets_as_one_closure(
             None,
             None,
         )
-        .with_superseded_agreements(vec![ClaimId::from_raw(1)]),
+        .with_superseded_agreements(vec![ClaimId::from_raw(7)]),
     );
     let vault = tempdir().unwrap();
-    let repository = VaultRepository::open(vault.path(), VaultKey::new([0x97; 32])).unwrap();
+    let repository = ready_repository(vault.path(), [0x97; 32]);
     let mut core = MemoryCore::new(
         repository,
         ScriptedRuntime::new(
@@ -670,7 +674,7 @@ fn supersession_survives_reopen_preserves_old_breach_and_forgets_as_one_closure(
     repository.close().unwrap();
 
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0x97; 32])).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 26);
+    assert_eq!(repository.schema_version().unwrap(), 27);
     let candidates = repository.all_shared_agreement_candidates().unwrap();
     let replacement = repository
         .shared_agreement_candidate(replacement_candidate_id)
@@ -713,7 +717,7 @@ fn supersession_survives_reopen_preserves_old_breach_and_forgets_as_one_closure(
         IncrementingClock::new(9_000),
     );
     core.forget(ForgetRequest::new(
-        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(1)),
+        ForgetTarget::ConversationEvidence(EvidenceId::from_raw(7)),
         true,
     ))
     .unwrap();
