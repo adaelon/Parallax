@@ -646,7 +646,10 @@ Obsidian 校准
 CreateCounterpartRequested
   -> require minimal InitialSelfIntroduction is complete
   -> persist introduction as timestamped person evidence and clear person claims
-  -> invoke_runtime(constitution, introduction_context, identity_version=NONE)
+  -> RuntimeGateway::form_initial_identity(InitialIdentityRequest)
+       -> serialize exactly six typed introduction items as untrusted data
+       -> record InvocationKind::InitialIdentity with only six introduction Evidence IDs
+       -> Responses strict json_schema | DeepSeek json_object + the same local strict parser
   -> require counterpart-authored initial identity preserves ReflectivePurpose
   -> append immutable IdentityStateVersion(version=1)
   -> CounterpartCreated
@@ -786,6 +789,8 @@ send_message(verbatim)
 ```
 
 运行时失败时，本人发言仍按 Core 既有语义保留；React 重新调用 `list_conversation`，显示已落盘原文与错误。普通问答只有运行时显式提出并通过 Core 校验的结构化操作才可能入账，保留原文本身不产生 Claim。
+
+实机审计确认该 S07 入口尚未接通前述 `CreateCounterpartRequested`：桌面端没有初始介绍和身份形成 command，`send_message` 在身份与 Self Bundle 缺失时仍可进入普通运行时，且后者只获得 Self Bundle 版本号。该状态违反 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)；[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -1082,7 +1087,7 @@ VaultBackup::restore(snapshot, deletion_head, empty_destination, RecoveryKey)
 | 单次事件、模式证据门槛与反例检查 | [ADR-0042：主动模式反思采用三实例门槛](adr/0042-pattern-reflection-requires-three-independent-events.md) |
 | 模式长期成熟、稳定看法归属与反例修正 | [ADR-0043：模式可成熟为受支持的第二自我看法](adr/0043-pattern-may-mature-into-supported-counterpart-view.md) |
 | 模式成熟资格、显式提议与 Core 校验边界 | [ADR-0044：模式成熟由第二自我显式提议](adr/0044-counterpart-explicitly-proposes-pattern-maturity.md) |
-| 初始自我介绍、创建门槛与首个身份版本 | [ADR-0045：第二自我创建前需要最小自我介绍](adr/0045-minimal-self-introduction-before-counterpart-creation.md) |
+| 初始自我介绍、首个身份与自我包、正式对话门禁 | [ADR-0045：第二自我创建前需要最小自我介绍](adr/0045-minimal-self-introduction-before-counterpart-creation.md)、[ADR-0055：正式对话以完整第二自我状态为就绪门禁](adr/0055-formal-conversation-requires-complete-counterpart-state.md) |
 | SQLCipher binding、子密钥派生、对象认证加密与关闭清零 | [ADR-0046：保险库密码配置](adr/0046-vault-cryptographic-profile.md) |
 | Recovery Key 载体、DPAPI CurrentUser、双解锁与元数据格式 | [ADR-0047：版本化独立双解锁](adr/0047-versioned-independent-vault-unlock.md) |
 | 首个本地/云端模型、Responses contract 与结构化输出白名单 | [ADR-0048：首个模型运行时采用 OpenAI Responses 家族](adr/0048-openai-responses-runtime-family.md) |
@@ -1280,7 +1285,7 @@ Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用�
 crates/runtime-gateway/src/
   transport.rs          # Base URL/模型/Key 校验、精确 host 协议选择、endpoint 与无重定向 HTTP
   deepseek.rs           # Chat Completions 请求、JSON Object 提示、关闭思考和 content 提取
-  adapter.rs            # Responses 编码或 DeepSeek 分派、严格 schema、外发记录和错误分类
+  adapter.rs            # 初始身份/分类/回应的 Responses 或 DeepSeek 编码、严格 schema、外发记录和错误分类
   fallback.rs           # 保留的 runtime 组合原语与回归夹具；桌面宿主不再接线固定双档案
 crates/vault/src/
   schema.rs             # v26 单例 runtime_profiles 与默认本地档案
@@ -1297,6 +1302,13 @@ apps/desktop/src/
 ```
 
 ```text
+OpenAiResponsesRuntime::form_initial_identity(request)
+  -> serialize six typed introduction items; treat statements as untrusted data
+  -> disclose exactly their six Evidence IDs as InitialIdentity
+  -> adapt one eam_initial_identity_v1 schema to Responses or DeepSeek
+  -> strict local parse into InitialIdentityProposal
+  -> IdentityFormation validates authorship, ReflectivePurpose, distinctness and evidence scope
+
 OpenAiResponsesRuntime::classify_person_turn(evidence)
   -> validate/normalize owned Base URL + model
   -> RuntimeTarget::protocol by exact normalized host
@@ -1339,7 +1351,7 @@ React runtime settings open
   -> save_runtime_profile success clears Key input and refreshes redacted view
 ```
 
-任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra`、Local `gpt-oss-20b` 与 DeepSeek `deepseek-v4-pro` 固定夹具产生等价领域输出。只有精确官方 DeepSeek host 选择 Chat Completions；相似 host 与自定义代理不被猜测。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v3](runtime-contract-v3.md)。结构化输出错误仍失败关闭；桌面宿主只认 Vault 单档案，不再读取 `OPENAI_API_KEY` 或 `EAM_*_RESPONSES_ENDPOINT`，也不再接线固定 fallback。schema v26 与 Repository 故障注入证明迁移/更新中断保持旧档案，Recovery Set 测试证明完整 Key 随加密数据库恢复且不出现在原始字节中；桌面集成测试进一步证明测试零副作用、保存失败保留旧运行时、保存后下一请求与重启使用新档案，以及请求中切换不会混用配置。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md)、[ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 和 [ADR-0054](adr/0054-deepseek-chat-completions-protocol-adapter.md)。
+任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra`、Local `gpt-oss-20b` 与 DeepSeek `deepseek-v4-pro` 固定夹具产生等价领域输出；S07C-1 进一步证明 Responses 与 DeepSeek 从同一六类介绍形成等价首个身份提议，并拒绝缺/多字段、提示注入控制字段、冒充本人、放弃反思使命和越界引用。只有精确官方 DeepSeek host 选择 Chat Completions；相似 host 与自定义代理不被猜测。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v3](runtime-contract-v3.md)。结构化输出错误仍失败关闭；桌面宿主只认 Vault 单档案，不再读取 `OPENAI_API_KEY` 或 `EAM_*_RESPONSES_ENDPOINT`，也不再接线固定 fallback。schema v26 与 Repository 故障注入证明迁移/更新中断保持旧档案，Recovery Set 测试证明完整 Key 随加密数据库恢复且不出现在原始字节中；桌面集成测试进一步证明测试零副作用、保存失败保留旧运行时、保存后下一请求与重启使用新档案，以及请求中切换不会混用配置。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)、[ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md)、[ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)、[ADR-0054](adr/0054-deepseek-chat-completions-protocol-adapter.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
 
 ### 9.7 S07 桌面宿主与持续对话当前实现边界
 

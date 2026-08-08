@@ -3312,6 +3312,7 @@ name = "runtime-gateway"
 version = "0.1.0"
 dependencies = [
  "core",
+ "identity",
  "memory",
  "reqwest",
  "serde",

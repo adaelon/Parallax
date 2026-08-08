@@ -1,5 +1,16 @@
 # 代码链路
 
+## 2026-08-08 S07C-1 真实初始身份运行时契约
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:IdentityRuntime for OpenAiResponsesRuntime<T>` — 只序列化六类类型化介绍，使用 `eam_initial_identity_v1` 严格 schema，并把双协议输出映射为 `InitialIdentityProposal`。
+- `crates/runtime-gateway/src/transport.rs:InvocationKind::InitialIdentity`、`src/deepseek.rs:request_json` — 固定身份形成外发类型，并为 DeepSeek JSON Object 请求提供同一 schema 与合成示例。
+- `crates/runtime-gateway/tests/runtime_contract.rs:responses_and_deepseek_form_equivalent_strict_initial_identity_proposals` 及相邻拒绝测试、`tests/fixtures/*initial-identity-response.json` — 覆盖双协议等价、六字段/六证据、缺/多字段、提示注入、冒充本人、放弃使命和越界引用。
+- `docs/runtime-contract-v3.md:§4`、`docs/architecture.md:§5.4/§9.6`、`docs/implementation-slices.md:S07C-1` — 固定最小数据出口、领域门禁、实现入口和完成状态。
+
+**入口**：`IdentityFormation::form_initial_identity` 把已持久化的 `InitialIdentityRequest` 交给当前 `OpenAiResponsesRuntime<T>`；本片不接宿主 command、Vault 事务或普通对话路径。
+**测试**：红测先因缺少 `IdentityRuntime` 实现和 `InitialIdentity` 调用类型而失败，并复现 DeepSeek 示例写死证据 ID；修复后 runtime-gateway 35/35、identity 5/5、Rust workspace 全测、workspace 全目标 Clippy `-D warnings`、格式、隐私/静态边界与 Markdown 链接检查通过。系统 `Validate` 与 acceptance self-tests 按 S07C 计划仅停在 `missing=[ADR-0055]`，该系统级证据留待 S07C-9 闭合。
+
 ## 2026-08-04 持续对话滚动所有权修复
 
 **触达**:

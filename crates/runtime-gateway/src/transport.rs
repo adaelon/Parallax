@@ -162,6 +162,7 @@ impl Error for RuntimeTargetError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvocationKind {
+    InitialIdentity,
     Classification,
     Response,
 }

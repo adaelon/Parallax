@@ -29,7 +29,7 @@
 | EV-OBSIDIAN | `cargo test -p source-obsidian`; `cargo test -p vault --test obsidian_reconciliation`; `cargo test -p vault --test obsidian_source_persistence` | 只读扫描、配置排除、移除/离线与结构查询 | automated |
 | EV-RETRIEVAL | `cargo test -p retrieval`; `cargo test -p vault --test retrieval_persistence` | 全文/向量/时间/关系/记忆召回、权威回读与冻结窗口 | automated |
 | EV-UNDERSTANDING | `cargo test -p understanding`; `cargo test -p vault --test understanding_persistence` | 有限触发、显式来源、可重建投影与失效 | automated |
-| EV-RUNTIME | `cargo test -p runtime-gateway --test runtime_contract` | Responses/DeepSeek 等价 contract、最小输出、HTTPS 与结构化白名单 | automated |
+| EV-RUNTIME | `cargo test -p runtime-gateway --test runtime_contract` | Responses/DeepSeek 等价初始身份、分类与回应 contract，最小输出、HTTPS、严格 schema 与结构化白名单 | automated |
 | EV-RUNTIME-PROFILE | `cargo test -p vault --test runtime_profile_persistence`; `cargo test -p vault --test backup_recovery encrypted_snapshot_round_trips_authority_and_rebuilds_indexes -- --exact`; `cargo test -p desktop-app runtime_profile`; `npm test -- App.test.tsx -t "S06R-4 local runtime settings"` in `apps/desktop` | v25→v26 默认档案、`KEEP/REPLACE/CLEAR` 与 write-only Key、Recovery Set 完整恢复、严格合成测试、提交后热切换、重启和并发隔离 | automated |
 | EV-VAULT | `cargo test -p vault --test encrypted_repository`; `cargo test -p vault --test windows_unlock`; `cargo test -p vault --lib` | SQLCipher、对象 AEAD、DPAPI/恢复密钥、确认前零写入、错误密钥、清零与故障注入 | automated |
 | EV-SCHEMA | `cargo test -p vault schema::tests` | schema v1→v26 逐版事务迁移、中断回滚与数据回填 | automated |
@@ -144,7 +144,7 @@
 | ADR-0042 | 三个独立事件的模式门槛 | EV-PATTERN, EV-REFLECTION | automated |
 | ADR-0043 | 模式成熟为稳定第二自我看法 | EV-PATTERN, EV-DISPUTE | automated |
 | ADR-0044 | 模式成熟须第二自我显式提议 | EV-PATTERN, EV-RUNTIME | automated |
-| ADR-0045 | 创建前需要最小自我介绍 | EV-IDENTITY-INIT | automated |
+| ADR-0045 | 创建前需要最小自我介绍 | EV-IDENTITY-INIT, EV-RUNTIME | automated |
 | ADR-0046 | 用途隔离的保险库密码配置 | EV-VAULT | automated |
 | ADR-0047 | 版本化独立双解锁 | EV-VAULT | automated |
 | ADR-0048 | OpenAI Responses 运行时家族 | EV-RUNTIME, EV-CORE-IDENTITY | automated |
@@ -180,7 +180,9 @@
 
 ## 8. S31 运行记录
 
-本节只记录最后一次完整通过的 S31 运行；命令输出与中间 JSON 留在被忽略的 `/.local/system-acceptance/`，不携带个人正文进入 Git。下表是完成 S06R-5 后重新冻结的唯一 S32 候选构建。
+> 历史记录：该构建早于 S06D 和 ADR-0055/S07C，已失去 S32 候选资格；S07C-9 必须更新本矩阵、完整重跑并替换以下记录后才能开始纵向观察。
+
+本节只记录最后一次完整通过的 S31 运行；命令输出与中间 JSON 留在被忽略的 `/.local/system-acceptance/`，不携带个人正文进入 Git。下表是完成 S06R-5 后当时冻结、现已失效的 S32 候选构建。
 
 | 字段 | 结果 |
 | --- | --- |
