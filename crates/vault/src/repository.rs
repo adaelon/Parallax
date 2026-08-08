@@ -33,9 +33,10 @@ use eam_desktop_host::{
     HostSessionId, HostSessionStart, LaunchMode,
 };
 use eam_identity::{
-    IdentityProfile, IdentityRepository, IdentityStateVersion, InitialSelfIntroduction,
-    IntroductionAnswer, IntroductionItem, SelfBundleRepository, SelfBundleState, SelfBundleVersion,
-    SelfIntroductionCategory, WakeCommit, WakeExit, WakeTrigger,
+    CounterpartRepository, IdentityProfile, IdentityRepository, IdentityStateVersion,
+    InitialSelfIntroduction, IntroductionAnswer, IntroductionItem, SelfBundleRepository,
+    SelfBundleState, SelfBundleVersion, SelfIntroductionCategory, WakeCommit, WakeExit,
+    WakeTrigger,
 };
 use eam_ingestion::{
     AcceptedMarkdownSource, ArchiveInput, ArchiveReceipt, ArchiveRepository, ArchiveStatus,
@@ -5847,6 +5848,63 @@ impl IdentityRepository for VaultRepository {
     }
 }
 
+impl CounterpartRepository for VaultRepository {
+    fn commit_initial_counterpart(
+        &mut self,
+        identity: IdentityStateVersion,
+        bundle: SelfBundleVersion,
+    ) -> Result<(), RepositoryError> {
+        if !valid_initial_counterpart_pair(&identity, &bundle) {
+            return Err(RepositoryError::new(
+                "initial identity and Self Bundle versions do not form one valid pair",
+            ));
+        }
+
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()
+            .map_err(repository_error)?;
+        let introduction_count = transaction
+            .query_row(
+                "SELECT count(*) FROM initial_self_introduction",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(repository_error)?;
+        if introduction_count
+            != i64::try_from(SelfIntroductionCategory::ALL.len()).map_err(repository_error)?
+        {
+            return Err(RepositoryError::new(
+                "complete initial self introduction does not exist",
+            ));
+        }
+        let identity_count = transaction
+            .query_row("SELECT count(*) FROM identity_state_versions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(repository_error)?;
+        let bundle_count = transaction
+            .query_row("SELECT count(*) FROM self_bundle_versions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(repository_error)?;
+        if identity_count != 0 || bundle_count != 0 {
+            return Err(RepositoryError::new(
+                "initial counterpart state already exists",
+            ));
+        }
+
+        validate_identity_chain(&transaction, &identity)?;
+        validate_self_bundle_chain(&transaction, &bundle)?;
+        insert_identity_state(&transaction, &identity)?;
+        insert_self_bundle(&transaction, &bundle)?;
+        transaction.commit().map_err(repository_error)?;
+        Ok(())
+    }
+}
+
 impl IdentityEvolutionRepository for VaultRepository {
     fn current_identity_context(&self) -> Result<Option<IdentityRuntimeContext>, RepositoryError> {
         let identity = self.current_identity_state()?;
@@ -6146,6 +6204,24 @@ fn validate_identity_chain(
             "identity version does not continue the current immutable chain",
         )),
     }
+}
+
+fn valid_initial_counterpart_pair(
+    identity: &IdentityStateVersion,
+    bundle: &SelfBundleVersion,
+) -> bool {
+    identity.version() == 1
+        && identity.predecessor_version().is_none()
+        && bundle.version() == 1
+        && bundle.predecessor_version().is_none()
+        && bundle.wake_commit().is_none()
+        && bundle.state().constitution_version() == 1
+        && bundle.state().identity_state_version() == identity.version()
+        && bundle.state().relationship_state() == identity.profile().relationship_posture()
+        && bundle.state().counterpart_experience_refs().is_empty()
+        && bundle.state().belief_refs().is_empty()
+        && bundle.state().pending_intentions().is_empty()
+        && bundle.committed_at() == identity.formed_at()
 }
 
 fn insert_identity_state(

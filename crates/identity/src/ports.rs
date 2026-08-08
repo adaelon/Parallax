@@ -1,8 +1,9 @@
 use eam_core::{RepositoryError, RuntimeError, SessionId, Timestamp};
 
 use crate::{
-    IdentityStateVersion, InitialIdentityProposal, InitialIdentityRequest, InitialSelfIntroduction,
-    IntroductionAnswer, SelfBundleState, SelfBundleVersion, WakeTrigger,
+    CounterpartInconsistencyReason, CounterpartReadiness, IdentityStateVersion,
+    InitialIdentityProposal, InitialIdentityRequest, InitialSelfIntroduction, IntroductionAnswer,
+    SelfBundleState, SelfBundleVersion, WakeTrigger,
 };
 
 pub trait IdentityRepository {
@@ -83,6 +84,75 @@ pub trait SelfBundleRepository {
     /// Returns an adapter error when persisted bundle state is incomplete or
     /// cannot be decoded.
     fn current_self_bundle(&self) -> Result<Option<SelfBundleVersion>, RepositoryError>;
+}
+
+pub trait CounterpartRepository: IdentityRepository + SelfBundleRepository {
+    /// Derives the read-only creation state from persisted introduction,
+    /// identity, and Self Bundle facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when any persisted component cannot be read or decoded.
+    fn counterpart_readiness(&self) -> Result<CounterpartReadiness, RepositoryError> {
+        let introduction_recorded = self.initial_self_introduction()?.is_some();
+        let identity = self.current_identity_state()?;
+        let bundle = self.current_self_bundle()?;
+
+        if !introduction_recorded {
+            return match (&identity, &bundle) {
+                (None, None) => Ok(CounterpartReadiness::NeedsIntroduction),
+                _ => Ok(CounterpartReadiness::Inconsistent {
+                    reason: CounterpartInconsistencyReason::IntroductionMissing {
+                        identity_version: identity.as_ref().map(IdentityStateVersion::version),
+                        self_bundle_version: bundle.as_ref().map(SelfBundleVersion::version),
+                    },
+                }),
+            };
+        }
+
+        match (identity, bundle) {
+            (None, None) => Ok(CounterpartReadiness::IntroductionRecorded),
+            (Some(identity), None) => Ok(CounterpartReadiness::Inconsistent {
+                reason: CounterpartInconsistencyReason::SelfBundleMissing {
+                    identity_version: identity.version(),
+                },
+            }),
+            (None, Some(bundle)) => Ok(CounterpartReadiness::Inconsistent {
+                reason: CounterpartInconsistencyReason::IdentityMissing {
+                    self_bundle_version: bundle.version(),
+                    referenced_identity_version: bundle.state().identity_state_version(),
+                },
+            }),
+            (Some(identity), Some(bundle))
+                if bundle.state().identity_state_version() == identity.version() =>
+            {
+                Ok(CounterpartReadiness::Ready {
+                    identity_version: identity.version(),
+                    self_bundle_version: bundle.version(),
+                })
+            }
+            (Some(identity), Some(bundle)) => Ok(CounterpartReadiness::Inconsistent {
+                reason: CounterpartInconsistencyReason::IdentityVersionMismatch {
+                    identity_version: identity.version(),
+                    self_bundle_version: bundle.version(),
+                    referenced_identity_version: bundle.state().identity_state_version(),
+                },
+            }),
+        }
+    }
+
+    /// Atomically commits the first identity and first Self Bundle as one pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the introduction is absent, either chain
+    /// already exists, the two first versions disagree, or the complete pair
+    /// cannot be committed together.
+    fn commit_initial_counterpart(
+        &mut self,
+        identity: IdentityStateVersion,
+        bundle: SelfBundleVersion,
+    ) -> Result<(), RepositoryError>;
 }
 
 /// Executes bounded wake-cycle work without receiving repository access.

@@ -1,8 +1,9 @@
 use eam_core::{ClaimOwner, EvidenceId, IncrementingClock, MemoryRepository, SessionId, Speaker};
 use eam_identity::{
-    IdentityAuthorship, IdentityError, IdentityFormation, IdentityProfile,
-    IdentityProposalRejectionReason, InMemoryIdentityRepository, InitialIdentityProposal,
-    IntroductionAnswer, PersonRepresentation, ReflectivePurposeStatus, ScriptedIdentityRuntime,
+    CounterpartInconsistencyReason, CounterpartReadiness, IdentityAuthorship, IdentityError,
+    IdentityFormation, IdentityProfile, IdentityProposalRejectionReason,
+    InMemoryIdentityRepository, InitialIdentityProposal, IntroductionAnswer, PersonRepresentation,
+    ReflectivePurposeStatus, ScriptedIdentityRuntime, SelfBundleRepository,
     SelfIntroductionCategory,
 };
 
@@ -204,5 +205,101 @@ fn first_identity_is_immutable_and_cannot_be_formed_twice() {
         IdentityError::IdentityAlreadyFormed
     );
     assert_eq!(formation.current_identity().unwrap(), Some(first));
+    assert_eq!(formation.runtime().seen_requests().len(), 1);
+}
+
+#[test]
+fn forms_identity_and_empty_self_bundle_as_one_ready_counterpart() {
+    let runtime = ScriptedIdentityRuntime::new([proposal()]);
+    let mut formation = IdentityFormation::new(
+        InMemoryIdentityRepository::new(),
+        runtime,
+        IncrementingClock::new(6_000),
+    );
+
+    assert_eq!(
+        formation.counterpart_readiness().unwrap(),
+        CounterpartReadiness::NeedsIntroduction
+    );
+    assert_eq!(
+        formation.form_initial_counterpart().unwrap_err(),
+        IdentityError::IntroductionNotRecorded
+    );
+    assert!(formation.runtime().seen_requests().is_empty());
+
+    formation
+        .record_initial_self_introduction(&SessionId::new("onboarding"), &complete_introduction())
+        .unwrap();
+    assert_eq!(
+        formation.counterpart_readiness().unwrap(),
+        CounterpartReadiness::IntroductionRecorded
+    );
+
+    assert_eq!(
+        formation.form_initial_counterpart().unwrap(),
+        CounterpartReadiness::Ready {
+            identity_version: 1,
+            self_bundle_version: 1,
+        }
+    );
+    let identity = formation.current_identity().unwrap().unwrap();
+    let bundle = formation
+        .repository()
+        .current_self_bundle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(bundle.version(), 1);
+    assert_eq!(bundle.predecessor_version(), None);
+    assert_eq!(bundle.wake_commit(), None);
+    assert_eq!(bundle.state().constitution_version(), 1);
+    assert_eq!(bundle.state().identity_state_version(), identity.version());
+    assert_eq!(
+        bundle.state().relationship_state(),
+        identity.profile().relationship_posture()
+    );
+    assert!(bundle.state().counterpart_experience_refs().is_empty());
+    assert!(bundle.state().belief_refs().is_empty());
+    assert!(bundle.state().pending_intentions().is_empty());
+    assert_eq!(bundle.committed_at(), identity.formed_at());
+    assert_eq!(
+        formation.counterpart_readiness().unwrap(),
+        CounterpartReadiness::Ready {
+            identity_version: 1,
+            self_bundle_version: 1,
+        }
+    );
+    assert_eq!(
+        formation.form_initial_counterpart().unwrap_err(),
+        IdentityError::CounterpartAlreadyCreated
+    );
+    assert_eq!(formation.runtime().seen_requests().len(), 1);
+}
+
+#[test]
+fn refuses_to_create_over_an_existing_identity_half_state() {
+    let runtime = ScriptedIdentityRuntime::new([proposal(), proposal()]);
+    let mut formation = IdentityFormation::new(
+        InMemoryIdentityRepository::new(),
+        runtime,
+        IncrementingClock::new(7_000),
+    );
+    formation
+        .record_initial_self_introduction(&SessionId::new("onboarding"), &complete_introduction())
+        .unwrap();
+    formation.form_initial_identity().unwrap();
+
+    let reason = CounterpartInconsistencyReason::SelfBundleMissing {
+        identity_version: 1,
+    };
+    assert_eq!(
+        formation.counterpart_readiness().unwrap(),
+        CounterpartReadiness::Inconsistent {
+            reason: reason.clone(),
+        }
+    );
+    assert_eq!(
+        formation.form_initial_counterpart().unwrap_err(),
+        IdentityError::InconsistentCounterpartState(reason)
+    );
     assert_eq!(formation.runtime().seen_requests().len(), 1);
 }

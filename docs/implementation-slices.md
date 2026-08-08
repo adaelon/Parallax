@@ -598,7 +598,7 @@ send_message(message):
 
 #### S07C-2 首个身份与自我包原子创建
 
-**状态**：待实施。
+**状态**：已完成；Identity 领域现以 `CounterpartReadiness` 四态派生持久化事实，并通过 `CounterpartRepository::commit_initial_counterpart` 在一个 SQLCipher 事务中提交身份 v1 与自我包 v1；父行、身份证据子项和自我包父行故障注入均证明重启后没有半状态。
 
 **依赖/输入**：S07C-1 的结构化身份提议、S04/S05 领域校验、SQLCipher 当前 schema。
 

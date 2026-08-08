@@ -1,5 +1,17 @@
 # 代码链路
 
+## 2026-08-08 S07C-2 首个身份与自我包原子创建
+
+**触达**:
+- `crates/identity/src/domain.rs:CounterpartReadiness`、`ports.rs:CounterpartRepository` — 从介绍、当前身份和当前自我包只读派生四态，并定义首版成对提交端口。
+- `crates/identity/src/service.rs:IdentityFormation::form_initial_counterpart`、`self_bundle.rs:SelfBundleVersion::initial` — 复用身份提议门禁，以已校验关系姿态构造空首版自我包并只提交完整一对。
+- `crates/vault/src/repository.rs:CounterpartRepository for VaultRepository` — 在一个 SQLCipher 事务内重验完整介绍、零既有版本和一致首版，写入身份父行/证据与自我包父行。
+- `crates/identity/tests/initial_identity.rs:forms_identity_and_empty_self_bundle_as_one_ready_counterpart`、`crates/vault/tests/identity_persistence.rs:injected_parent_and_child_failures_reopen_without_half_counterpart_state` — 覆盖四态、缺介绍、半状态、重复请求、版本错配及三阶段故障重启。
+- `CONTEXT.md:第二自我就绪状态`、`docs/architecture.md:§5.4/§9.4/§9.5`、`docs/implementation-slices.md:S07C-2` — 固定领域术语、原子数据流、实现边界和完成状态。
+
+**入口**：未来宿主创建 command 只需调用 `IdentityFormation::form_initial_counterpart`；本片仍不接 command、React 或普通对话门禁。
+**测试**：Identity 7/7、Vault identity persistence 6/6、event-driven presence 5/5、Self Bundle persistence 2/2、Rust workspace 全测、workspace 全目标 Clippy `-D warnings`、格式和 desktop all-targets check 通过；系统 `Validate` 按计划仅停在 `missing=[ADR-0055]`，留待 S07C-9 注册。
+
 ## 2026-08-08 S07C-1 真实初始身份运行时契约
 
 **触达**:

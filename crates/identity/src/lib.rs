@@ -9,12 +9,15 @@ mod self_bundle;
 mod service;
 
 pub use domain::{
-    IdentityAuthorship, IdentityProfile, IdentityStateVersion, InitialIdentityProposal,
-    InitialIdentityRequest, InitialSelfIntroduction, IntroductionAnswer, IntroductionItem,
-    PersonRepresentation, ReflectivePurposeStatus, SelfIntroductionCategory,
+    CounterpartInconsistencyReason, CounterpartReadiness, IdentityAuthorship, IdentityProfile,
+    IdentityStateVersion, InitialIdentityProposal, InitialIdentityRequest, InitialSelfIntroduction,
+    IntroductionAnswer, IntroductionItem, PersonRepresentation, ReflectivePurposeStatus,
+    SelfIntroductionCategory,
 };
 pub use in_memory::InMemoryIdentityRepository;
-pub use ports::{IdentityRepository, IdentityRuntime, SelfBundleRepository, WakeWork};
+pub use ports::{
+    CounterpartRepository, IdentityRepository, IdentityRuntime, SelfBundleRepository, WakeWork,
+};
 pub use presence::{
     PresenceCoordinator, PresenceError, WakeInterruption, WakeInterruptionReason, WakeOutcome,
 };

@@ -4,8 +4,9 @@ use eam_core::{
 };
 
 use crate::{
-    IdentityRepository, IdentityStateVersion, InitialSelfIntroduction, IntroductionAnswer,
-    IntroductionItem, SelfBundleRepository, SelfBundleVersion, SelfIntroductionCategory,
+    CounterpartRepository, IdentityRepository, IdentityStateVersion, InitialSelfIntroduction,
+    IntroductionAnswer, IntroductionItem, SelfBundleRepository, SelfBundleVersion,
+    SelfIntroductionCategory,
 };
 
 pub struct InMemoryIdentityRepository {
@@ -161,6 +162,52 @@ impl SelfBundleRepository for InMemoryIdentityRepository {
     fn current_self_bundle(&self) -> Result<Option<SelfBundleVersion>, RepositoryError> {
         Ok(self.self_bundles.last().cloned())
     }
+}
+
+impl CounterpartRepository for InMemoryIdentityRepository {
+    fn commit_initial_counterpart(
+        &mut self,
+        identity: IdentityStateVersion,
+        bundle: SelfBundleVersion,
+    ) -> Result<(), RepositoryError> {
+        if self.introduction.is_none() {
+            return Err(RepositoryError::new(
+                "initial self introduction does not exist",
+            ));
+        }
+        if !self.identities.is_empty() || !self.self_bundles.is_empty() {
+            return Err(RepositoryError::new(
+                "initial counterpart state already exists",
+            ));
+        }
+        if !valid_initial_counterpart_pair(&identity, &bundle) {
+            return Err(RepositoryError::new(
+                "initial identity and Self Bundle versions do not form one valid pair",
+            ));
+        }
+
+        self.identities.push(identity);
+        self.self_bundles.push(bundle);
+        Ok(())
+    }
+}
+
+fn valid_initial_counterpart_pair(
+    identity: &IdentityStateVersion,
+    bundle: &SelfBundleVersion,
+) -> bool {
+    identity.version() == 1
+        && identity.predecessor_version().is_none()
+        && bundle.version() == 1
+        && bundle.predecessor_version().is_none()
+        && bundle.wake_commit().is_none()
+        && bundle.state().constitution_version() == 1
+        && bundle.state().identity_state_version() == identity.version()
+        && bundle.state().relationship_state() == identity.profile().relationship_posture()
+        && bundle.state().counterpart_experience_refs().is_empty()
+        && bundle.state().belief_refs().is_empty()
+        && bundle.state().pending_intentions().is_empty()
+        && bundle.committed_at() == identity.formed_at()
 }
 
 impl MemoryRepository for InMemoryIdentityRepository {

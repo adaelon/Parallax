@@ -2,6 +2,10 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 use eam_core::{ClaimId, Timestamp};
 
+use crate::IdentityStateVersion;
+
+const INITIAL_CONSTITUTION_VERSION: u64 = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelfBundleListField {
     CounterpartExperienceRefs,
@@ -248,6 +252,18 @@ pub struct SelfBundleVersion {
 }
 
 impl SelfBundleVersion {
+    pub(crate) fn initial(identity: &IdentityStateVersion, committed_at: Timestamp) -> Self {
+        let state = SelfBundleState {
+            constitution_version: INITIAL_CONSTITUTION_VERSION,
+            identity_state_version: identity.version(),
+            counterpart_experience_refs: Vec::new(),
+            belief_refs: Vec::new(),
+            relationship_state: identity.profile().relationship_posture().to_owned(),
+            pending_intentions: Vec::new(),
+        };
+        Self::restore(1, None, state, None, committed_at)
+    }
+
     /// Restores an immutable Self Bundle version from a trusted adapter.
     #[must_use]
     pub const fn restore(

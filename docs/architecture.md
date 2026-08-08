@@ -651,7 +651,16 @@ CreateCounterpartRequested
        -> record InvocationKind::InitialIdentity with only six introduction Evidence IDs
        -> Responses strict json_schema | DeepSeek json_object + the same local strict parser
   -> require counterpart-authored initial identity preserves ReflectivePurpose
-  -> append immutable IdentityStateVersion(version=1)
+  -> construct immutable IdentityStateVersion(version=1)
+  -> construct SelfBundleVersion(version=1,
+                                 identity_state_version=1,
+                                 relationship_state=validated relationship_posture,
+                                 experiences=[], beliefs=[], pending_intentions=[])
+  -> CounterpartRepository::commit_initial_counterpart(identity, self_bundle)
+       -> require complete introduction and zero existing identity/Self Bundle versions
+       -> require one matching first-version pair
+       -> one SQLCipher transaction inserts identity parent/evidence and Self Bundle parent
+  -> derive CounterpartReadiness::READY(identity_version=1, self_bundle_version=1)
   -> CounterpartCreated
 
 PersonMessageReceived
@@ -790,7 +799,7 @@ send_message(verbatim)
 
 运行时失败时，本人发言仍按 Core 既有语义保留；React 重新调用 `list_conversation`，显示已落盘原文与错误。普通问答只有运行时显式提出并通过 Core 校验的结构化操作才可能入账，保留原文本身不产生 Claim。
 
-实机审计确认该 S07 入口尚未接通前述 `CreateCounterpartRequested`：桌面端没有初始介绍和身份形成 command，`send_message` 在身份与 Self Bundle 缺失时仍可进入普通运行时，且后者只获得 Self Bundle 版本号。该状态违反 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)；[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
+实机审计确认该 S07 入口尚未接通前述 `CreateCounterpartRequested`：桌面端没有初始介绍和身份形成 command，`send_message` 在身份与 Self Bundle 缺失时仍可进入普通运行时，且后者只获得 Self Bundle 版本号。S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`，但宿主接线和正式对话失败关闭仍分别留给 S07C-5 与 S07C-3。当前宿主状态仍违反 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)；[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -1229,8 +1238,8 @@ VaultKeyStore::unlock_recovery(vault_root, RecoveryKey)
 ```text
 crates/identity/src/
   domain.rs             # 六类自述、结构化身份提议与不可改写 IdentityStateVersion
-  service.rs            # 两阶段形成流程及作者、使命、身份隔离和来源校验
-  ports.rs              # IdentityRepository / IdentityRuntime 显式契约
+  service.rs            # 两阶段兼容流程、原子首建编排及作者、使命、身份隔离和来源校验
+  ports.rs              # IdentityRepository / CounterpartRepository / IdentityRuntime 显式契约
   scripted_runtime.rs   # 可检查输入的确定性身份输出夹具
   in_memory.rs          # 领域拒绝测试使用的内存适配器
 ```
@@ -1247,21 +1256,29 @@ IdentityFormation::form_initial_identity()
   -> require counterpart authorship + preserved ReflectivePurpose
   -> require DistinctCounterpart + complete fields + introduction-only evidence refs
   -> append IdentityStateVersion(version=1, predecessor=None)
+
+IdentityFormation::form_initial_counterpart()
+  -> require CounterpartReadiness = INTRODUCTION_RECORDED
+  -> reuse the same runtime and proposal validation
+  -> derive SelfBundleVersion(1) from identity v1 relationship_posture
+  -> initialize empty experiences, beliefs and pending intentions
+  -> CounterpartRepository atomically commits both first versions
+  -> return READY { identity_version=1, self_bundle_version=1 }
 ```
 
-本人只能提交自述，不能调用身份写入路径把自述变成角色卡；放弃反思使命、冒充本人或引用自述范围外证据的结构化提议均被 Core 拒绝。身份与来源随 SQLCipher schema v2 重启后恢复，首版一旦存在便拒绝再次形成。S25 从该首版身份继续追加不可改写版本；S05 从首版身份建立 Self Bundle。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) 和 [ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)。
+本人只能提交自述，不能调用身份写入路径把自述变成角色卡；放弃反思使命、冒充本人或引用自述范围外证据的结构化提议均被 Core 拒绝。身份与来源随 SQLCipher schema v2 重启后恢复，首版一旦存在便拒绝再次形成。S07C-2 的可信首建路径同时形成 Self Bundle，不再让新宿主编排暴露身份已写而自我包缺失的提交窗口；S04/S05 分步入口继续保留为既有领域测试与后续状态机原语，不作为未来宿主创建 API。S25 从原子首版继续追加不可改写版本。该实现落实 [ADR-0001](adr/0001-digital-counterpart-identity.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)、[ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
 
 ### 9.5 S05 当前实现边界
 
 ```text
 crates/identity/src/
-  self_bundle.rs        # 完整状态、不可改写版本、触发/退出提交与状态枚举
+  self_bundle.rs        # 完整状态、由身份关系姿态构造的空首版、不可改写版本与状态枚举
   presence.rs           # 初始化门禁、固定唤醒序列、失败收口和休眠提交
-  ports.rs              # SelfBundleRepository / WakeWork 显式契约
+  ports.rs              # SelfBundleRepository / CounterpartRepository / WakeWork 显式契约
   in_memory.rs          # 领域状态机测试用不可改写版本链
 crates/vault/src/
   schema.rs             # schema v3 Self Bundle 父版本及三个有序子表
-  repository.rs         # 完整快照单事务追加、当前版本恢复和链连续性校验
+  repository.rs         # 完整快照追加、身份与自我包原子首建、当前版本恢复和链连续性校验
 ```
 
 ```text
@@ -1277,7 +1294,7 @@ PresenceCoordinator::wake(trigger)
   -> only after commit: SLEEPING
 ```
 
-Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用、信念引用、关系状态和未完成意图；每次唤醒提交同时保存触发类型与完成/中断阶段。`WakeWork` 不获得 repository，不能越过 Core 直接写入；真实模型网关由 S06 接入，S25 已把身份修订与 Self Bundle 原子推进接入同一本地版本链，触发调度留给 S26。SQLCipher 故障注入在父行和部分子项已执行后触发外键失败，证明整个 v3 事务回滚且重启只恢复旧版本。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0005](adr/0005-event-driven-presence.md) 和 [ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)。
+Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用、信念引用、关系状态和未完成意图；每次唤醒提交同时保存触发类型与完成/中断阶段。`WakeWork` 不获得 repository，不能越过 Core 直接写入；真实模型网关由 S06 接入，S25 已把身份修订与 Self Bundle 原子推进接入同一本地版本链，触发调度留给 S26。S07C-2 复用 schema v2/v3，在一个 SQLCipher 事务中写入首个身份和首个自我包；身份父行、第三个证据子项与自我包父行故障注入均证明回滚后重启只恢复完整介绍，不出现半个第二自我。后续唤醒的既有故障注入继续证明完整自我包版本只会整体提交。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
 
 ### 9.6 S06 当前实现边界
 
