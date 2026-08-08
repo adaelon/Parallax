@@ -1,13 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
-import { FormEvent, useEffect, useRef, useState } from "react";
+import {
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  ReactNode,
+  RefObject,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 type Speaker = "person" | "counterpart";
+type CounterpartReplyAttribution = "PRE_IDENTITY_UNBOUND" | "IDENTITY_BOUND";
 
 export interface ConversationTurn {
   id: number;
   speaker: Speaker;
   verbatim: string;
   recordedAtMillis: number;
+  counterpartReplyAttribution: CounterpartReplyAttribution | null;
+  counterpartIdentityVersion: number | null;
 }
 
 interface ConversationTurnResult {
@@ -130,6 +141,90 @@ interface RuntimeProfileDraft {
   apiKeyChange: RuntimeProfileApiKeyChange;
 }
 
+type CounterpartReadinessState =
+  | "NEEDS_INTRODUCTION"
+  | "INTRODUCTION_RECORDED"
+  | "READY"
+  | "INCONSISTENT";
+
+interface CounterpartReadinessView {
+  state: CounterpartReadinessState;
+  identityVersion: number | null;
+  selfBundleVersion: number | null;
+  inconsistencyReason: string | null;
+}
+
+interface InitialSelfIntroductionDraft {
+  basicIdentityAndAddress: string;
+  currentLife: string;
+  importantPeople: string;
+  longTermGoals: string;
+  currentConcerns: string;
+  desiredReflection: string;
+}
+
+type InitialSelfIntroductionField = keyof InitialSelfIntroductionDraft;
+
+const INITIAL_SELF_INTRODUCTION_FIELDS: ReadonlyArray<{
+  field: InitialSelfIntroductionField;
+  id: string;
+  label: string;
+  prompt: string;
+}> = [
+  {
+    field: "basicIdentityAndAddress",
+    id: "introduction-basic-identity-and-address",
+    label: "基本身份与称呼",
+    prompt: "你如何介绍自己，希望第二自我怎样称呼你？",
+  },
+  {
+    field: "currentLife",
+    id: "introduction-current-life",
+    label: "当前生活",
+    prompt: "此刻的生活、工作或学习大致是什么状态？",
+  },
+  {
+    field: "importantPeople",
+    id: "introduction-important-people",
+    label: "重要人物",
+    prompt: "目前哪些人或关系对你尤其重要？",
+  },
+  {
+    field: "longTermGoals",
+    id: "introduction-long-term-goals",
+    label: "长期目标",
+    prompt: "有哪些想长期走向或守住的事情？",
+  },
+  {
+    field: "currentConcerns",
+    id: "introduction-current-concerns",
+    label: "当前关切",
+    prompt: "最近最牵动你、让你犹豫或投入的是什么？",
+  },
+  {
+    field: "desiredReflection",
+    id: "introduction-desired-reflection",
+    label: "希望被帮助看见的部分",
+    prompt: "你希望第二自我帮助你看见什么？",
+  },
+];
+
+const EMPTY_INITIAL_SELF_INTRODUCTION: InitialSelfIntroductionDraft = {
+  basicIdentityAndAddress: "",
+  currentLife: "",
+  importantPeople: "",
+  longTermGoals: "",
+  currentConcerns: "",
+  desiredReflection: "",
+};
+
+const BLOCKED_COUNTERPART_READINESS: CounterpartReadinessView = {
+  state: "INCONSISTENT",
+  identityVersion: null,
+  selfBundleVersion: null,
+  inconsistencyReason: null,
+};
+
 interface VaultProjection {
   turns: ConversationTurn[];
   ceremonies: SharedExperienceCeremony[];
@@ -137,6 +232,12 @@ interface VaultProjection {
   reflectionInvitations: ReflectionInvitationCeremony[];
   captureStatus: CaptureStatus;
   activityTimeline: ActivityTimelineEntry[];
+}
+
+interface CounterpartRouteSnapshot {
+  readiness: CounterpartReadinessView;
+  projection: VaultProjection | null;
+  projectionUnavailable: boolean;
 }
 
 export interface ActivityTimelineEntry {
@@ -206,6 +307,24 @@ async function loadVaultProjection(): Promise<VaultProjection> {
   };
 }
 
+async function loadCounterpartRoute(): Promise<CounterpartRouteSnapshot> {
+  const readiness = await invoke<CounterpartReadinessView>(
+    "get_counterpart_readiness",
+  );
+  if (readiness.state !== "READY") {
+    return { readiness, projection: null, projectionUnavailable: false };
+  }
+  try {
+    return {
+      readiness,
+      projection: await loadVaultProjection(),
+      projectionUnavailable: false,
+    };
+  } catch {
+    return { readiness, projection: null, projectionUnavailable: true };
+  }
+}
+
 export function App() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [ceremonies, setCeremonies] = useState<SharedExperienceCeremony[]>([]);
@@ -215,6 +334,17 @@ export function App() {
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [hostStatus, setHostStatus] = useState<HostStatus | null>(null);
+  const [counterpartReadiness, setCounterpartReadiness] =
+    useState<CounterpartReadinessView | null>(null);
+  const [initialIntroduction, setInitialIntroduction] =
+    useState<InitialSelfIntroductionDraft>(EMPTY_INITIAL_SELF_INTRODUCTION);
+  const [counterpartCreationAction, setCounterpartCreationAction] = useState<
+    "record" | "form" | null
+  >(null);
+  const [counterpartCreationError, setCounterpartCreationError] = useState<
+    string | null
+  >(null);
+  const [counterpartFormationFailed, setCounterpartFormationFailed] = useState(false);
   const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
   const [recoveryKeySaved, setRecoveryKeySaved] = useState(false);
   const [recoveryKeyCopied, setRecoveryKeyCopied] = useState(false);
@@ -251,6 +381,9 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const conversationViewport = useRef<HTMLElement>(null);
   const messageInput = useRef<HTMLTextAreaElement>(null);
+  const introductionFirstInput = useRef<HTMLTextAreaElement>(null);
+  const formCounterpartButton = useRef<HTMLButtonElement>(null);
+  const focusComposerAfterFormation = useRef(false);
   const runtimeSettingsTrigger = useRef<HTMLButtonElement>(null);
   const runtimeSettingsBaseUrl = useRef<HTMLInputElement>(null);
   const runtimeSettingsClose = useRef<HTMLButtonElement>(null);
@@ -268,10 +401,31 @@ export function App() {
         if (!status.vaultReady) {
           return;
         }
-        const projection = await loadVaultProjection();
-        if (active) {
-          applyVaultProjection(projection);
-          setError(null);
+        try {
+          const readiness = await invoke<CounterpartReadinessView>(
+            "get_counterpart_readiness",
+          );
+          if (active) {
+            setCounterpartReadiness(readiness);
+          }
+          if (readiness.state === "READY") {
+            try {
+              const projection = await loadVaultProjection();
+              if (active) {
+                applyVaultProjection(projection);
+                setError(null);
+              }
+            } catch {
+              if (active) {
+                setError("第二自我已就绪，但正式对话暂时无法从保险库恢复。");
+              }
+            }
+          }
+        } catch {
+          if (active) {
+            setCounterpartReadiness(BLOCKED_COUNTERPART_READINESS);
+            setError("第二自我状态暂时无法读取；正式对话保持关闭。");
+          }
         }
       } catch (reason: unknown) {
         if (active) {
@@ -294,6 +448,27 @@ export function App() {
       conversation.scrollTop = conversation.scrollHeight;
     }
   }, [turns, sending]);
+
+  useEffect(() => {
+    if (loading || counterpartCreationAction !== null) {
+      return;
+    }
+    if (counterpartReadiness?.state === "NEEDS_INTRODUCTION") {
+      introductionFirstInput.current?.focus();
+      return;
+    }
+    if (counterpartReadiness?.state === "INTRODUCTION_RECORDED") {
+      formCounterpartButton.current?.focus();
+      return;
+    }
+    if (
+      counterpartReadiness?.state === "READY" &&
+      focusComposerAfterFormation.current
+    ) {
+      focusComposerAfterFormation.current = false;
+      messageInput.current?.focus();
+    }
+  }, [counterpartCreationAction, counterpartReadiness?.state, loading]);
 
   useEffect(() => {
     if (runtimeSettingsOpen) {
@@ -331,6 +506,18 @@ export function App() {
     setReflectionInvitations(projection.reflectionInvitations);
     setCaptureStatus(projection.captureStatus);
     setActivityTimeline(projection.activityTimeline);
+  }
+
+  function applyCounterpartRoute(route: CounterpartRouteSnapshot) {
+    setCounterpartReadiness(route.readiness);
+    if (route.projection !== null) {
+      applyVaultProjection(route.projection);
+    }
+    setError(
+      route.projectionUnavailable
+        ? "第二自我已就绪，但正式对话暂时无法从保险库恢复。"
+        : null,
+    );
   }
 
   async function openRuntimeSettings() {
@@ -492,8 +679,12 @@ export function App() {
       setRecoveryKey(null);
       setRecoveryKeySaved(false);
       setRecoveryKeyCopied(false);
-      const projection = await loadVaultProjection();
-      applyVaultProjection(projection);
+      try {
+        applyCounterpartRoute(await loadCounterpartRoute());
+      } catch {
+        setCounterpartReadiness(BLOCKED_COUNTERPART_READINESS);
+        setError("第二自我状态暂时无法读取；正式对话保持关闭。");
+      }
     } catch (reason: unknown) {
       setError(errorMessage(reason));
     } finally {
@@ -508,6 +699,91 @@ export function App() {
     } catch (reason: unknown) {
       setError(errorMessage(reason));
       setSetupAction(false);
+    }
+  }
+
+  function updateInitialIntroduction(
+    field: InitialSelfIntroductionField,
+    value: string,
+  ) {
+    setInitialIntroduction((current) => ({ ...current, [field]: value }));
+    setCounterpartCreationError(null);
+  }
+
+  async function submitInitialIntroduction(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (counterpartCreationAction !== null) {
+      return;
+    }
+    const missing = INITIAL_SELF_INTRODUCTION_FIELDS.find(
+      ({ field }) => initialIntroduction[field].trim().length === 0,
+    );
+    if (missing !== undefined) {
+      setCounterpartCreationError("请完成六个部分后再继续。");
+      document.getElementById(missing.id)?.focus();
+      return;
+    }
+
+    setCounterpartCreationAction("record");
+    setCounterpartCreationError(null);
+    try {
+      const readiness = await invoke<CounterpartReadinessView>(
+        "record_initial_self_introduction",
+        { draft: initialIntroduction },
+      );
+      if (readiness.state !== "INTRODUCTION_RECORDED") {
+        setCounterpartReadiness(BLOCKED_COUNTERPART_READINESS);
+        setCounterpartCreationError(
+          "介绍已提交，但第二自我状态无法确认；正式对话保持关闭。",
+        );
+        return;
+      }
+      setCounterpartReadiness(readiness);
+      setInitialIntroduction(EMPTY_INITIAL_SELF_INTRODUCTION);
+      setCounterpartFormationFailed(false);
+    } catch {
+      setCounterpartCreationError(
+        "介绍暂时无法保存；没有形成第二自我，请稍后重试。",
+      );
+    } finally {
+      setCounterpartCreationAction(null);
+    }
+  }
+
+  async function formInitialCounterpart() {
+    if (counterpartCreationAction !== null) {
+      return;
+    }
+    setCounterpartCreationAction("form");
+    setCounterpartCreationError(null);
+    try {
+      const readiness = await invoke<CounterpartReadinessView>(
+        "form_initial_counterpart",
+      );
+      if (readiness.state !== "READY") {
+        setCounterpartReadiness(readiness);
+        setCounterpartFormationFailed(true);
+        setCounterpartCreationError(
+          "形成状态无法确认；正式对话保持关闭，可以重新尝试。",
+        );
+        return;
+      }
+      focusComposerAfterFormation.current = true;
+      setCounterpartReadiness(readiness);
+      setCounterpartFormationFailed(false);
+      try {
+        applyVaultProjection(await loadVaultProjection());
+        setError(null);
+      } catch {
+        setError("第二自我已形成，但正式对话暂时无法从保险库恢复。");
+      }
+    } catch {
+      setCounterpartFormationFailed(true);
+      setCounterpartCreationError(
+        "形成暂时未完成；你的介绍已安全保存，可以重试。",
+      );
+    } finally {
+      setCounterpartCreationAction(null);
     }
   }
 
@@ -800,6 +1076,59 @@ export function App() {
     );
   }
 
+  if (counterpartReadiness === null) {
+    return (
+      <CounterpartCreationState
+        eyebrow="Counterpart state"
+        error={error}
+        title="正在读取第二自我状态…"
+      >
+        <p>正式对话会在 Core 确认完整身份与自我包后开放。</p>
+      </CounterpartCreationState>
+    );
+  }
+
+  if (counterpartReadiness.state === "NEEDS_INTRODUCTION") {
+    return (
+      <InitialSelfIntroductionScreen
+        action={counterpartCreationAction}
+        draft={initialIntroduction}
+        error={counterpartCreationError}
+        firstInputRef={introductionFirstInput}
+        onChange={updateInitialIntroduction}
+        onSubmit={submitInitialIntroduction}
+      />
+    );
+  }
+
+  if (counterpartReadiness.state === "INTRODUCTION_RECORDED") {
+    return (
+      <CounterpartFormationScreen
+        action={counterpartCreationAction}
+        buttonRef={formCounterpartButton}
+        error={counterpartCreationError}
+        failed={counterpartFormationFailed}
+        onForm={() => void formInitialCounterpart()}
+      />
+    );
+  }
+
+  if (counterpartReadiness.state !== "READY") {
+    return (
+      <CounterpartCreationState
+        eyebrow="Fail closed"
+        error={error ?? counterpartCreationError}
+        title="第二自我状态需要安全检查"
+      >
+        <p>
+          Core 无法从当前持久化事实证明身份与自我包完整一致，因此正式对话保持关闭。请重启应用；若状态仍未恢复，请使用受信任的恢复流程。
+        </p>
+      </CounterpartCreationState>
+    );
+  }
+
+  const initialIdentity = identityHistory.find((identity) => identity.version === 1) ?? null;
+
   return (
     <main className="conversation-shell">
       <header className="topbar">
@@ -849,6 +1178,14 @@ export function App() {
         className="conversation"
         ref={conversationViewport}
       >
+        {initialIdentity ? (
+          <aside aria-label="第二自我首版身份" className="counterpart-arrival">
+            <p className="eyebrow">Counterpart ready · v1</p>
+            <h2>{initialIdentity.name}</h2>
+            <p>{initialIdentity.relationshipPosture}</p>
+            <span>首版身份由第二自我基于你的介绍自主形成；这里没有直接编辑入口。</span>
+          </aside>
+        ) : null}
         {loading ? (
           <p className="conversation-state">正在从加密保险库恢复对话…</p>
         ) : turns.length === 0 ? (
@@ -863,6 +1200,10 @@ export function App() {
               <article className={`turn turn-${turn.speaker}`} key={turn.id}>
                 <div className="turn-meta">
                   <span>{turn.speaker === "person" ? "你" : "第二自我"}</span>
+                  {turn.speaker === "counterpart" &&
+                  turn.counterpartReplyAttribution === "PRE_IDENTITY_UNBOUND" ? (
+                    <span className="pre-identity-record">创建前记录</span>
+                  ) : null}
                   <time dateTime={new Date(turn.recordedAtMillis).toISOString()}>
                     {timeFormatter.format(turn.recordedAtMillis)}
                   </time>
@@ -1655,6 +1996,145 @@ export function App() {
         <p className="retention-note">逐字加密保留 · 不自动升格为记忆</p>
       </footer>
     </main>
+  );
+}
+
+interface CounterpartCreationStateProps {
+  children: ReactNode;
+  eyebrow: string;
+  error: string | null;
+  title: string;
+}
+
+function CounterpartCreationState({
+  children,
+  eyebrow,
+  error,
+  title,
+}: CounterpartCreationStateProps) {
+  return (
+    <main className="counterpart-creation-shell">
+      <section className="counterpart-creation-card">
+        <p className="eyebrow">{eyebrow}</p>
+        <h1>{title}</h1>
+        <div className="counterpart-creation-copy">{children}</div>
+        {error ? (
+          <p className="error-banner counterpart-creation-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+      </section>
+    </main>
+  );
+}
+
+interface InitialSelfIntroductionScreenProps {
+  action: "record" | "form" | null;
+  draft: InitialSelfIntroductionDraft;
+  error: string | null;
+  firstInputRef: RefObject<HTMLTextAreaElement | null>;
+  onChange: (field: InitialSelfIntroductionField, value: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}
+
+function InitialSelfIntroductionScreen({
+  action,
+  draft,
+  error,
+  firstInputRef,
+  onChange,
+  onSubmit,
+}: InitialSelfIntroductionScreenProps) {
+  function submitWithKeyboard(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
+  }
+
+  return (
+    <main className="counterpart-creation-shell introduction-shell">
+      <section className="counterpart-creation-card introduction-card">
+        <p className="eyebrow">Initial self introduction</p>
+        <h1>先介绍此刻的你</h1>
+        <p className="counterpart-creation-copy">
+          六个简短部分足以开始，不需要先填写完整人生史。它们会作为带时间背景的本人自述保存，不会变成第二自我的角色卡。
+        </p>
+        <form className="initial-introduction-form" noValidate onSubmit={onSubmit}>
+          {INITIAL_SELF_INTRODUCTION_FIELDS.map(({ field, id, label, prompt }, index) => (
+            <label className="introduction-field" htmlFor={id} key={field}>
+              <span>{label}</span>
+              <small>{prompt}</small>
+              <textarea
+                disabled={action !== null}
+                id={id}
+                onChange={(event) => onChange(field, event.target.value)}
+                onKeyDown={submitWithKeyboard}
+                ref={index === 0 ? firstInputRef : undefined}
+                required
+                rows={3}
+                value={draft[field]}
+              />
+            </label>
+          ))}
+          {error ? (
+            <p className="error-banner counterpart-creation-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+          <div className="introduction-submit-row">
+            <p>Ctrl / ⌘ + Enter 也可提交</p>
+            <button disabled={action !== null} type="submit">
+              {action === "record" ? "正在安全保存…" : "保存这份介绍"}
+            </button>
+          </div>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+interface CounterpartFormationScreenProps {
+  action: "record" | "form" | null;
+  buttonRef: RefObject<HTMLButtonElement | null>;
+  error: string | null;
+  failed: boolean;
+  onForm: () => void;
+}
+
+function CounterpartFormationScreen({
+  action,
+  buttonRef,
+  error,
+  failed,
+  onForm,
+}: CounterpartFormationScreenProps) {
+  return (
+    <CounterpartCreationState
+      eyebrow="Identity formation"
+      error={error}
+      title="让第二自我形成自己"
+    >
+      <p>
+        六类介绍已经安全记录。下一步由第二自我读取这些自述，自主形成首个身份与关系姿态；你的介绍不会被当作人格配置。
+      </p>
+      <p>如果运行时暂时不可用，介绍会留在保险库中，重启或原地重试都不会要求重新填写。</p>
+      <div className="counterpart-formation-actions">
+        <button
+          disabled={action !== null}
+          id="form-counterpart"
+          onClick={onForm}
+          ref={buttonRef}
+          type="button"
+        >
+          {action === "form"
+            ? "正在形成…"
+            : failed
+              ? "重新尝试形成"
+              : "开始形成"}
+        </button>
+      </div>
+    </CounterpartCreationState>
   );
 }
 

@@ -831,9 +831,31 @@ send_message(verbatim)
   -> MemoryCore 在任何本人证据前重新派生并复核 READY 与精确版本
 ```
 
+S07C-6 让 React 只按上述可信投影路由，不拥有可编辑创建状态：
+
+```text
+VaultReady
+  -> get_counterpart_readiness
+  -> NEEDS_INTRODUCTION: require six non-empty named fields
+       -> record_initial_self_introduction({ draft })
+       -> INTRODUCTION_RECORDED
+  -> INTRODUCTION_RECORDED: explicit form/retry ceremony
+       -> form_initial_counterpart()
+       -> READY
+  -> READY: load conversation + immutable identity history
+       -> show identity v1 name/relationship posture
+       -> enable formal composer
+  -> INCONSISTENT | unknown/read failure: keep formal composer closed
+
+list_conversation()
+  -> each counterpart turn carries PRE_IDENTITY_UNBOUND
+     or IDENTITY_BOUND(identity_version)
+  -> React labels only PRE_IDENTITY_UNBOUND as "创建前记录"
+```
+
 运行时失败时，本人发言仍按 Core 既有语义保留；React 重新调用 `list_conversation`，显示已落盘原文与错误。普通问答只有运行时显式提出并通过 Core 校验的结构化操作才可能入账，保留原文本身不产生 Claim。
 
-S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 Core 的 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭；S07C-4 把当前完整主体状态投影为有界、可审计且模型可替换的 `CounterpartSelfContext`；S07C-5 现已接通三个宿主创建 command，并把发送门禁前移到检索之前，同时保留 Core 第二层复核。React 尚未调用这些创建 command，六类介绍与创建仪式路由留给 S07C-6；旧回复继续逐字可读，但 schema v27 将其投影为 `PRE_IDENTITY_UNBOUND`，不得支持当前第二自我的判断、共同关系历史或身份修订。[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
+S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 Core 的 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭；S07C-4 把当前完整主体状态投影为有界、可审计且模型可替换的 `CounterpartSelfContext`；S07C-5 接通三个宿主创建 command，并把发送门禁前移到检索之前，同时保留 Core 第二层复核；S07C-6 已令 React 在 readiness `READY` 前不加载或显示正式聊天输入，并以显式归属码标识创建前回复。旧回复继续逐字可读，但不得支持当前第二自我的判断、共同关系历史或身份修订。[S07C 修订组](implementation-slices.md#s07c-第二自我创建与认识闭环修订)完成前，现有构建不得进入 S32。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -1418,7 +1440,7 @@ apps/desktop/src-tauri/src/
   lib.rs                # 宿主事件循环、创建/对话与运行时档案白名单 command
   state.rs              # Vault/Core/双能力运行时装配、创建门禁、持续会话、心跳与安全退出
 apps/desktop/src/
-  App.tsx               # 持续对话、运行时设置模态、重启恢复、发送与错误恢复界面
+  App.tsx               # readiness 创建路由、持续对话、运行时设置、重启与错误恢复界面
 crates/desktop-host/src/
   lifecycle.rs          # 无 Tauri 依赖的宿主状态机
 crates/vault/src/
@@ -1431,6 +1453,8 @@ second process -> activate_existing_window(first process) -> exit
 creation state -> get_counterpart_readiness -> fixed four-state projection
 six introductions -> record_initial_self_introduction -> atomic person evidence/facts
 form counterpart -> current IdentityRuntime -> atomic identity v1 + Self Bundle v1 -> READY
+React vault ready -> readiness route -> introduction | formation retry | READY chat | fail closed
+conversation projection -> reply attribution code + identity version -> legacy marker in React
 React send -> send_message -> freeze recent conversation context -> MemoryCore -> exact turn views
 React restore -> list_conversation -> SQLCipher evidence -> exact turn views
 React settings open -> get_runtime_profile -> redacted view + empty Key input
@@ -1438,7 +1462,7 @@ React settings test/save -> explicit KEEP | REPLACE | CLEAR draft -> ManagedHost
 explicit exit -> finish_host_session -> close Vault -> zeroize key -> release lock -> process exit
 ```
 
-主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater、首次创建、持续对话和运行时配置只能经宿主白名单 command 使用。创建 API 只接收六个命名介绍字段并只返回 readiness 投影；当前活动运行时同时支持身份形成与普通对话，但只能在 `ManagedHost` 单写锁内由 Identity/Core 可信入口调用。介绍形成失败后保持 `INTRODUCTION_RECORDED`，允许重启或原地重试；所有 provider/解析错误均压缩为固定类别。运行时设置入口只在 Vault 就绪的持续对话页出现；打开时按需读取 Base URL、模型、Key 是否存在和安全末四位，Key 密码框永远从空值开始且关闭即丢弃。测试连接不清草稿，保存失败保留草稿，保存成功才清空 Key 输入并刷新返回的脱敏视图；读取和操作失败都使用不拼接 provider 正文或 Key 的固定提示，键盘关闭把焦点交还入口。测试与保存草稿中的完整 Key 不可序列化回 WebView，并在 Rust 草稿析构时清零。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。首次创建的 Recovery Key 是 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 限定的一次性展示例外，不赋予 UI 任何 Vault Key 或持久密钥能力。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md)、[ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)、[ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md)、[ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
+主窗口 capability 仅启用 `core:default`，不授予插件、文件、shell、HTTP、进程或凭据权限；自启动、updater、首次创建、持续对话和运行时配置只能经宿主白名单 command 使用。创建 API 只接收六个命名介绍字段并只返回 readiness 投影；当前活动运行时同时支持身份形成与普通对话，但只能在 `ManagedHost` 单写锁内由 Identity/Core 可信入口调用。React 在 Vault 就绪后先读取 readiness：`NEEDS_INTRODUCTION` 只显示六类最小介绍，`INTRODUCTION_RECORDED` 只显示显式形成/重试仪式，`READY` 才加载对话、展示首版名字与关系姿态并开放输入，`INCONSISTENT`、未知状态或读取失败均保持关闭。介绍形成失败后保持 `INTRODUCTION_RECORDED`，允许重启或原地重试，界面使用固定错误而不回显 provider 正文；会话投影显式返回回复归属与绑定身份版本，只有 `PRE_IDENTITY_UNBOUND` 在 React 标作“创建前记录”。运行时设置入口只在 Vault 就绪且 `READY` 的持续对话页出现；打开时按需读取 Base URL、模型、Key 是否存在和安全末四位，Key 密码框永远从空值开始且关闭即丢弃。测试连接不清草稿，保存失败保留草稿，保存成功才清空 Key 输入并刷新返回的脱敏视图；读取和操作失败都使用不拼接 provider 正文或 Key 的固定提示，键盘关闭把焦点交还入口。测试与保存草稿中的完整 Key 不可序列化回 WebView，并在 Rust 草稿析构时清零。updater 仅在运行时同时提供 HTTPS endpoint 与非空公钥时注册，私钥不进入仓库。持续对话固定回到同一会话，双方逐字发言可跨 SQLCipher 重启恢复；普通问答不因保留而自动入账。首次创建的 Recovery Key 是 [ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md) 限定的一次性展示例外，不赋予 UI 任何 Vault Key 或持久密钥能力。S07 本身不实现采集、时间线或 Personal Library；S28 的采集扩展见 §9.28。该边界落实 [ADR-0008](adr/0008-tauri-react-rust-desktop-stack.md)、[ADR-0011](adr/0011-trust-current-windows-logon-session.md)、[ADR-0012](adr/0012-tray-resident-tauri-host.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0037](adr/0037-disputed-memory-uses-natural-layered-disclosure.md)、[ADR-0049](adr/0049-heartbeated-single-host-lifecycle.md)、[ADR-0052](adr/0052-one-time-recovery-key-webview-ceremony.md)、[ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
 
 ### 9.8 S08 Context Inbox 先归档当前实现边界
 

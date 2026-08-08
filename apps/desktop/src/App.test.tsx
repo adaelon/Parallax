@@ -27,16 +27,25 @@ const READY_HOST_STATUS = {
   updaterConfigured: false,
   detail: null,
 };
+const READY_COUNTERPART_READINESS = {
+  state: "READY",
+  identityVersion: 1,
+  selfBundleVersion: 1,
+  inconsistencyReason: null,
+};
 const RUNTIME_REPLACEMENT_KEY = "synthetic-runtime-secret-4321";
 
-type InvokeHandler = <T>(command: string) => Promise<T>;
+type InvokeHandler = <T>(command: string, args?: unknown) => Promise<T>;
 
 function mockReadyInvoke(implementation: InvokeHandler) {
-  invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+  invokeMock.mockImplementation(async <T,>(command: string, args?: unknown): Promise<T> => {
     if (command === "get_host_status") {
       return READY_HOST_STATUS as T;
     }
-    return implementation<T>(command);
+    if (command === "get_counterpart_readiness") {
+      return READY_COUNTERPART_READINESS as T;
+    }
+    return implementation<T>(command, args);
   });
 }
 
@@ -73,6 +82,14 @@ describe("first-run encrypted vault setup", () => {
       }
       if (command === "confirm_recovery_key_saved") {
         return READY_HOST_STATUS as T;
+      }
+      if (command === "get_counterpart_readiness") {
+        return {
+          state: "NEEDS_INTRODUCTION",
+          identityVersion: null,
+          selfBundleVersion: null,
+          inconsistencyReason: null,
+        } as T;
       }
       if (
         command === "list_conversation" ||
@@ -111,13 +128,217 @@ describe("first-run encrypted vault setup", () => {
     expect(confirmButton.disabled).toBe(false);
     await clickButton("我已安全保存，创建保险库");
 
-    await vi.waitFor(() =>
-      expect(document.body.textContent).toContain("从此刻继续认识彼此"),
-    );
+    await vi.waitFor(() => expect(document.body.textContent).toContain("先介绍此刻的你"));
     expect(document.body.textContent).not.toContain(recoveryKey);
     expect(invokeMock).toHaveBeenCalledWith("confirm_recovery_key_saved", {
       confirmed: true,
     });
+  });
+});
+
+describe("S07C-6 counterpart creation ceremony", () => {
+  it("requires all six introduction categories and submits the fixed DTO from the keyboard", async () => {
+    const introduction = {
+      basicIdentityAndAddress: "我是林然，希望你叫我阿然。",
+      currentLife: "我正在转换工作方向。",
+      importantPeople: "家人和一位多年好友对我很重要。",
+      longTermGoals: "建立能长期投入的创作事业。",
+      currentConcerns: "我担心再次因为求稳而停下。",
+      desiredReflection: "请帮助我看见自我叙述里的盲点。",
+    };
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "get_host_status") {
+        return READY_HOST_STATUS as T;
+      }
+      if (command === "get_counterpart_readiness") {
+        return {
+          state: "NEEDS_INTRODUCTION",
+          identityVersion: null,
+          selfBundleVersion: null,
+          inconsistencyReason: null,
+        } as T;
+      }
+      if (command === "record_initial_self_introduction") {
+        return {
+          state: "INTRODUCTION_RECORDED",
+          identityVersion: null,
+          selfBundleVersion: null,
+          inconsistencyReason: null,
+        } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("先介绍此刻的你"));
+    expect(document.querySelector("#message")).toBeNull();
+    expect(document.querySelectorAll(".initial-introduction-form textarea")).toHaveLength(6);
+    expect(document.activeElement).toBe(
+      document.querySelector("#introduction-basic-identity-and-address"),
+    );
+    expect(document.body.textContent).not.toContain("跳过介绍");
+
+    for (const [field, value] of Object.entries(introduction).slice(0, 5)) {
+      await setControlValue(`#introduction-${toKebabCase(field)}`, value);
+    }
+    await submitForm(".initial-introduction-form");
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("请完成六个部分后再继续"),
+    );
+    expect(
+      invokeMock.mock.calls.some(([command]) => command === "record_initial_self_introduction"),
+    ).toBe(false);
+    expect(document.activeElement).toBe(
+      document.querySelector("#introduction-desired-reflection"),
+    );
+
+    await setControlValue(
+      "#introduction-desired-reflection",
+      introduction.desiredReflection,
+    );
+    await act(async () => {
+      document.querySelector("#introduction-desired-reflection")!.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          ctrlKey: true,
+          key: "Enter",
+        }),
+      );
+    });
+
+    await vi.waitFor(() => expect(document.body.textContent).toContain("让第二自我形成自己"));
+    expect(invokeMock).toHaveBeenCalledWith("record_initial_self_introduction", {
+      draft: introduction,
+    });
+    expect(document.activeElement).toBe(document.querySelector("#form-counterpart"));
+  });
+
+  it("resumes the recorded introduction, redacts formation failure, and retries into READY", async () => {
+    let formationCalls = 0;
+    const providerBody = "provider-secret-response-body";
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "get_host_status") {
+        return READY_HOST_STATUS as T;
+      }
+      if (command === "get_counterpart_readiness") {
+        return {
+          state: "INTRODUCTION_RECORDED",
+          identityVersion: null,
+          selfBundleVersion: null,
+          inconsistencyReason: null,
+        } as T;
+      }
+      if (command === "form_initial_counterpart") {
+        formationCalls += 1;
+        if (formationCalls === 1) {
+          throw new Error(providerBody);
+        }
+        return READY_COUNTERPART_READINESS as T;
+      }
+      if (
+        command === "list_conversation" ||
+        command === "list_shared_experience_ceremonies" ||
+        command === "list_offered_reflection_invitations" ||
+        command === "list_activity_timeline"
+      ) {
+        return [] as T;
+      }
+      if (command === "list_identity_history") {
+        return [identityVersion(1, null, "岚", "清晰、克制", "基于六类介绍形成")] as T;
+      }
+      if (command === "get_capture_status") {
+        return { state: "collecting" } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("让第二自我形成自己"));
+    expect(document.querySelector("#message")).toBeNull();
+    expect(
+      invokeMock.mock.calls.some(
+        ([command]) => command === "record_initial_self_introduction",
+      ),
+    ).toBe(false);
+
+    await clickButton("开始形成");
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain(
+        "形成暂时未完成；你的介绍已安全保存，可以重试。",
+      ),
+    );
+    expect(document.body.textContent).not.toContain(providerBody);
+    expect(document.activeElement).toBe(document.querySelector("#form-counterpart"));
+
+    await clickButton("重新尝试形成");
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("岚");
+      expect(document.body.textContent).toContain("同行者");
+      expect(document.querySelector("#message")).not.toBeNull();
+    });
+    expect(document.activeElement).toBe(document.querySelector("#message"));
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "form_initial_counterpart"),
+    ).toHaveLength(2);
+    expect(document.querySelector(".counterpart-arrival input, .counterpart-arrival textarea")).toBeNull();
+  });
+
+  it("marks only legacy unbound counterpart replies as creation-time records", async () => {
+    const restored = [
+      turn(1, "person", "创建前我说过的话"),
+      turn(2, "counterpart", "创建前的通用回复", "PRE_IDENTITY_UNBOUND"),
+      turn(3, "counterpart", "形成身份后的回复", "IDENTITY_BOUND", 1),
+    ];
+    mockReadyInvoke(async <T,>(command: string): Promise<T> => {
+      if (command === "list_conversation") {
+        return restored as T;
+      }
+      if (command === "list_shared_experience_ceremonies") {
+        return [] as T;
+      }
+      if (command === "list_identity_history") {
+        return [identityVersion(1, null, "岚", "清晰、克制", "首版形成")] as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("形成身份后的回复"));
+    const articles = [...document.querySelectorAll(".turn")];
+    const legacy = articles.find((article) =>
+      article.textContent?.includes("创建前的通用回复"),
+    )!;
+    const bound = articles.find((article) => article.textContent?.includes("形成身份后的回复"))!;
+    expect(legacy.textContent).toContain("创建前记录");
+    expect(bound.textContent).not.toContain("创建前记录");
+    expect(document.querySelector("#message")).not.toBeNull();
+  });
+
+  it("fails closed on an inconsistent counterpart state without loading formal conversation", async () => {
+    invokeMock.mockImplementation(async <T,>(command: string): Promise<T> => {
+      if (command === "get_host_status") {
+        return READY_HOST_STATUS as T;
+      }
+      if (command === "get_counterpart_readiness") {
+        return {
+          state: "INCONSISTENT",
+          identityVersion: null,
+          selfBundleVersion: null,
+          inconsistencyReason: "SELF_BUNDLE_MISSING",
+        } as T;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    await act(async () => root.render(<App />));
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("第二自我状态需要安全检查"),
+    );
+    expect(document.querySelector("#message")).toBeNull();
+    expect(
+      invokeMock.mock.calls.some(([command]) => command === "list_conversation"),
+    ).toBe(false);
   });
 });
 
@@ -1025,6 +1246,14 @@ async function clickButton(label: string) {
   await act(async () => button!.click());
 }
 
+async function submitForm(selector: string) {
+  await act(async () => {
+    document.querySelector<HTMLFormElement>(selector)!.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+  });
+}
+
 async function setControlValue(selector: string, value: string) {
   const control = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)!;
   const prototype =
@@ -1102,8 +1331,21 @@ function turn(
   id: number,
   speaker: ConversationTurn["speaker"],
   verbatim: string,
+  counterpartReplyAttribution: ConversationTurn["counterpartReplyAttribution"] = null,
+  counterpartIdentityVersion: number | null = null,
 ): ConversationTurn {
-  return { id, speaker, verbatim, recordedAtMillis: 1_785_000_000_000 + id };
+  return {
+    id,
+    speaker,
+    verbatim,
+    recordedAtMillis: 1_785_000_000_000 + id,
+    counterpartReplyAttribution,
+    counterpartIdentityVersion,
+  };
+}
+
+function toKebabCase(value: string): string {
+  return value.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 }
 
 function identityVersion(

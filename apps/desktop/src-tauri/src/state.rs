@@ -11,14 +11,15 @@ use eam_capture_windows::{
     ShutdownReason, sample_foreground_activity,
 };
 use eam_core::{
-    AgreementWithdrawalActor, ClaimId, Clock, ConversationEvidence, CounterpartRuntime,
-    EvidenceCitation, EvidenceId, IdentityEvolutionRepository, IdentityStateSnapshot, MemoryCore,
-    MemoryRepository, ReflectionDecision, ReflectionImportance, ReflectionInvitation,
-    ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationRepository,
-    ReflectionInvitationState, ReflectionOpportunity, RuntimeErrorKind, SessionId,
-    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementResolution,
-    SharedAgreementRevision, SharedExperienceKind, SharedExperienceRepository, Speaker,
-    SystemClock, Timestamp, WorkingContext, agreement_is_active_at,
+    AgreementWithdrawalActor, ClaimId, Clock, ConversationEvidence, CounterpartReplyAttribution,
+    CounterpartRuntime, EvidenceCitation, EvidenceId, IdentityEvolutionRepository,
+    IdentityStateSnapshot, MemoryCore, MemoryRepository, ReflectionDecision, ReflectionImportance,
+    ReflectionInvitation, ReflectionInvitationBasis, ReflectionInvitationId,
+    ReflectionInvitationRepository, ReflectionInvitationState, ReflectionOpportunity,
+    RuntimeErrorKind, SessionId, SharedAgreementCandidateStatus, SharedAgreementDecision,
+    SharedAgreementResolution, SharedAgreementRevision, SharedExperienceKind,
+    SharedExperienceRepository, Speaker, SystemClock, Timestamp, WorkingContext,
+    agreement_is_active_at,
 };
 use eam_desktop_host::{ExitReason, HostLifecycle, HostLifecycleRepository, HostState, LaunchMode};
 use eam_identity::{
@@ -174,6 +175,8 @@ pub struct ConversationTurnView {
     speaker: &'static str,
     verbatim: String,
     recorded_at_millis: i64,
+    counterpart_reply_attribution: Option<&'static str>,
+    counterpart_identity_version: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -2144,6 +2147,16 @@ const fn encode_unparsed_reason(reason: UnparsedReason) -> &'static str {
 
 impl From<&ConversationEvidence> for ConversationTurnView {
     fn from(value: &ConversationEvidence) -> Self {
+        let (counterpart_reply_attribution, counterpart_identity_version) =
+            match value.counterpart_reply_attribution() {
+                Some(CounterpartReplyAttribution::PreIdentityUnbound) => {
+                    (Some("PRE_IDENTITY_UNBOUND"), None)
+                }
+                Some(CounterpartReplyAttribution::IdentityBound(version)) => {
+                    (Some("IDENTITY_BOUND"), Some(version))
+                }
+                None => (None, None),
+            };
         Self {
             id: value.id().get(),
             speaker: match value.speaker() {
@@ -2152,6 +2165,8 @@ impl From<&ConversationEvidence> for ConversationTurnView {
             },
             verbatim: value.verbatim().to_owned(),
             recorded_at_millis: value.recorded_at().as_millis(),
+            counterpart_reply_attribution,
+            counterpart_identity_version,
         }
     }
 }

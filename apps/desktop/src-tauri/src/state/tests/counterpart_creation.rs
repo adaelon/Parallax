@@ -242,6 +242,47 @@ fn readiness_view_uses_fixed_codes_for_every_inconsistency() {
 }
 
 #[test]
+fn conversation_view_projects_pre_identity_and_bound_reply_attribution() {
+    let person = ConversationEvidence::restore(
+        EvidenceId::from_raw(1),
+        SessionId::new("s07c-6-view"),
+        Speaker::Person,
+        "本人原话".to_owned(),
+        Timestamp::from_millis(1_000),
+    );
+    let legacy = ConversationEvidence::restore(
+        EvidenceId::from_raw(2),
+        SessionId::new("s07c-6-view"),
+        Speaker::Counterpart,
+        "创建前回复".to_owned(),
+        Timestamp::from_millis(2_000),
+    );
+    let bound = ConversationEvidence::restore_counterpart(
+        EvidenceId::from_raw(3),
+        SessionId::new("s07c-6-view"),
+        "正式回复".to_owned(),
+        Timestamp::from_millis(3_000),
+        CounterpartReplyAttribution::IdentityBound(7),
+    );
+
+    let person_view = ConversationTurnView::from(&person);
+    assert_eq!(person_view.counterpart_reply_attribution, None);
+    assert_eq!(person_view.counterpart_identity_version, None);
+    let legacy_view = ConversationTurnView::from(&legacy);
+    assert_eq!(
+        legacy_view.counterpart_reply_attribution,
+        Some("PRE_IDENTITY_UNBOUND")
+    );
+    assert_eq!(legacy_view.counterpart_identity_version, None);
+    let bound_view = ConversationTurnView::from(&bound);
+    assert_eq!(
+        bound_view.counterpart_reply_attribution,
+        Some("IDENTITY_BOUND")
+    );
+    assert_eq!(bound_view.counterpart_identity_version, Some(7));
+}
+
+#[test]
 fn every_runtime_failure_category_is_sanitized() {
     let provider_secret = "provider-secret-response-body";
     let cases = [

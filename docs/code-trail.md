@@ -1214,3 +1214,16 @@
 
 **入口**：WebView 只能依次 invoke `get_counterpart_readiness`、`record_initial_self_introduction({ draft })`、`form_initial_counterpart`；正式发送仍经 `send_message({ verbatim })`，并由宿主和 Core 各自重新派生 READY。
 **测试**：`state::tests::counterpart_creation` 的 6 个 S07C-5 用例加既有 Core 旁路用例全绿；`cargo test --workspace --no-fail-fast` 与 `cargo clippy --workspace --all-targets -- -D warnings` 通过。
+
+## 2026-08-09 S07C-6 六类介绍与创建仪式界面
+
+**触达**:
+- `apps/desktop/src/App.tsx:CounterpartReadinessView/InitialSelfIntroductionScreen/CounterpartFormationScreen/App` — Vault 就绪后先按宿主四态路由，校验并提交六类命名介绍，以固定错误支持形成重试，只有 `READY` 才加载正式聊天并展示首版名字与关系姿态。
+- `apps/desktop/src/App.tsx:ConversationTurn/counterpart-arrival/pre-identity-record` — 只按可信回复归属码标记“创建前记录”，不以时间、顺序或当前身份反推旧回复归属。
+- `apps/desktop/src-tauri/src/state.rs:ConversationTurnView/From<&ConversationEvidence>` — 为会话只读 DTO 增加 `PRE_IDENTITY_UNBOUND | IDENTITY_BOUND` 及绑定身份版本，不改变证据或创建语义。
+- `apps/desktop/src/App.test.tsx:S07C-6 counterpart creation ceremony`、`apps/desktop/src-tauri/src/state/tests/counterpart_creation.rs:conversation_view_projects_pre_identity_and_bound_reply_attribution` — 覆盖六类缺失、固定 DTO、重启恢复、脱敏失败重试、READY 门禁、归属标识及键盘/焦点行为。
+- `apps/desktop/src/styles.css:.counterpart-creation-shell/.initial-introduction-form/.counterpart-arrival` — 增加创建仪式、响应式六类表单、首版身份与旧记录标识布局。
+- `docs/architecture.md:第二自我醒来和对话/S07 桌面宿主`、`docs/implementation-slices.md:S07C-6` — 同步已实现的可信路由、wire 投影和切片状态。
+
+**入口**：Vault 确认就绪后 React 先 invoke `get_counterpart_readiness`；介绍、形成和正式聊天分别只能经 `record_initial_self_introduction({ draft })`、`form_initial_counterpart` 与 `send_message({ verbatim })` 进入宿主白名单。
+**测试**：`apps/desktop/src/App.test.tsx` 24/24、`state::tests::counterpart_creation` 7/7、`npm run typecheck/build --prefix apps/desktop`、`cargo test --workspace --no-fail-fast`、全目标 Clippy、Rust fmt 与 `git diff --check` 全绿。
