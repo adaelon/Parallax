@@ -1,8 +1,8 @@
 # 首版完整实现切片方案
 
-状态：实施中；S01～S31、S06R-1～S06R-5、S06D 与 S07C-1～S07C-7 已完成；下一片为 S07C-8，S32 在 S07C-9 重新验收并冻结构建前保持锁定
+状态：实施中；S01～S31、S06R-1～S06R-5、S06D 与 S07C-1～S07C-9 已完成；S32 已由新冻结构建解锁，但纵向观察尚未开始
 
-本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 曾形成可安装构建。实机审计发现桌面正式对话绕过 S04/S05 的创建链，且普通运行时允许缺少身份与完整自我包，因此 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 新增 S07C 修订组；任何旧冻结构建都不得再进入 S32。
+本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 曾形成可安装构建。实机审计发现桌面正式对话绕过 S04/S05 的创建链，且普通运行时允许缺少身份与完整自我包，因此 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 新增 S07C 修订组；S07C-9 已重新冻结唯一候选构建，任何更早构建都不得进入 S32。
 
 ## 1. 结论
 
@@ -549,7 +549,7 @@ save(draft) -> validate/build -> Vault commit -> replace active runtime -> Runti
 
 ### S06D DeepSeek Chat Completions 协议适配
 
-**状态**：源码实现完成；全仓 Rust、桌面 React/类型/生产构建及 Validate 门禁已通过。现有 S32 冻结安装包早于本片，不包含 DeepSeek 适配；替换冻结构建前仍须重新执行 Full runner 与安装烟测。
+**状态**：已完成并进入 S07C-9 新冻结构建；全仓 Rust、桌面 React/类型/生产构建、Full runner 与安装烟测均已通过。
 
 **依赖/输入**：[ADR-0054](adr/0054-deepseek-chat-completions-protocol-adapter.md)、[G03 Runtime Contract v3](runtime-contract-v3.md)、S06R Vault 单档案与 45 秒严格合成测试。
 
@@ -561,7 +561,7 @@ save(draft) -> validate/build -> Vault commit -> replace active runtime -> Runti
 
 ### S07C 第二自我创建与认识闭环修订
 
-**状态**：已由 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 接受；S07C-1～S07C-8 已完成，S07C-9 尚未实施；重新冻结构建前，S32 保持锁定。
+**状态**：已由 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 接受；S07C-1～S07C-9 已完成，新冻结构建已通过系统验收，S32 可从零开始。
 
 修订前领域层分别具备初始身份和 Self Bundle 能力，但桌面端没有创建入口，正式对话允许 `identity=None`，运行时只收到 Self Bundle 版本号。修订后的可信状态只从持久化事实派生：
 
@@ -707,7 +707,7 @@ send_message(message):
 
 #### S07C-9 系统重验收与新冻结构建
 
-**状态**：待实施；S07C-1～S07C-8 全绿后才能开始。
+**状态**：已完成；52 个 accepted ADR、39 个证据入口与全部 DET/FR/THR/MIG 映射闭合，Full runner 18/18 通过并生成唯一 S32 候选构建。
 
 **依赖/输入**：完整 S07C、S06D、更新后的架构/代码链路、现有 Full runner 和安装烟测。
 
@@ -719,9 +719,11 @@ send_message(message):
 
 **主决策**：ADR-0055 与全部 accepted ADR 的系统级回归；不产生新的领域语义。
 
+**运行记录**：构建来源 `ad974e566eab6c0b00e3e9471ac7df406dcf9932`；`evrything-about-me_0.1.0_x64-setup.exe` 为 5,530,200 bytes，SHA-256 `73f0137e04222e0900789c685dd7e18564edeb6912842f5afdbfc41a63f5659f`；隔离安装、启动、关窗保留托盘、退出与卸载烟测全绿。
+
 ### S32 冻结构建纵向验收与首版发布结论
 
-**状态**：锁定；不得使用 S07C-9 之前的任何安装包开始或延续观察。
+**状态**：已解锁、尚未开始；只能使用 S07C-9 的唯一冻结安装包，并从观察第 1 日重新起算。
 
 **依赖/输入**：S07C-9 重新提交的 S31 自动验收结果、版本化 NSIS 安装程序和纵向观察模板；本人在仓库外准备的脱敏真实资料基准。
 

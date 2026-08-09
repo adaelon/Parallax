@@ -1254,3 +1254,14 @@
 
 **入口**：`MemoryCore::run_counterpart_turn` 将带 `DecisionImpact` 的冻结上下文交给 `OpenAiResponsesRuntime::respond`；Runtime 使用同一结构化回应 schema，Core 独立校验引用、判断、反思邀请与未知操作。
 **测试**：Runtime Contract 43/43、Core minimal memory loop 15/15、`cargo test --workspace --no-fail-fast` 347/347、workspace Clippy `-D warnings`、Desktop all-targets check 与 Rust fmt 全绿；隐私扫描 280 个 tracked 文本零违规、Markdown 本地链接 294/294、静态安全边界通过。更宽的 `Validate` acceptance-matrix 仍按计划因 ADR-0055 尚未进入 S07C-9 系统验收而失败关闭，不属于本片完成门禁。
+
+## 2026-08-09 S07C-9 系统重验收与新冻结构建
+
+**触达**:
+- `docs/system-acceptance-v1.md:证据注册表/DET/FR/ADR/THR/MIG 矩阵/S31 运行记录` — 新增 6 个 S07C 证据 ID，闭合 ADR-0055 与 52 个 accepted ADR，并记录唯一新构建。
+- `scripts/run-system-acceptance.ps1:Test-AcceptanceMatrix` — 把 S07C 的创建、就绪、回复归属、主体出口、桌面仪式和原子事实映射升级为失败关闭的强制证据。
+- `scripts/tests/run-system-acceptance.tests.ps1:S07C rejection fixture` — 固定 52 个 accepted ADR、39 个证据入口，并证明 ADR-0055 缺少原子事实证据时矩阵拒绝。
+- `docs/implementation-slices.md:S07C-9/S32`、`docs/longitudinal-observation-template.md:构建身份`、`docs/architecture.md:§5.4/§9.31` — 关闭 S07C 修订组，把 S32 重置到同一新构建的第 1 日。
+
+**入口**：`scripts/run-system-acceptance.ps1 -Mode Full -ResultsPath .local/system-acceptance/s07c9-full.json` 从提交 `ad974e566eab6c0b00e3e9471ac7df406dcf9932` 执行矩阵、仓库、打包与安装生命周期门禁。
+**测试**：S07C 定向 Identity 7/7、Vault identity 7/7、Core 15/15、Runtime 43/43、Desktop host 8/8、React 创建仪式 4/4 与 Vault 原子事实 1/1 通过；Validate 与 Full 18/18 全绿，workspace 347/347、Desktop 24/24、扩展 10/10、隐私 280/280、链接 294/294。NSIS 为 5,530,200 bytes，SHA-256 `73f0137e04222e0900789c685dd7e18564edeb6912842f5afdbfc41a63f5659f`，隔离安装、启动、托盘退出和卸载烟测通过。

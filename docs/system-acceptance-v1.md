@@ -187,22 +187,20 @@
 
 ## 8. S31 运行记录
 
-> 历史记录：该构建早于 S06D 和 ADR-0055/S07C，已失去 S32 候选资格；S07C-9 必须更新本矩阵、完整重跑并替换以下记录后才能开始纵向观察。
-
-本节只记录最后一次完整通过的 S31 运行；命令输出与中间 JSON 留在被忽略的 `/.local/system-acceptance/`，不携带个人正文进入 Git。下表是完成 S06R-5 后当时冻结、现已失效的 S32 候选构建。
+本节只记录最后一次完整通过的 S31 运行；命令输出与中间 JSON 留在被忽略的 `/.local/system-acceptance/`，不携带个人正文进入 Git。下表是完成 S07C-9 后唯一可用于新一轮 S32 观察的冻结构建；此前构建与观察窗口均已失效。
 
 | 字段 | 结果 |
 | --- | --- |
 | 状态 | `PASS`（`Full` 模式，18/18 步骤通过） |
-| Git head | `1468ca57b9919e8dfc08d428b2885770ae66649a`（S06R-5/S31 构建来源） |
-| 执行时间 | 2026-08-04 19:17:11～19:20:44 `+08:00`（212.855 秒） |
+| Git head | `ad974e566eab6c0b00e3e9471ac7df406dcf9932`（S07C-9/S31 构建来源） |
+| 执行时间 | 2026-08-09 13:18:46～13:22:11 `+08:00`（204.961 秒） |
 | Rust workspace | `cargo fmt`、workspace Clippy `-D warnings`、`cargo test --workspace --no-fail-fast`、desktop all-targets check 全部通过 |
-| Desktop React | 19/19，通过 TypeScript 检查与生产构建 |
+| Desktop React | 24/24，通过 TypeScript 检查与生产构建 |
 | Browser extension | 10/10，通过 TypeScript 检查与生产构建 |
-| S06R 运行时档案 | `EV-RUNTIME-PROFILE` 覆盖 v25→v26、`KEEP/REPLACE/CLEAR`、write-only Key、恢复、严格合成测试、热切换、下一请求、重启与并发隔离 |
-| 静态/隐私/矩阵 | 33 个确定性判据、FR-01～FR-12、50 个 accepted ADR、8 个威胁边界、5 个迁移契约、33 个证据入口完整；256 个文本文件隐私扫描零违规，266 个本地链接零缺失 |
-| NSIS 版本 | `0.1.0`；`target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe`；5,448,409 bytes |
-| NSIS SHA-256 | `824203ffd36bd2ca32957c10719edd21c4bfaeb39c34b108aa27eda418f87242` |
-| 安装/启动/退出/卸载 | 隔离目录静默安装、启动、关窗保留托盘宿主、进程清理与静默卸载全部通过；仅预置 `bundle.meta` 后，安装版实际创建含 schema v26 默认运行时档案的 `self.db` |
+| S07C 第二自我闭环 | `EV-COUNTERPART-CREATION/READINESS/REPLY-ATTRIBUTION/COUNTERPART-SELF-CONTEXT/DESKTOP-CREATION/PERSON-FACTS` 覆盖 S07C-1～S07C-8 与 ADR-0055；人工语言验收不冒充自动化证据 |
+| 静态/隐私/矩阵 | 33 个确定性判据、FR-01～FR-12、52 个 accepted ADR、8 个威胁边界、5 个迁移契约、39 个证据入口完整；280 个 tracked 文本隐私扫描零违规，294 个本地链接零缺失 |
+| NSIS 版本 | `0.1.0`；`target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe`；5,530,200 bytes |
+| NSIS SHA-256 | `73f0137e04222e0900789c685dd7e18564edeb6912842f5afdbfc41a63f5659f` |
+| 安装/启动/退出/卸载 | 隔离目录静默安装、启动、关窗保留托盘宿主、进程清理与静默卸载全部通过；仅预置 `bundle.meta` 后，安装版实际创建当前 schema v27 的 `self.db` |
 
 S31 不执行第 6.2 节的十四天纵向验收。该过程只能使用 [S32 观察模板](longitudinal-observation-template.md) 在同一个冻结安装包上完成。

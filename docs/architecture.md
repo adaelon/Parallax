@@ -872,7 +872,7 @@ list_conversation()
 
 运行时失败时，本人发言仍按 Core 既有语义保留；React 重新调用 `list_conversation`，显示已落盘原文与错误。普通问答只有运行时显式提出并通过 Core 校验的结构化操作才可能入账，保留原文本身不产生 Claim。
 
-S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 Core 的 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭；S07C-4 把当前完整主体状态投影为有界、可审计且模型可替换的 `CounterpartSelfContext`；S07C-5 接通三个宿主创建 command，并把发送门禁前移到检索之前，同时保留 Core 第二层复核；S07C-6 已令 React 在 readiness `READY` 前不加载或显示正式聊天输入，并以显式归属码标识创建前回复；S07C-7 已把普通发言转成可为零的有界原子本人事实提议，并由 Core 逐项校验、去重后入账。旧回复继续逐字可读，但不得支持当前第二自我的判断、共同关系历史或身份修订。S07C-8～S07C-9 完成前，现有构建不得进入 S32。
+S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 Core 的 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭；S07C-4 把当前完整主体状态投影为有界、可审计且模型可替换的 `CounterpartSelfContext`；S07C-5 接通三个宿主创建 command，并把发送门禁前移到检索之前，同时保留 Core 第二层复核；S07C-6 已令 React 在 readiness `READY` 前不加载或显示正式聊天输入，并以显式归属码标识创建前回复；S07C-7 已把普通发言转成可为零的有界原子本人事实提议，并由 Core 逐项校验、去重后入账。旧回复继续逐字可读，但不得支持当前第二自我的判断、共同关系历史或身份修订。S07C-8 冻结反思回应与非自评边界，S07C-9 已完成系统重验收；只有 §9.31 记录的新冻结构建可以从零进入 S32。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -2223,7 +2223,7 @@ restore old generation + latest head
   -> preserve the person's Recovery Key and refresh local DPAPI wrapper
 ```
 
-S30 不新增 schema：删除重放消费 S19 schema v16 的 `deletion_intents`，快照覆盖当前 v25 权威库，派生索引在恢复时清空重建。实现拒绝保险库内备份位置、独立快照恢复、未知/重复/遍历路径、缺对象、现有目标覆盖以及跨组拼接；加密 envelope 当前有 1 GiB 硬上限。恢复不会改写历史 Recovery Set；新 Vault 必须创建新集合，旧集合仅用于再次恢复，不能由原设备与恢复设备继续双写。
+S30 不新增 schema：删除重放消费 S19 schema v16 的 `deletion_intents`，快照覆盖当前 v27 权威库，派生索引在恢复时清空重建。实现拒绝保险库内备份位置、独立快照恢复、未知/重复/遍历路径、缺对象、现有目标覆盖以及跨组拼接；加密 envelope 当前有 1 GiB 硬上限。恢复不会改写历史 Recovery Set；新 Vault 必须创建新集合，旧集合仅用于再次恢复，不能由原设备与恢复设备继续双写。
 
 ### 9.31 S31 自动化系统验收与可安装构建当前实现边界
 
@@ -2231,11 +2231,12 @@ S30 不新增 schema：删除重放消费 S19 schema v16 的 `deletion_intents`�
 docs/system-acceptance-v1.md
   -> 33 个产品确定性判据
   -> FR-01..FR-12
-  -> 50 个 accepted ADR
+  -> 52 个 accepted ADR + 39 个证据入口
   -> 8 个威胁边界 + 5 个迁移契约
   -> EV-RUNTIME-PROFILE 强制覆盖 S06R 档案、密钥、热切换与恢复
+  -> 6 个 S07C 证据 ID 强制覆盖创建、就绪、归属、主体出口、桌面仪式与原子事实
 scripts/run-system-acceptance.ps1
-  -> 精确集合/证据外键 + S06R 必需证据 + G10 隐私 + 静态边界
+  -> 精确集合/证据外键 + S06R/S07C 必需证据 + G10 隐私 + 静态边界
   -> Rust workspace + desktop + browser extension
   -> Tauri release -> versioned NSIS -> SHA-256 -> isolated install smoke
   -> ephemeral bundle.meta seed -> installed exe must create self.db
@@ -2245,4 +2246,4 @@ G10 真实资料和 S32 观察记录只能位于仓库外或 `/.local/`；仓库
 
 S31 本地构建只产生 NSIS 安装包，`createUpdaterArtifacts=false`。安装烟测用不打包、不输出 Recovery Key 的示例仅预置 `bundle.meta`，随后要求安装版 exe 自己创建 `self.db`；“进程仍存活”不再等价于 Vault 已打开。签名升级仍保持 G04 的 HTTPS endpoint + 内嵌公钥门禁；更新包只能在后续签名发布流水线同时提供静态 updater 配置与仓库外私钥时生成，不得为本地验收伪造签名材料。S31 不改变 schema 或领域语义。
 
-S06R-5 从构建来源 `1468ca57b9919e8dfc08d428b2885770ae66649a` 完整重跑 18/18 gate，并冻结 `evrything-about-me_0.1.0_x64-setup.exe`（5,448,409 bytes，SHA-256 `824203ffd36bd2ca32957c10719edd21c4bfaeb39c34b108aa27eda418f87242`）作为唯一 S32 候选。安装烟测与独立摘要复算通过；S32 仍须在同一安装包上完成不少于十四个自然日的纵向观察。
+S07C-9 从构建来源 `ad974e566eab6c0b00e3e9471ac7df406dcf9932` 完整重跑 18/18 gate，并冻结 `evrything-about-me_0.1.0_x64-setup.exe`（5,530,200 bytes，SHA-256 `73f0137e04222e0900789c685dd7e18564edeb6912842f5afdbfc41a63f5659f`）作为唯一 S32 候选。安装烟测与独立摘要复算通过；更早构建及观察窗口失效，S32 必须在该安装包上从第 1 日重新开始并完成不少于十四个自然日。
