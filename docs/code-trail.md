@@ -1265,3 +1265,14 @@
 
 **入口**：`scripts/run-system-acceptance.ps1 -Mode Full -ResultsPath .local/system-acceptance/s07c9-full.json` 从提交 `ad974e566eab6c0b00e3e9471ac7df406dcf9932` 执行矩阵、仓库、打包与安装生命周期门禁。
 **测试**：S07C 定向 Identity 7/7、Vault identity 7/7、Core 15/15、Runtime 43/43、Desktop host 8/8、React 创建仪式 4/4 与 Vault 原子事实 1/1 通过；Validate 与 Full 18/18 全绿，workspace 347/347、Desktop 24/24、扩展 10/10、隐私 280/280、链接 294/294。NSIS 为 5,530,200 bytes，SHA-256 `73f0137e04222e0900789c685dd7e18564edeb6912842f5afdbfc41a63f5659f`，隔离安装、启动、托盘退出和卸载烟测通过。
+
+## 2026-08-09 S07C-6 初始化页面视口滚动修复
+
+**触达**:
+- `apps/desktop/src/styles.css:.vault-setup-shell/.counterpart-creation-shell` — 以固定视口高度替代可随内容扩张的最小高度，使两类初始化外壳真正拥有纵向溢出并保留会话页的全局滚动锁。
+- `apps/desktop/src/App.test.tsx:viewport scrolling contract` — 对两类外壳的 `height: 100vh` 与 `overflow-y: auto` 建立同源 CSS 回归契约。
+- `apps/desktop/vite.config.ts:test.css` — 让 Vitest 处理真实样式源，避免 CSS 回归测试读取空模块。
+- `docs/implementation-slices.md:S07C-6` — 把初始化页桌面/窄屏滚动纳入该归属切片的确定性完成判据。
+
+**入口**：首次保险库初始化、六类初始自我介绍及其后续第二自我形成页面进入各自外壳；持续对话仍只滚动 `.conversation`。
+**测试**：旧规则红测 2/2 后修复转绿；React 26/26、TypeScript、Vite 生产构建通过；真实浏览器覆盖 1280×720、500×600、保险库 500×200，并证明会话文档滚动保持为零。

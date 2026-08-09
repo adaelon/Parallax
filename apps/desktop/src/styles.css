@@ -24,7 +24,7 @@ textarea {
 
 .vault-setup-shell {
   display: grid;
-  min-height: 100vh;
+  height: 100vh;
   padding: clamp(1.25rem, 5vw, 4rem);
   overflow-y: auto;
   place-items: center;
@@ -132,7 +132,7 @@ textarea {
 
 .counterpart-creation-shell {
   display: grid;
-  min-height: 100vh;
+  height: 100vh;
   padding: clamp(1.25rem, 5vw, 4rem);
   overflow-y: auto;
   place-items: center;

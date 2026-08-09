@@ -13,6 +13,7 @@ import {
   ReflectionInvitationCeremony,
   SharedExperienceCeremony,
 } from "./App";
+import desktopStyles from "./styles.css?inline";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -58,6 +59,28 @@ beforeEach(() => {
 
 afterEach(async () => {
   await act(async () => root.unmount());
+});
+
+describe("viewport scrolling contract", () => {
+  it.each(["vault-setup-shell", "counterpart-creation-shell"])(
+    "bounds %s to the viewport so vertical overflow can scroll",
+    (className) => {
+      const styleSheet = document.createElement("style");
+      styleSheet.textContent = desktopStyles;
+      document.head.append(styleSheet);
+      try {
+        const rule = [...styleSheet.sheet!.cssRules].find(
+          (candidate) => (candidate as CSSStyleRule).selectorText === `.${className}`,
+        ) as CSSStyleRule | undefined;
+
+        expect(rule).toBeDefined();
+        expect(rule!.style.getPropertyValue("height")).toBe("100vh");
+        expect(rule!.style.getPropertyValue("overflow-y")).toBe("auto");
+      } finally {
+        styleSheet.remove();
+      }
+    },
+  );
 });
 
 describe("first-run encrypted vault setup", () => {
