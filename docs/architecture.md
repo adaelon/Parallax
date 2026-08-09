@@ -2246,4 +2246,4 @@ G10 真实资料和 S32 观察记录只能位于仓库外或 `/.local/`；仓库
 
 S31 本地构建只产生 NSIS 安装包，`createUpdaterArtifacts=false`。安装烟测用不打包、不输出 Recovery Key 的示例仅预置 `bundle.meta`，随后要求安装版 exe 自己创建 `self.db`；“进程仍存活”不再等价于 Vault 已打开。签名升级仍保持 G04 的 HTTPS endpoint + 内嵌公钥门禁；更新包只能在后续签名发布流水线同时提供静态 updater 配置与仓库外私钥时生成，不得为本地验收伪造签名材料。S31 不改变 schema 或领域语义。
 
-S07C-9 从构建来源 `ad974e566eab6c0b00e3e9471ac7df406dcf9932` 完整重跑 18/18 gate，并冻结 `evrything-about-me_0.1.0_x64-setup.exe`（5,530,200 bytes，SHA-256 `73f0137e04222e0900789c685dd7e18564edeb6912842f5afdbfc41a63f5659f`）作为唯一 S32 候选。安装烟测与独立摘要复算通过；更早构建及观察窗口失效，S32 必须在该安装包上从第 1 日重新开始并完成不少于十四个自然日。
+S07C-6 初始化页滚动修复后，S31 从构建来源 `74dd8123600f23a03c9e8e8e49507fa20623fa46` 完整重跑 18/18 gate，并冻结 `evrything-about-me_0.1.0_x64-setup.exe`（5,529,536 bytes，SHA-256 `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8`）作为唯一 S32 候选。安装烟测与独立摘要复算通过；更早构建及观察窗口失效，S32 必须在该安装包上从第 1 日重新开始并完成不少于十四个自然日。

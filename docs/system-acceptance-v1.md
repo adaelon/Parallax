@@ -192,15 +192,15 @@
 | 字段 | 结果 |
 | --- | --- |
 | 状态 | `PASS`（`Full` 模式，18/18 步骤通过） |
-| Git head | `ad974e566eab6c0b00e3e9471ac7df406dcf9932`（S07C-9/S31 构建来源） |
-| 执行时间 | 2026-08-09 13:18:46～13:22:11 `+08:00`（204.961 秒） |
+| Git head | `74dd8123600f23a03c9e8e8e49507fa20623fa46`（S07C-6 初始化页滚动修复后的 S31 构建来源） |
+| 执行时间 | 2026-08-09 16:41:43～16:49:57 `+08:00`（494.673 秒） |
 | Rust workspace | `cargo fmt`、workspace Clippy `-D warnings`、`cargo test --workspace --no-fail-fast`、desktop all-targets check 全部通过 |
-| Desktop React | 24/24，通过 TypeScript 检查与生产构建 |
+| Desktop React | 26/26，通过 TypeScript 检查与生产构建；初始化外壳具有视口有界滚动契约 |
 | Browser extension | 10/10，通过 TypeScript 检查与生产构建 |
 | S07C 第二自我闭环 | `EV-COUNTERPART-CREATION/READINESS/REPLY-ATTRIBUTION/COUNTERPART-SELF-CONTEXT/DESKTOP-CREATION/PERSON-FACTS` 覆盖 S07C-1～S07C-8 与 ADR-0055；人工语言验收不冒充自动化证据 |
 | 静态/隐私/矩阵 | 33 个确定性判据、FR-01～FR-12、52 个 accepted ADR、8 个威胁边界、5 个迁移契约、39 个证据入口完整；280 个 tracked 文本隐私扫描零违规，294 个本地链接零缺失 |
-| NSIS 版本 | `0.1.0`；`target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe`；5,530,200 bytes |
-| NSIS SHA-256 | `73f0137e04222e0900789c685dd7e18564edeb6912842f5afdbfc41a63f5659f` |
+| NSIS 版本 | `0.1.0`；`target/release/bundle/nsis/evrything-about-me_0.1.0_x64-setup.exe`；5,529,536 bytes |
+| NSIS SHA-256 | `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8` |
 | 安装/启动/退出/卸载 | 隔离目录静默安装、启动、关窗保留托盘宿主、进程清理与静默卸载全部通过；仅预置 `bundle.meta` 后，安装版实际创建当前 schema v27 的 `self.db` |
 
 S31 不执行第 6.2 节的十四天纵向验收。该过程只能使用 [S32 观察模板](longitudinal-observation-template.md) 在同一个冻结安装包上完成。

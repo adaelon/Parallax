@@ -1276,3 +1276,13 @@
 
 **入口**：首次保险库初始化、六类初始自我介绍及其后续第二自我形成页面进入各自外壳；持续对话仍只滚动 `.conversation`。
 **测试**：旧规则红测 2/2 后修复转绿；React 26/26、TypeScript、Vite 生产构建通过；真实浏览器覆盖 1280×720、500×600、保险库 500×200，并证明会话文档滚动保持为零。
+
+## 2026-08-09 初始化页滚动修复后系统重验收
+
+**触达**:
+- `docs/system-acceptance-v1.md:S31 运行记录` — 记录修复提交上的 Full 18/18、新安装包身份与生命周期烟测。
+- `docs/architecture.md:§9.31`、`docs/implementation-slices.md:S07C-9/S32` — 将唯一 S32 候选切换到滚动修复后的重新冻结构建并作废旧候选。
+- `docs/longitudinal-observation-template.md:构建身份` — 更新唯一允许进入十四日观察的来源提交与 SHA-256。
+
+**入口**：`scripts/run-system-acceptance.ps1 -Mode Full -ResultsPath .local/system-acceptance/scroll-fix-full.json` 从提交 `74dd8123600f23a03c9e8e8e49507fa20623fa46` 执行全仓、打包和隔离安装生命周期门禁。
+**测试**：Full 18/18、workspace 347/347、Desktop React 26/26、扩展 10/10、隐私 280/280、链接 294/294 全绿；NSIS 为 5,529,536 bytes，脚本与独立复算均得到 SHA-256 `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8`。

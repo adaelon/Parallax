@@ -719,7 +719,7 @@ send_message(message):
 
 **主决策**：ADR-0055 与全部 accepted ADR 的系统级回归；不产生新的领域语义。
 
-**运行记录**：构建来源 `ad974e566eab6c0b00e3e9471ac7df406dcf9932`；`evrything-about-me_0.1.0_x64-setup.exe` 为 5,530,200 bytes，SHA-256 `73f0137e04222e0900789c685dd7e18564edeb6912842f5afdbfc41a63f5659f`；隔离安装、启动、关窗保留托盘、退出与卸载烟测全绿。
+**运行记录**：S07C-6 初始化页滚动修复后，从构建来源 `74dd8123600f23a03c9e8e8e49507fa20623fa46` 重新完整运行 18/18 gate；`evrything-about-me_0.1.0_x64-setup.exe` 为 5,529,536 bytes，SHA-256 `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8`；隔离安装、启动、关窗保留托盘、退出与卸载烟测全绿，旧候选失效。
 
 ### S32 冻结构建纵向验收与首版发布结论
 
