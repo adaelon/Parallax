@@ -1,12 +1,12 @@
 # 首版完整实现切片方案
 
-状态：实施中；S01～S31、S06R-1～S06R-5、S06D 与 S07C-1～S07C-9 已完成；S32 已由新冻结构建解锁，但纵向观察尚未开始
+状态：实施中；S01～S31、S06R-1～S06R-5、S06D 与 S07C-1～S07C-9 已完成；S12M-1～S12M-7 待实现，S32 因活动资料源监控缺口重新锁定
 
-本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 曾形成可安装构建。实机审计发现桌面正式对话绕过 S04/S05 的创建链，且普通运行时允许缺少身份与完整自我包，因此 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 新增 S07C 修订组；S07C-9 已重新冻结唯一候选构建，任何更早构建都不得进入 S32。
+本方案以 [产品需求](product-spec.md)、[目标架构](architecture.md)、[领域语言](../CONTEXT.md) 和 `docs/adr/` 中的全部决策为约束。S01～S30 已从最小领域闭环逐步完成安全存储、资料摄取、检索与记忆、关系与身份、活动采集和恢复；S31 曾形成可安装构建。S07C 已修复桌面正式对话的创建与主体状态缺口，但实机核对又确认 S12 的只读对账从未接入桌面目录选择、后台触发或 UI，且现有持久化不能表达唯一活动资料源和资料源停用。[ADR-0056](adr/0056-explicit-read-only-markdown-source-directory.md) 与 [ADR-0057](adr/0057-atomic-active-source-replacement.md) 因此新增 S12M 修订组；S07C-9 冻结构建不含该能力，不再可直接进入 S32。
 
 ## 1. 结论
 
-原首版拆成 32 个可独立验收的纵向切片；不重排已经完成的编号，在 S32 前保留 S06R/S06D，并插入九个 S07C 修订子片：
+原首版拆成 32 个可独立验收的纵向切片；不重排已经完成的编号，在 S32 前保留 S06R/S06D、九个 S07C 修订子片，并追加七个 S12M 修订子片：
 
 ```text
 A. 核心与本地应用
@@ -28,7 +28,8 @@ S28 -> S29 -> S30 -> S31(旧边界证据)
                          -> S06D
                          -> S07C-1 -> S07C-2 -> S07C-3 -> S07C-4 -> S07C-5
                          -> S07C-6 -> S07C-7 -> S07C-8 -> S07C-9
-                         -> S31(重验收并冻结新构建) -> S32
+                         -> S12M-1 -> S12M-2 -> S12M-3 -> S12M-4
+                         -> S12M-5 -> S12M-6 -> S12M-7 -> S32
 ```
 
 数字顺序是推荐交付顺序。依赖允许的情况下可以并行准备测试夹具或技术 spike，但任何产品切片都必须从已提交的文件状态开始、独立跑绿，并且不得依赖会话记忆。
@@ -561,7 +562,7 @@ save(draft) -> validate/build -> Vault commit -> replace active runtime -> Runti
 
 ### S07C 第二自我创建与认识闭环修订
 
-**状态**：已由 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 接受；S07C-1～S07C-9 已完成，新冻结构建已通过系统验收，S32 可从零开始。
+**状态**：已由 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) 接受；S07C-1～S07C-9 已完成且当时通过系统验收，但该冻结构建现已被 S12M 范围变更作废。
 
 修订前领域层分别具备初始身份和 Self Bundle 能力，但桌面端没有创建入口，正式对话允许 `identity=None`，运行时只收到 Self Bundle 版本号。修订后的可信状态只从持久化事实派生：
 
@@ -707,7 +708,7 @@ send_message(message):
 
 #### S07C-9 系统重验收与新冻结构建
 
-**状态**：已完成；52 个 accepted ADR、39 个证据入口与全部 DET/FR/THR/MIG 映射闭合，Full runner 18/18 通过并生成唯一 S32 候选构建。
+**状态**：已完成；当时 52 个 accepted ADR、39 个证据入口与全部 DET/FR/THR/MIG 映射闭合，Full runner 18/18 通过并生成候选构建；该候选现因 S12M 作废。
 
 **依赖/输入**：完整 S07C、S06D、更新后的架构/代码链路、现有 Full runner 和安装烟测。
 
@@ -719,13 +720,160 @@ send_message(message):
 
 **主决策**：ADR-0055 与全部 accepted ADR 的系统级回归；不产生新的领域语义。
 
-**运行记录**：S07C-6 初始化页滚动修复后，从构建来源 `74dd8123600f23a03c9e8e8e49507fa20623fa46` 重新完整运行 18/18 gate；`evrything-about-me_0.1.0_x64-setup.exe` 为 5,529,536 bytes，SHA-256 `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8`；隔离安装、启动、关窗保留托盘、退出与卸载烟测全绿，旧候选失效。
+**运行记录**：S07C-6 初始化页滚动修复后，从构建来源 `74dd8123600f23a03c9e8e8e49507fa20623fa46` 重新完整运行 18/18 gate；`evrything-about-me_0.1.0_x64-setup.exe` 为 5,529,536 bytes，SHA-256 `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8`；隔离安装、启动、关窗保留托盘、退出与卸载烟测全绿。该记录保留为历史证据，但安装包已被 S12M 作废。
+
+### S12M 只读 Markdown 资料源监控修订
+
+**状态**：已由 [ADR-0056](adr/0056-explicit-read-only-markdown-source-directory.md) 与 [ADR-0057](adr/0057-atomic-active-source-replacement.md) 接受；S12M-1～S12M-7 均待实现。现有 S12 只提供可调用的全根对账，没有桌面目录选择、唯一活动根、自动调度或 UI，因此不得把“底层测试通过”表述为“监控文件夹已交付”。
+
+本修订沿用 S12 已实现的只读扫描、稳定读取、新增/修改/移动/删除/离线识别、Markdown 解析、证据块物化与谱系，不在功能切片中重命名 `source-obsidian` crate。产品与 UI 统一使用“只读资料源目录”，Obsidian 只表示目录内容可选使用的兼容方言。
+
+```text
+SourceRootLifecycle = STAGED | ACTIVE | DETACHED
+SourceAvailability  = AVAILABLE | SOURCE_UNAVAILABLE
+SourceRecordState   = PRESENT | SOURCE_REMOVED
+
+Current RAG:
+  ACTIVE + PRESENT + latest accepted version -> eligible
+  STAGED | DETACHED | SOURCE_REMOVED | old version -> excluded
+
+Historical RAG:
+  ACTIVE | DETACHED -> eligible under existing historical rules
+  STAGED -> excluded
+```
+
+来源生命周期与可用性正交：活动目录暂时离线只变为 `SOURCE_UNAVAILABLE`，不自动停用、不批量移除子项；`DETACHED` 表示被另一个成功启用的目录取代，既不是离线、文件删除，也不是 Forget。
+
+```text
+replace_active_markdown_source(candidate_path):
+  require candidate_path is an explicitly selected absolute local directory
+  require root itself is not a reparse point
+  candidate := register_or_load_source_root(candidate_path)
+  result := reconcile(candidate, scope=FULL)
+  if result != COMPLETED:
+    return failure_with_previous_active_unchanged
+  transaction:
+    previous ACTIVE -> DETACHED, unless it is candidate
+    candidate -> ACTIVE
+    append immutable lifecycle events
+  return active_source_snapshot
+
+reconcile_active_markdown_source(scope):
+  active := load_unique_active_source()
+  if none: return NOT_CONFIGURED
+  return reconcile(active, scope)
+```
+
+文件通知不是事实来源，只是读取提示；所有删除、移动和离线结论仍由完整目录枚举与现有双扫描稳定性门禁确认：
+
+```text
+ReconcileScope = FULL | CHANGED_PATHS(set<root-relative path>)
+
+FULL:
+  enumerate complete root; stably read every ordinary file
+
+CHANGED_PATHS:
+  enumerate complete root
+  existing PRESENT path not hinted -> claim existing record without opening bytes
+  hinted, new, moved target, or reappeared path -> stable read and reconcile
+
+both:
+  second complete scan must equal first
+  only then commit unseen records as SOURCE_REMOVED
+  only new content runs parse -> evidence materialization -> lineage
+```
+
+#### S12M-1 唯一活动资料源持久化与 RAG 门禁
+
+**状态**：已实现（2026-08-09）；schema v28、唯一活动根原子切换与当前/历史 RAG 生命周期门禁已由 Vault 全套测试锁定。
+
+**依赖/输入**：S12 `source_roots`/`source_records`、S13 当前/历史检索、schema v27、ADR-0016、ADR-0057。
+
+**新增/输出**：schema v28 为来源根增加 `STAGED | ACTIVE | DETACHED` 生命周期、不可变生命周期事件和“至多一个 ACTIVE”的局部唯一约束；Repository 增加唯一活动根查询与原子启用事务。迁移把最近一次成功对账的旧根确定为唯一 `ACTIVE`，其他已成功对账根为 `DETACHED`，从未成功对账根为 `STAGED`，并以较大稳定 ID 解决时间并列。权威候选解析把生命周期加入当前/历史 RAG 门禁。
+
+**明确不做**：扫描目录、改变文件 `PRESENT/SOURCE_REMOVED`、后台线程、Tauri command、UI 或 crate 重命名。
+
+**确定性完成**：v27→v28 的零根、单根、多根、并列时间与中断回滚测试全绿；故障注入证明切换只能看到完整的新 `ACTIVE`/旧 `DETACHED` 或完整旧状态；当前检索只返回活动根，历史检索保留停用根且拒绝 `STAGED`，Forget 回归保持绿色。
+
+#### S12M-2 有提示的增量读取与全量校准
+
+**状态**：待实现。
+
+**依赖/输入**：S12 全根对账、S12M-1 生命周期门禁、现有扫描快照与来源记录。
+
+**新增/输出**：为协调入口增加 `ReconcileScope::Full | ChangedPaths`；完整枚举仍负责确认删除，提示模式只打开提示路径、新路径、移动目标和重新出现路径，直接认领未提示的现有 `PRESENT` 记录。保留 `reconcile_obsidian_source` 作为 `Full` 兼容入口，新增中性命名入口供宿主调用。
+
+**明确不做**：只相信 watcher 推断删除、用大小/修改时间替代内容身份、跳过扫描后稳定性复核、启动后台线程或修改解析契约。
+
+**确定性完成**：可计数的固定文件适配器证明单文件变化时只读取该文件，新文件和移动目标必读，未提示现有文件不打开；删除仍只在完整双扫描成功后提交；通知丢失场景经下一次 `Full` 修复；未变化内容零新版本、零解析、零谱系批次。
+
+#### S12M-3 候选首次对账与活动根原子替换
+
+**状态**：待实现。
+
+**依赖/输入**：S12M-1～S12M-2、现有 `reconcile_obsidian_source` 成功/离线/错误结果。
+
+**新增/输出**：增加 `replace_active_markdown_source` 与 `reconcile_active_markdown_source` 应用服务；候选使用 `Full` 完成首次对账并刷新内部关系后才调用原子启用事务。同一路径重复选择执行幂等全量同步；重新选择 `DETACHED` 根时，成功前不恢复当前性；新 `STAGED` 根的部分归档对当前与历史检索都不可见。
+
+**明确不做**：对扫描失败做部分启用、替换时删除旧证据、同时活动多个根、自动 Forget、目录选择器、watcher 或 UI。
+
+**确定性完成**：固定 A/B 目录覆盖首次启用、空目录启用、相同路径重选、B 扫描失败、B 中途变化、B 成功、停用 A 重选和事务故障；所有失败均保持 A 为唯一活动根，成功后 B 进入当前 RAG、A 只进入历史 RAG，源目录字节哈希不变。
+
+#### S12M-4 后台监控调度器与失败恢复
+
+**状态**：待实现。
+
+**依赖/输入**：S12M-3 两个应用服务、托盘宿主显式退出信号、现有单写 `ManagedHost`。
+
+**新增/输出**：增加一个宿主拥有的资料源监控线程和递归文件通知适配器。启动或活动根切换后执行 `Full`，普通文件事件按 `root_id + watcher_generation` 去重并防抖后执行 `ChangedPaths`，周期校准、通知溢出、目录级歧义和重新上线执行 `Full`；失败使用有上限的退避重试。策略时长集中在可注入 `MonitorPolicy`，测试使用虚拟时钟。任何时刻最多一个对账执行，执行中到达的路径合并到下一批。
+
+**明确不做**：第二数据库写连接、并行解析同一根、把 watcher 通知当作删除事实、窗口隐藏时停机、让“暂停活动记录”停止资料源同步或把原始 OS 错误写入 WebView。
+
+**确定性完成**：虚拟 watcher/时钟覆盖启动扫描、事件合并、连续写入、通知溢出、周期校准、根离线/恢复、扫描中切换根、旧代际迟到事件、宿主忙时重排和显式退出；没有重叠对账、忙循环、旧根复活或批量误删。
+
+#### S12M-5 本机目录选择与白名单宿主 API
+
+**状态**：待实现。
+
+**依赖/输入**：S12M-3～S12M-4、现有 Tauri command 与 `ManagedHost` 失败关闭边界。
+
+**新增/输出**：由可信 Rust 宿主打开本机目录选择器并直接执行候选替换；WebView 不接收通用文件/目录插件权限，也没有可提交任意路径的文本框。白名单只新增 `get_markdown_source_status`、`choose_markdown_source_directory` 和 `sync_markdown_source_now`，返回有界 `MarkdownSourceStatusView`：是否配置、活动目录显示路径、可用性、最近成功时间、Markdown/不支持文件数量、监控状态及固定错误码。选择取消零副作用，选择成功通知监控器换代重装。
+
+**明确不做**：WebView 任意文件读取、源文件预览、路径自动发现、多目录列表、返回文件正文、原始系统错误或 Repository/Watcher 句柄。
+
+**确定性完成**：宿主测试覆盖 Vault 未就绪、取消、首次选择、失败保留旧源、成功换代、立即同步、重启恢复和错误脱敏；capability 仍只有 Core 默认能力，不出现通用文件、shell、HTTP、进程或凭据权限。
+
+#### S12M-6 资料源设置与同步状态界面
+
+**状态**：待实现。
+
+**依赖/输入**：S12M-5 三条固定 command、现有持续对话页与设置模态交互。
+
+**新增/输出**：增加“资料源设置”入口，分别显示未配置、首次扫描、活动、暂时不可用和同步失败；展示活动路径、最近成功时间、Markdown/不支持文件计数、监控是否运行，并提供“选择/更换目录”和“立即同步”。更换期间明确显示旧源仍活动；失败后保留旧状态并允许重试；成功后采用宿主返回的唯一活动源。
+
+**明确不做**：在 React 中遍历目录、用浏览器存储保存路径、展示文件正文、把停用称为删除/遗忘、提供多个活动目录或让前端自行判断扫描成功。
+
+**确定性完成**：React 测试覆盖五种状态、取消、失败保留旧源、成功替换、手动同步、防重复提交、Escape/焦点返回和窄屏滚动；命令 mock 证明没有任意路径参数或通用文件 API；类型检查与生产构建通过。
+
+#### S12M-7 RAG 端到端重验收与新冻结构建
+
+**状态**：待实现；完成前 S32 保持锁定。
+
+**依赖/输入**：S12M-1～S12M-6 全绿、更新后的产品/架构/宿主契约、现有系统验收与安装烟测。
+
+**新增/输出**：增加 `EV-MARKDOWN-SOURCE` 证据入口和 schema v28 迁移覆盖；用临时 A/B 目录贯穿“选择 A→启动监控→新增/修改/移动/删除→离线/恢复→B 失败不切换→B 成功原子替换→重启自动恢复监控→当前/历史 RAG”全链路。更新 ADR/FR/DET/THR/MIG 矩阵，重跑 Full runner，生成新的版本化 NSIS 安装包与 SHA-256，替代 S07C-9 候选。
+
+**明确不做**：用人工观察替代自动化、提交真实个人目录或正文、沿用旧安装包 SHA、在验收片新增产品行为或缩短 S32 十四日观察。
+
+**确定性完成**：资料源目录哈希始终不变；事件提示只重读变化文件；变化内容可被下一次默认 RAG/正式对话取证；停用和删除均退出当前但保留历史；新候选失败不影响旧源；定向测试、workspace、桌面测试/类型/构建、Validate、Full 和安装生命周期烟测全部通过，S32 只指向同一个新构建并从零开始观察。
+
+**主决策**：ADR-0004、ADR-0008、ADR-0013、ADR-0016、ADR-0018、ADR-0022～ADR-0024、ADR-0056、ADR-0057。
 
 ### S32 冻结构建纵向验收与首版发布结论
 
-**状态**：已解锁、尚未开始；只能使用 S07C-9 的唯一冻结安装包，并从观察第 1 日重新起算。
+**状态**：重新锁定、尚未开始；S07C-9 安装包不含 S12M，只有 S12M-7 重新冻结的新安装包可以从观察第 1 日起算。
 
-**依赖/输入**：S07C-9 重新提交的 S31 自动验收结果、版本化 NSIS 安装程序和纵向观察模板；本人在仓库外准备的脱敏真实资料基准。
+**依赖/输入**：S12M-7 重新提交的完整自动验收结果、版本化 NSIS 安装程序和纵向观察模板；本人在仓库外准备的脱敏真实资料基准。
 
 **新增/输出**：安装并冻结使用同一个 S31 构建至少两周；期间导入历史资料、产生新日常记录、纠正若干记忆，并至少重启或更换一次推理运行时；只记录脱敏指标、构建版本、观察时间和人工结论，最终形成首版纵向验收报告与发布结论。
 
@@ -757,7 +905,9 @@ S06R-5 -> S06D
 S04 + S05 + S06D + S07 + S25..S27
   -> S07C-1 -> S07C-2 -> S07C-3 -> S07C-4 -> S07C-5
   -> S07C-6 -> S07C-7 -> S07C-8 -> S07C-9
-  -> S31(重验收并冻结新构建) -> S32
+S12 + S13 + S19 + S07C-9
+  -> S12M-1 -> S12M-2 -> S12M-3 -> S12M-4
+  -> S12M-5 -> S12M-6 -> S12M-7 -> S32
 ```
 
 每片的回滚范围只包括该片新增的模块、migration、command 或策略。不得通过放宽上一片测试来让下一片变绿。若规格与测试冲突，先引用产品、架构或 ADR 说明冲突，再单独修改规格或测试。
@@ -782,8 +932,8 @@ S04 + S05 + S06D + S07 + S25..S27
 | [0012](adr/0012-tray-resident-tauri-host.md) | accepted | S07、S28 | 内嵌 Core、关窗隐藏、显式退出 |
 | [0013](adr/0013-archive-before-understanding.md) | accepted | S08 | 原件先归档、解析失败可重处理 |
 | [0014](adr/0014-first-readable-file-formats.md) | superseded by 0022 | S09 | 不实现多格式首版，只理解 Markdown |
-| [0015](adr/0015-read-only-obsidian-source.md) | accepted | S12 | 只读笔记库、不写回、不执行插件 |
-| [0016](adr/0016-obsidian-source-removal-semantics.md) | accepted | S12、S19 | 移除退出当前认知，不等于遗忘 |
+| [0015](adr/0015-read-only-obsidian-source.md) | superseded by 0056 | S12 | 保留历史实现背景，不继续限制为 Obsidian 笔记库 |
+| [0016](adr/0016-obsidian-source-removal-semantics.md) | accepted | S12、S12M、S19 | 移除与停用退出当前认知，不等于遗忘 |
 | [0017](adr/0017-on-demand-appcontainer-parser.md) | superseded by 0023 | S09 | 不实现 AppContainer parser host |
 | [0018](adr/0018-hybrid-rag-selective-deep-understanding.md) | accepted | S13～S15 | 多通道 RAG 常驻、深度理解按需 |
 | [0019](adr/0019-stable-evidence-blocks-dynamic-retrieval-windows.md) | accepted | S10、S13、S14 | 稳定块、动态窗口 |
@@ -823,23 +973,25 @@ S04 + S05 + S06D + S07 + S25..S27
 | [0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md) | accepted | S06R | Vault 单档案、write-only Key、热切换与严格测试连接 |
 | [0054](adr/0054-deepseek-chat-completions-protocol-adapter.md) | accepted | S06D | DeepSeek 官方后端适配 Chat Completions，Core 严格契约不变 |
 | [0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md) | accepted | S07C | 首个身份与自我包原子形成、正式对话失败关闭、回复绑定身份版本 |
+| [0056](adr/0056-explicit-read-only-markdown-source-directory.md) | accepted | S12M | 任意显式选择的本地 Markdown 目录、只读根边界与 Obsidian 兼容语义 |
+| [0057](adr/0057-atomic-active-source-replacement.md) | accepted | S12M | 单一活动资料源、候选首次成功后原子替换、旧源停用保留历史 |
 
 ## 11. 功能需求覆盖矩阵
 
 | 功能需求 | 主切片 | 最终能力 |
 | --- | --- | --- |
 | FR-01 渐进式共同回忆 | S04、S07、S07C | 最小介绍后原子创建，正式对话再渐进补充 |
-| FR-02 上下文收件箱 | S08～S12 | 先归档、Markdown 理解、稳定引用、增量谱系、Obsidian |
+| FR-02 上下文收件箱 | S08～S12、S12M | 先归档、Markdown 理解、稳定引用、增量谱系、任意只读目录与后台监控 |
 | FR-03 Windows 日常采集 | S28、S29 | Windows 与浏览器元数据采集及空缺显示 |
 | FR-04 时间化事实账本 | S01、S18、S20～S24、S07C | 三账本、原子事实、修正、共同经历与约定生命周期 |
-| FR-05 全库检索与工作上下文 | S13～S15 | 多通道取证、动态窗口、冻结上下文 |
+| FR-05 全库检索与工作上下文 | S13～S15、S12M | 多通道取证、活动/停用资料源门禁、动态窗口、冻结上下文 |
 | FR-06 长期记忆维护 | S16～S19、S27 | 提议、争议、纠错、遗忘、模式成熟 |
 | FR-07 第二自我运行时 | S05、S06、S06R、S25～S27、S07C | 必填主体状态、可配置推理后端、身份演化与主动反思 |
-| FR-08 持续对话界面 | S07、S06R、S17、S20～S24、S07C | 创建门禁、持续对话、运行时设置、来源展开与仪式交互 |
+| FR-08 持续对话界面 | S07、S06R、S12M、S17、S20～S24、S07C | 创建门禁、持续对话、运行时与资料源设置、来源展开与仪式交互 |
 | FR-09 纠错与遗忘 | S17～S19、S30 | 争议复核、传播删除、恢复防复活 |
-| FR-10 本地加密与恢复 | S02、S03、S06R、S30 | 加密 Vault、运行时密钥、双解锁路径、密文备份恢复 |
+| FR-10 本地加密与恢复 | S02、S03、S06R、S12M、S30 | 加密 Vault、运行时密钥、活动资料源状态、双解锁路径、密文备份恢复 |
 | FR-11 不可信内容隔离 | S08～S10、S29 | 归档边界、受限解析、控制通道隔离 |
-| FR-12 首版威胁边界 | S02、S03、S06R、S07～S10、S28～S31 | 当前会话信任边界、write-only 密钥、最小权限、真实安全声明 |
+| FR-12 首版威胁边界 | S02、S03、S06R、S07～S10、S12M、S28～S31 | 当前会话信任边界、write-only 密钥、显式只读根、最小权限、真实安全声明 |
 
 ## 12. 实施纪律与完成判据
 

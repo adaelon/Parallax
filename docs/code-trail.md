@@ -1286,3 +1286,15 @@
 
 **入口**：`scripts/run-system-acceptance.ps1 -Mode Full -ResultsPath .local/system-acceptance/scroll-fix-full.json` 从提交 `74dd8123600f23a03c9e8e8e49507fa20623fa46` 执行全仓、打包和隔离安装生命周期门禁。
 **测试**：Full 18/18、workspace 347/347、Desktop React 26/26、扩展 10/10、隐私 280/280、链接 294/294 全绿；NSIS 为 5,529,536 bytes，脚本与独立复算均得到 SHA-256 `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8`。
+
+## 2026-08-09 S12M-1 唯一活动资料源持久化与 RAG 门禁
+
+**触达**:
+- `crates/source-obsidian/src/lib.rs:SourceRootLifecycle/SourceRoot/ObsidianSourceRepository` — 暴露 `STAGED/ACTIVE/DETACHED` 快照、唯一活动根查询与原子启用 port。
+- `crates/vault/src/schema.rs:MIGRATION_28` — 回填旧根生命周期，增加不可变事件表及单一 `ACTIVE` 局部唯一索引。
+- `crates/vault/src/repository.rs:VaultRepository::activate_source_root_with_hook/ObsidianSourceRepository` — 在一个事务内停用旧根、启用候选并追加双方事件，故障时整体回滚。
+- `crates/vault/src/repository.rs:resolve_retrieval_evidence` — 令当前检索仅接受 `ACTIVE`，历史检索接受 `ACTIVE/DETACHED`，两者均拒绝 `STAGED`。
+- `crates/vault/tests/obsidian_source_persistence.rs:active_source_switch_is_unique_and_survives_reopen`、`crates/vault/tests/retrieval_persistence.rs:source_lifecycle_gates_current_and_historical_retrieval` — 覆盖切换、重启与当前/历史可见性。
+
+**入口**：可信 Core 注册并完整对账候选根后调用 `activate_source_root(root_id, observed_at_millis)`；检索候选在权威回读时实时复核根生命周期。
+**测试**：schema v28 零根、单根、多根、并列时间与中断回滚 5 组迁移测试、原子切换故障注入、来源/检索/Forget/理解回归、Vault 全套及 `cargo test --workspace --no-fail-fast` 全绿；source-obsidian 与 Vault all-targets Clippy `-D warnings`、Rust fmt 通过。

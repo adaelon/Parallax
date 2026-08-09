@@ -55,7 +55,7 @@ fn preserves_multiple_atomic_person_facts_and_exact_citations_across_reopen() {
     .unwrap();
     let runtime = ScriptedRuntime::new([ScriptedPersonFactResponse::Exact(proposals)], []);
     let repository = ready_repository(directory.path(), VAULT_KEY_BYTES);
-    assert_eq!(repository.schema_version().unwrap(), 27);
+    assert_eq!(repository.schema_version().unwrap(), 28);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_000));
 
     let observation = core

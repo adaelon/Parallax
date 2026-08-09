@@ -43,6 +43,7 @@ fn vector_windows_and_replay_digest_survive_sqlcipher_reopen() {
     repository
         .finish_source_reconciliation(root.id(), &[receipt.source_record_id()], 30)
         .unwrap();
+    repository.activate_source_root(root.id(), 31).unwrap();
     accept_and_materialize(&mut repository, receipt.archive_id(), 40);
     let query =
         RetrievalQuery::lexical("coordination launching reviewed preparation projects summarizing");
@@ -141,6 +142,43 @@ fn authoritative_multi_channel_retrieval_survives_scope_changes_and_reopen() {
     .unwrap();
     assert_eq!(reopened.index().disposition(), IndexDisposition::Current);
     assert!(!evidence_quotes(&reopened).is_empty());
+}
+
+#[test]
+fn source_lifecycle_gates_current_and_historical_retrieval() {
+    let vault = tempdir().unwrap();
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    let first = seed_lifecycle_source(
+        &mut repository,
+        "C:/notes/lifecycle-first",
+        "First.md",
+        "# First\n\nSaffronLifecycleAlpha evidence.\n",
+        10,
+    );
+    assert_source_visibility(&mut repository, "SaffronLifecycleAlpha", false, false);
+
+    repository.activate_source_root(first, 50).unwrap();
+    assert_source_visibility(&mut repository, "SaffronLifecycleAlpha", true, true);
+
+    let second = seed_lifecycle_source(
+        &mut repository,
+        "C:/notes/lifecycle-second",
+        "Second.md",
+        "# Second\n\nCobaltLifecycleBeta evidence.\n",
+        100,
+    );
+    assert_source_visibility(&mut repository, "CobaltLifecycleBeta", false, false);
+
+    repository.activate_source_root(second, 140).unwrap();
+    assert_source_visibility(&mut repository, "SaffronLifecycleAlpha", false, true);
+    assert_source_visibility(&mut repository, "CobaltLifecycleBeta", true, true);
+    repository.close().unwrap();
+
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    assert_source_visibility(&mut repository, "SaffronLifecycleAlpha", false, true);
+    assert_source_visibility(&mut repository, "CobaltLifecycleBeta", true, true);
 }
 
 fn append_and_assert_city_time(repository: &mut VaultRepository) {
@@ -246,10 +284,61 @@ fn archive_relation_pair(repository: &mut VaultRepository, root_id: u64) -> (u64
             30,
         )
         .unwrap();
+    repository.activate_source_root(root_id, 31).unwrap();
     accept_and_materialize(repository, alpha.archive_id(), 40);
     accept_and_materialize(repository, target.archive_id(), 50);
     repository.refresh_source_relations(root_id).unwrap();
     (alpha.source_record_id(), target.source_record_id())
+}
+
+fn seed_lifecycle_source(
+    repository: &mut VaultRepository,
+    root_locator: &str,
+    relative_path: &str,
+    content: &str,
+    at: i64,
+) -> u64 {
+    let root = repository.register_source_root(root_locator, at).unwrap();
+    let paths = [relative_path.to_owned()];
+    let receipt = archive_markdown(
+        repository,
+        root.id(),
+        relative_path,
+        content,
+        &paths,
+        &[],
+        at + 1,
+    );
+    repository
+        .finish_source_reconciliation(root.id(), &[receipt.source_record_id()], at + 2)
+        .unwrap();
+    accept_and_materialize(repository, receipt.archive_id(), at + 3);
+    root.id()
+}
+
+fn assert_source_visibility(
+    repository: &mut VaultRepository,
+    term: &str,
+    expected_current: bool,
+    expected_historical: bool,
+) {
+    for (scope, expected) in [
+        (SourceScope::Current, expected_current),
+        (SourceScope::Historical, expected_historical),
+    ] {
+        let result = retrieve(
+            repository,
+            &RetrievalQuery::lexical(term).with_source_scope(scope),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_quotes(&result)
+                .iter()
+                .any(|quote| quote.contains(term)),
+            expected,
+            "unexpected {scope:?} visibility for {term}",
+        );
+    }
 }
 
 fn archive_markdown(

@@ -35,7 +35,7 @@ fn merges_continuous_activity_and_recovers_a_crash_without_inventing_time() {
     let _guard = sqlcipher_test_lock();
     let directory = tempdir().unwrap();
     let mut repository = VaultRepository::open(directory.path(), key()).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 27);
+    assert_eq!(repository.schema_version().unwrap(), 28);
     let host = repository
         .begin_host_session(at(1_000), LaunchMode::Foreground)
         .unwrap();

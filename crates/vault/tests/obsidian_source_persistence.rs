@@ -4,7 +4,7 @@ use eam_ingestion::{
 use eam_markdown::{CONTRACT_VERSION, ParseLimits};
 use eam_source_obsidian::{
     ObsidianSourceRepository, SourceArchiveInput, SourceAvailability, SourceFileKind,
-    SourceRecordState, SourceRelationKind,
+    SourceRecordState, SourceRelationKind, SourceRootLifecycle,
 };
 use eam_vault::{VaultKey, VaultRepository};
 use tempfile::tempdir;
@@ -69,6 +69,91 @@ fn metadata_relations_and_s11_lineage_are_queryable_for_obsidian_versions() {
         attachment.source_record_id(),
     );
     assert_modified_source_uses_s11_lineage(&mut repository, root.id(), alpha.source_record_id());
+}
+
+#[test]
+fn active_source_switch_is_unique_and_survives_reopen() {
+    let vault = tempdir().unwrap();
+    let mut repository =
+        VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    let first = repository
+        .register_source_root("C:/notes/active-first", 10)
+        .unwrap();
+    let second = repository
+        .register_source_root("C:/notes/active-second", 11)
+        .unwrap();
+    assert_eq!(first.lifecycle(), SourceRootLifecycle::Staged);
+    assert_eq!(second.lifecycle(), SourceRootLifecycle::Staged);
+    assert!(repository.load_active_source_root().unwrap().is_none());
+    assert!(repository.activate_source_root(first.id(), 12).is_err());
+
+    repository
+        .finish_source_reconciliation(first.id(), &[], 20)
+        .unwrap();
+    let activated_first = repository.activate_source_root(first.id(), 30).unwrap();
+    assert_eq!(
+        activated_first.root().lifecycle(),
+        SourceRootLifecycle::Active
+    );
+    assert_eq!(
+        repository
+            .load_active_source_root()
+            .unwrap()
+            .unwrap()
+            .root()
+            .id(),
+        first.id()
+    );
+
+    repository
+        .finish_source_reconciliation(second.id(), &[], 40)
+        .unwrap();
+    let activated_second = repository.activate_source_root(second.id(), 50).unwrap();
+    assert_eq!(
+        activated_second.root().lifecycle(),
+        SourceRootLifecycle::Active
+    );
+    assert_eq!(
+        repository
+            .load_source_root(first.id())
+            .unwrap()
+            .root()
+            .lifecycle(),
+        SourceRootLifecycle::Detached
+    );
+    assert_eq!(
+        repository
+            .load_active_source_root()
+            .unwrap()
+            .unwrap()
+            .root()
+            .id(),
+        second.id()
+    );
+    assert_eq!(
+        repository.activate_source_root(second.id(), 60).unwrap(),
+        activated_second
+    );
+    repository.close().unwrap();
+
+    let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
+    assert_eq!(
+        repository
+            .load_source_root(first.id())
+            .unwrap()
+            .root()
+            .lifecycle(),
+        SourceRootLifecycle::Detached
+    );
+    assert_eq!(
+        repository
+            .load_active_source_root()
+            .unwrap()
+            .unwrap()
+            .root()
+            .id(),
+        second.id()
+    );
 }
 
 fn archive_initial_pair(

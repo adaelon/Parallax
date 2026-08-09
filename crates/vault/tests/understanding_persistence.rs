@@ -103,6 +103,7 @@ fn seed_projections(repository: &mut VaultRepository) -> ProjectionFixture {
             30,
         )
         .unwrap();
+    repository.activate_source_root(root.id(), 31).unwrap();
     let alpha_materialized = accept_and_materialize(repository, alpha.archive_id(), 40);
     let beta_materialized = accept_and_materialize(repository, beta.archive_id(), 50);
     let alpha_ref = alpha_materialized

@@ -21,6 +21,13 @@ pub enum SourceAvailability {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRootLifecycle {
+    Staged,
+    Active,
+    Detached,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceRecordState {
     Present,
     SourceRemoved,
@@ -238,6 +245,7 @@ pub struct SourceScan {
 pub struct SourceRoot {
     id: u64,
     locator: String,
+    lifecycle: SourceRootLifecycle,
     availability: SourceAvailability,
     first_seen_at_millis: i64,
     last_reconciled_at_millis: Option<i64>,
@@ -252,16 +260,21 @@ impl SourceRoot {
     pub fn new(
         id: u64,
         locator: String,
+        lifecycle: SourceRootLifecycle,
         availability: SourceAvailability,
         first_seen_at_millis: i64,
         last_reconciled_at_millis: Option<i64>,
     ) -> Result<Self, SourceStateError> {
-        if id == 0 || locator.trim().is_empty() {
+        if id == 0
+            || locator.trim().is_empty()
+            || (lifecycle != SourceRootLifecycle::Staged && last_reconciled_at_millis.is_none())
+        {
             return Err(SourceStateError::InvalidRoot);
         }
         Ok(Self {
             id,
             locator,
+            lifecycle,
             availability,
             first_seen_at_millis,
             last_reconciled_at_millis,
@@ -276,6 +289,11 @@ impl SourceRoot {
     #[must_use]
     pub fn locator(&self) -> &str {
         &self.locator
+    }
+
+    #[must_use]
+    pub const fn lifecycle(&self) -> SourceRootLifecycle {
+        self.lifecycle
     }
 
     #[must_use]
@@ -477,6 +495,26 @@ pub trait ObsidianSourceRepository {
     ///
     /// Returns the adapter error for missing or corrupt encrypted state.
     fn load_source_root(&self, root_id: u64) -> Result<SourceRootSnapshot, Self::Error>;
+
+    /// Loads the unique active source root, if one has been activated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error for corrupt encrypted lifecycle state.
+    fn load_active_source_root(&self) -> Result<Option<SourceRootSnapshot>, Self::Error>;
+
+    /// Atomically activates one successfully reconciled root and detaches the
+    /// previous active root without deleting either root's evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error if the candidate is missing, unavailable, has
+    /// never reconciled successfully, or the complete transition cannot commit.
+    fn activate_source_root(
+        &mut self,
+        root_id: u64,
+        observed_at_millis: i64,
+    ) -> Result<SourceRootSnapshot, Self::Error>;
 
     /// Marks a root unavailable without changing any child record.
     ///
@@ -850,6 +888,45 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn active_and_detached_roots_require_a_successful_reconciliation() {
+        assert!(
+            SourceRoot::new(
+                1,
+                "C:/notes/staged".to_owned(),
+                SourceRootLifecycle::Staged,
+                SourceAvailability::Available,
+                10,
+                None,
+            )
+            .is_ok()
+        );
+        for lifecycle in [SourceRootLifecycle::Active, SourceRootLifecycle::Detached] {
+            assert!(
+                SourceRoot::new(
+                    1,
+                    "C:/notes/reconciled".to_owned(),
+                    lifecycle,
+                    SourceAvailability::Available,
+                    10,
+                    None,
+                )
+                .is_err()
+            );
+            assert!(
+                SourceRoot::new(
+                    1,
+                    "C:/notes/reconciled".to_owned(),
+                    lifecycle,
+                    SourceAvailability::Available,
+                    10,
+                    Some(20),
+                )
+                .is_ok()
+            );
+        }
+    }
 
     #[test]
     fn scans_only_ordinary_source_files_without_modifying_the_root() {

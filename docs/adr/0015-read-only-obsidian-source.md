@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0056
 ---
 
 # Obsidian 笔记库作为只读外部资料源

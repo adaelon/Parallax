@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VaultError;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 27;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 28;
 
 const MIGRATION_1: &str = r"
 CREATE TABLE conversation_evidence (
@@ -1566,6 +1566,55 @@ CREATE INDEX conversation_evidence_counterpart_identity
     WHERE speaker = 1;
 ";
 
+const MIGRATION_28: &str = r"
+ALTER TABLE source_roots ADD COLUMN lifecycle_state INTEGER NOT NULL DEFAULT 0
+    CHECK (lifecycle_state IN (0, 1, 2));
+
+UPDATE source_roots
+SET lifecycle_state = 2
+WHERE last_reconciled_at IS NOT NULL;
+
+UPDATE source_roots
+SET lifecycle_state = 1
+WHERE id = (
+    SELECT id
+    FROM source_roots
+    WHERE last_reconciled_at IS NOT NULL
+    ORDER BY last_reconciled_at DESC, id DESC
+    LIMIT 1
+);
+
+CREATE UNIQUE INDEX source_roots_single_active
+    ON source_roots(lifecycle_state)
+    WHERE lifecycle_state = 1;
+
+CREATE TABLE source_root_lifecycle_events (
+    root_id INTEGER NOT NULL REFERENCES source_roots(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    lifecycle_state INTEGER NOT NULL CHECK (lifecycle_state IN (0, 1, 2)),
+    occurred_at INTEGER NOT NULL,
+    PRIMARY KEY (root_id, ordinal)
+) STRICT;
+
+INSERT INTO source_root_lifecycle_events
+    (root_id, ordinal, lifecycle_state, occurred_at)
+SELECT id, 0, lifecycle_state, COALESCE(last_reconciled_at, first_seen_at)
+FROM source_roots
+ORDER BY id;
+
+CREATE TRIGGER source_root_lifecycle_events_immutable_update
+BEFORE UPDATE ON source_root_lifecycle_events
+BEGIN
+    SELECT RAISE(ABORT, 'source root lifecycle events are immutable');
+END;
+
+CREATE TRIGGER source_root_lifecycle_events_immutable_delete
+BEFORE DELETE ON source_root_lifecycle_events
+BEGIN
+    SELECT RAISE(ABORT, 'source root lifecycle events are immutable');
+END;
+";
+
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
     migrate_with_hook(connection, |_, _| Ok(()))
 }
@@ -1610,6 +1659,7 @@ where
             25 => transaction.execute_batch(MIGRATION_25)?,
             26 => transaction.execute_batch(MIGRATION_26)?,
             27 => transaction.execute_batch(MIGRATION_27)?,
+            28 => transaction.execute_batch(MIGRATION_28)?,
             _ => return Err(VaultError::UnsupportedSchema(target)),
         }
         hook(target, &transaction)?;
@@ -1624,6 +1674,204 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn migrate_to_v27(connection: &mut Connection) {
+        let result = migrate_with_hook(connection, |target, _| {
+            if target == 28 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(28))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 27);
+    }
+
+    fn insert_v27_source_root(
+        connection: &Connection,
+        id: i64,
+        first_seen_at: i64,
+        last_reconciled_at: Option<i64>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO source_roots
+                 (id, root_kind, root_locator, availability, first_seen_at, last_reconciled_at)
+                 VALUES (?1, 0, ?2, 0, ?3, ?4)",
+                rusqlite::params![
+                    id,
+                    format!("C:/migration/root-{id}"),
+                    first_seen_at,
+                    last_reconciled_at,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn source_lifecycles(connection: &Connection) -> Vec<(i64, i64)> {
+        let mut statement = connection
+            .prepare("SELECT id, lifecycle_state FROM source_roots ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn v28_migration_accepts_zero_source_roots() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_to_v27(&mut connection);
+
+        migrate(&mut connection).unwrap();
+
+        assert!(source_lifecycles(&connection).is_empty());
+        let event_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM source_root_lifecycle_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn v28_migration_makes_one_reconciled_root_active() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_to_v27(&mut connection);
+        insert_v27_source_root(&connection, 1, 10, Some(20));
+
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(source_lifecycles(&connection), vec![(1, 1)]);
+        let event: (i64, i64) = connection
+            .query_row(
+                "SELECT lifecycle_state, occurred_at
+                 FROM source_root_lifecycle_events WHERE root_id = 1 AND ordinal = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event, (1, 20));
+        assert!(
+            connection
+                .execute(
+                    "UPDATE source_root_lifecycle_events
+                     SET lifecycle_state = 2 WHERE root_id = 1 AND ordinal = 0",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM source_root_lifecycle_events
+                     WHERE root_id = 1 AND ordinal = 0",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v28_migration_classifies_staged_detached_and_active_roots() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_to_v27(&mut connection);
+        insert_v27_source_root(&connection, 1, 10, None);
+        insert_v27_source_root(&connection, 2, 20, Some(100));
+        insert_v27_source_root(&connection, 3, 30, Some(200));
+
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(source_lifecycles(&connection), vec![(1, 0), (2, 2), (3, 1)]);
+        let events: Vec<(i64, i64)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT root_id, lifecycle_state
+                     FROM source_root_lifecycle_events ORDER BY root_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(events, vec![(1, 0), (2, 2), (3, 1)]);
+        assert!(
+            connection
+                .execute(
+                    "UPDATE source_roots SET lifecycle_state = 1 WHERE id = 2",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v28_migration_breaks_reconciliation_time_ties_by_highest_stable_id() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_to_v27(&mut connection);
+        insert_v27_source_root(&connection, 4, 10, Some(300));
+        insert_v27_source_root(&connection, 9, 20, Some(300));
+
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(source_lifecycles(&connection), vec![(4, 2), (9, 1)]);
+    }
+
+    #[test]
+    fn interrupted_v28_migration_keeps_v27_source_state_reopenable() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_to_v27(&mut connection);
+        insert_v27_source_root(&connection, 1, 10, Some(20));
+        insert_v27_source_root(&connection, 2, 30, Some(40));
+
+        let result = migrate_with_hook(&mut connection, |target, _| {
+            if target == 28 {
+                Err(VaultError::MigrationInterrupted(target))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(VaultError::MigrationInterrupted(28))));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 27);
+        let lifecycle_column_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('source_roots')
+                 WHERE name = 'lifecycle_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_column_count, 0);
+        let lifecycle_table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'source_root_lifecycle_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_table_count, 0);
+
+        migrate(&mut connection).unwrap();
+        assert_eq!(source_lifecycles(&connection), vec![(1, 2), (2, 1)]);
+    }
 
     #[test]
     fn interrupted_migration_rolls_back_before_reopen() {

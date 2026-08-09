@@ -122,7 +122,7 @@ fn repository_with_identity_bundle(path: &std::path::Path) -> VaultRepository {
 fn reopens_the_same_first_identity_with_its_person_evidence_and_facts() {
     let directory = tempdir().unwrap();
     let repository = VaultRepository::open(directory.path(), key()).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 27);
+    assert_eq!(repository.schema_version().unwrap(), 28);
     let runtime = ScriptedIdentityRuntime::new([proposal()]);
     let mut formation = IdentityFormation::new(repository, runtime, IncrementingClock::new(10_000));
 

@@ -70,7 +70,7 @@ use eam_runtime_gateway::{RuntimeTarget, validate_responses_bearer_token};
 use eam_source_obsidian::{
     ObsidianSourceRepository, SourceArchiveInput, SourceArchiveReceipt, SourceAvailability,
     SourceDocumentProjection, SourceFileKind, SourceRecord, SourceRecordState, SourceRelation,
-    SourceRelationKind, SourceRoot, SourceRootSnapshot,
+    SourceRelationKind, SourceRoot, SourceRootLifecycle, SourceRootSnapshot,
 };
 use eam_understanding::{
     ProjectionBuild, ProjectionContent, ProjectionId, ProjectionKind, ProjectionRecipe,
@@ -1332,6 +1332,90 @@ impl VaultRepository {
         Ok(batch.clone())
     }
 
+    fn activate_source_root_with_hook<F>(
+        &mut self,
+        root_id: u64,
+        observed_at_millis: i64,
+        before_commit: F,
+    ) -> Result<SourceRootSnapshot, VaultError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), VaultError>,
+    {
+        let root_id_sql = to_vault_sql_id(root_id)?;
+        let candidate = self
+            .connection()
+            .query_row(
+                "SELECT lifecycle_state, availability, last_reconciled_at
+                 FROM source_roots WHERE id = ?1",
+                [root_id_sql],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(VaultError::InvalidKeyOrCorrupt)?;
+        let lifecycle = decode_source_root_lifecycle(candidate.0)?;
+        let availability = decode_source_availability(candidate.1)?;
+        if lifecycle == SourceRootLifecycle::Active {
+            return load_source_root_snapshot(self.connection(), root_id);
+        }
+        if availability != SourceAvailability::Available || candidate.2.is_none() {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+
+        let transaction = self
+            .connection
+            .as_mut()
+            .expect("an open vault always owns a database connection")
+            .transaction()?;
+        let previous_active = transaction
+            .query_row(
+                "SELECT id FROM source_roots WHERE lifecycle_state = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(previous_active) = previous_active {
+            let previous_active =
+                u64::try_from(previous_active).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+            let changed = transaction.execute(
+                "UPDATE source_roots SET lifecycle_state = 2
+                 WHERE id = ?1 AND lifecycle_state = 1",
+                [to_vault_sql_id(previous_active)?],
+            )?;
+            if changed != 1 {
+                return Err(VaultError::InvalidKeyOrCorrupt);
+            }
+            insert_source_root_lifecycle_event(
+                &transaction,
+                previous_active,
+                SourceRootLifecycle::Detached,
+                observed_at_millis,
+            )?;
+        }
+        let changed = transaction.execute(
+            "UPDATE source_roots SET lifecycle_state = 1
+             WHERE id = ?1 AND lifecycle_state IN (0, 2)",
+            [root_id_sql],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::InvalidKeyOrCorrupt);
+        }
+        insert_source_root_lifecycle_event(
+            &transaction,
+            root_id,
+            SourceRootLifecycle::Active,
+            observed_at_millis,
+        )?;
+        before_commit(&transaction)?;
+        transaction.commit()?;
+        load_source_root_snapshot(self.connection(), root_id)
+    }
+
     fn close_inner(&mut self) -> Result<(), VaultError> {
         let mut first_error = None;
 
@@ -1725,14 +1809,21 @@ impl ObsidianSourceRepository for VaultRepository {
             .transaction()?;
         transaction.execute(
             "INSERT INTO source_roots
-             (id, root_kind, root_locator, availability, first_seen_at, last_reconciled_at)
-             VALUES (?1, 0, ?2, 0, ?3, NULL)",
+             (id, root_kind, root_locator, availability, first_seen_at,
+              last_reconciled_at, lifecycle_state)
+             VALUES (?1, 0, ?2, 0, ?3, NULL, 0)",
             params![to_vault_sql_id(root_id)?, root_locator, observed_at_millis],
         )?;
         insert_source_root_event(
             &transaction,
             root_id,
             SourceAvailability::Available,
+            observed_at_millis,
+        )?;
+        insert_source_root_lifecycle_event(
+            &transaction,
+            root_id,
+            SourceRootLifecycle::Staged,
             observed_at_millis,
         )?;
         transaction.commit()?;
@@ -1742,6 +1833,18 @@ impl ObsidianSourceRepository for VaultRepository {
 
     fn load_source_root(&self, root_id: u64) -> Result<SourceRootSnapshot, Self::Error> {
         load_source_root_snapshot(self.connection(), root_id)
+    }
+
+    fn load_active_source_root(&self) -> Result<Option<SourceRootSnapshot>, Self::Error> {
+        load_active_source_root_snapshot(self.connection())
+    }
+
+    fn activate_source_root(
+        &mut self,
+        root_id: u64,
+        observed_at_millis: i64,
+    ) -> Result<SourceRootSnapshot, Self::Error> {
+        self.activate_source_root_with_hook(root_id, observed_at_millis, |_| Ok(()))
     }
 
     fn mark_source_unavailable(
@@ -9045,9 +9148,11 @@ fn resolve_retrieval_evidence(
                         SELECT MAX(latest.version_ordinal)
                         FROM source_record_versions latest
                         WHERE latest.source_record_id = v.source_record_id
-                    )
+                    ),
+                    s.origin_kind, roots.lifecycle_state
              FROM source_record_versions v
              JOIN source_records s ON s.id = v.source_record_id
+             LEFT JOIN source_roots roots ON roots.id = s.root_id
              JOIN archived_evidence a ON a.id = v.evidence_id
              JOIN retrieval_evidence_availability available
                ON available.evidence_id = v.evidence_id AND available.state = 1
@@ -9060,6 +9165,8 @@ fn resolve_retrieval_evidence(
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, bool>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
                 ))
             },
         )
@@ -9070,6 +9177,19 @@ fn resolve_retrieval_evidence(
         1 => SourceCurrentness::SourceRemoved,
         _ => return Err(VaultError::InvalidKeyOrCorrupt),
     };
+    let lifecycle = match (source.5, source.6) {
+        (0, None) => None,
+        (1, Some(value)) => Some(decode_source_root_lifecycle(value)?),
+        _ => return Err(VaultError::InvalidKeyOrCorrupt),
+    };
+    let lifecycle_eligible = match lifecycle {
+        None | Some(SourceRootLifecycle::Active) => true,
+        Some(SourceRootLifecycle::Detached) => scope == SourceScope::Historical,
+        Some(SourceRootLifecycle::Staged) => false,
+    };
+    if !lifecycle_eligible {
+        return Ok(None);
+    }
     if scope == SourceScope::Current
         && (currentness == SourceCurrentness::SourceRemoved || !source.4)
     {
@@ -9429,7 +9549,8 @@ fn load_source_root_snapshot(
     let root_id_sql = to_vault_sql_id(root_id)?;
     let root = connection
         .query_row(
-            "SELECT root_locator, availability, first_seen_at, last_reconciled_at
+            "SELECT root_locator, lifecycle_state, availability, first_seen_at,
+                    last_reconciled_at
              FROM source_roots WHERE id = ?1",
             [root_id_sql],
             |row| {
@@ -9437,7 +9558,8 @@ fn load_source_root_snapshot(
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             },
         )
@@ -9446,9 +9568,10 @@ fn load_source_root_snapshot(
     let root = SourceRoot::new(
         root_id,
         root.0,
-        decode_source_availability(root.1)?,
-        root.2,
+        decode_source_root_lifecycle(root.1)?,
+        decode_source_availability(root.2)?,
         root.3,
+        root.4,
     )
     .map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
     let mut statement = connection.prepare(
@@ -9491,6 +9614,24 @@ fn load_source_root_snapshot(
     Ok(SourceRootSnapshot::new(root, records))
 }
 
+fn load_active_source_root_snapshot(
+    connection: &Connection,
+) -> Result<Option<SourceRootSnapshot>, VaultError> {
+    let root_id = connection
+        .query_row(
+            "SELECT id FROM source_roots WHERE lifecycle_state = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    root_id
+        .map(|root_id| {
+            let root_id = u64::try_from(root_id).map_err(|_| VaultError::InvalidKeyOrCorrupt)?;
+            load_source_root_snapshot(connection, root_id)
+        })
+        .transpose()
+}
+
 fn insert_source_root_event(
     transaction: &rusqlite::Transaction<'_>,
     root_id: u64,
@@ -9510,6 +9651,31 @@ fn insert_source_root_event(
             to_vault_sql_id(root_id)?,
             ordinal,
             encode_source_availability(availability),
+            occurred_at_millis,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_source_root_lifecycle_event(
+    transaction: &rusqlite::Transaction<'_>,
+    root_id: u64,
+    lifecycle: SourceRootLifecycle,
+    occurred_at_millis: i64,
+) -> Result<(), VaultError> {
+    let ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(ordinal), -1) + 1
+         FROM source_root_lifecycle_events WHERE root_id = ?1",
+        [to_vault_sql_id(root_id)?],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO source_root_lifecycle_events
+         (root_id, ordinal, lifecycle_state, occurred_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            to_vault_sql_id(root_id)?,
+            ordinal,
+            encode_source_root_lifecycle(lifecycle),
             occurred_at_millis,
         ],
     )?;
@@ -9817,6 +9983,23 @@ const fn encode_source_availability(value: SourceAvailability) -> i64 {
     match value {
         SourceAvailability::Available => 0,
         SourceAvailability::SourceUnavailable => 1,
+    }
+}
+
+const fn encode_source_root_lifecycle(value: SourceRootLifecycle) -> i64 {
+    match value {
+        SourceRootLifecycle::Staged => 0,
+        SourceRootLifecycle::Active => 1,
+        SourceRootLifecycle::Detached => 2,
+    }
+}
+
+const fn decode_source_root_lifecycle(value: i64) -> Result<SourceRootLifecycle, VaultError> {
+    match value {
+        0 => Ok(SourceRootLifecycle::Staged),
+        1 => Ok(SourceRootLifecycle::Active),
+        2 => Ok(SourceRootLifecycle::Detached),
+        _ => Err(VaultError::InvalidKeyOrCorrupt),
     }
 }
 
@@ -12563,6 +12746,83 @@ mod tests {
         assert_eq!(profile.base_url(), "https://runtime.example.test/v1");
         assert_eq!(profile.model(), "owner/model-v1");
         assert_eq!(profile.bearer_key(), Some("synthetic-original-key"));
+    }
+
+    #[test]
+    fn interrupted_source_root_activation_rolls_back_both_lifecycles_across_reopen() {
+        let _guard = crate::test_support::sqlcipher_test_lock();
+        let directory = tempdir().unwrap();
+        let key = [0x59; 32];
+        let mut repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        let first = repository
+            .register_source_root("C:/notes/atomic-first", 10)
+            .unwrap();
+        let second = repository
+            .register_source_root("C:/notes/atomic-second", 11)
+            .unwrap();
+        repository
+            .finish_source_reconciliation(first.id(), &[], 20)
+            .unwrap();
+        repository
+            .finish_source_reconciliation(second.id(), &[], 21)
+            .unwrap();
+        repository.activate_source_root(first.id(), 30).unwrap();
+
+        let result = repository.activate_source_root_with_hook(second.id(), 40, |transaction| {
+            let states = transaction
+                .prepare("SELECT id, lifecycle_state FROM source_roots ORDER BY id")?
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(states, vec![(1, 2), (2, 1)]);
+            Err(VaultError::InvalidKeyOrCorrupt)
+        });
+
+        assert!(matches!(result, Err(VaultError::InvalidKeyOrCorrupt)));
+        assert_eq!(
+            repository
+                .load_active_source_root()
+                .unwrap()
+                .unwrap()
+                .root()
+                .id(),
+            first.id()
+        );
+        assert_eq!(
+            repository
+                .load_source_root(first.id())
+                .unwrap()
+                .root()
+                .lifecycle(),
+            SourceRootLifecycle::Active
+        );
+        assert_eq!(
+            repository
+                .load_source_root(second.id())
+                .unwrap()
+                .root()
+                .lifecycle(),
+            SourceRootLifecycle::Staged
+        );
+        repository.close().unwrap();
+
+        let repository = VaultRepository::open(directory.path(), VaultKey::new(key)).unwrap();
+        assert_eq!(
+            repository
+                .load_active_source_root()
+                .unwrap()
+                .unwrap()
+                .root()
+                .id(),
+            first.id()
+        );
+        assert_eq!(
+            repository
+                .load_source_root(second.id())
+                .unwrap()
+                .root()
+                .lifecycle(),
+            SourceRootLifecycle::Staged
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ flowchart LR
     subgraph Sources[数据来源]
         Interview[渐进式访谈]
         Inbox[Context Inbox]
-        Obsidian[Obsidian 笔记库<br/>只读资料源]
+        SourceDirectory[本地 Markdown 目录<br/>只读资料源]
         Browser[TypeScript 浏览器扩展]
     end
 
@@ -35,7 +35,7 @@ flowchart LR
         subgraph LocalCore[内嵌本地可信 Rust Core]
             WinCollector[Rust Windows 活动采集器]
             BrowserCapture[固定来源环回浏览采集器]
-            ObsidianSource[Obsidian 资料源适配器]
+            MarkdownSource[Markdown 资料源适配器<br/>兼容 Obsidian 语义]
             Intake[摄取协调器]
             MarkdownParser[纯 Rust Markdown 解析器]
             Vault[Evidence Vault<br/>SQLCipher + 加密对象库]
@@ -65,11 +65,11 @@ flowchart LR
     Person --> UI
     Person --> Interview
     Person --> Inbox
-    Person --> Obsidian
+    Person --> SourceDirectory
     UI <--> Commands
     Interview --> Intake
     Inbox --> Intake
-    Obsidian --> ObsidianSource --> Intake
+    SourceDirectory --> MarkdownSource --> Intake
     Intake --> MarkdownParser
     MarkdownParser --> Intake
     WinCollector --> Intake
@@ -134,13 +134,15 @@ Rust Core 内嵌在 Tauri 宿主中，负责采集、保险库、账本、索引
 
 扩展使用 TypeScript，只采集已声明的浏览元数据和获准的页面内容，并通过受认证的本地通道提交证据。扩展不直接查询保险库，也不接收第二自我的其他上下文。
 
-### 3.4 Obsidian 笔记库资料源
+### 3.4 只读 Markdown 资料源目录
 
-本人在应用中选择一个已有 Obsidian 笔记库根目录。Rust 适配器只读扫描和观察其普通文件，把库内相对路径作为来源定位，并通过通用摄取协调器归档；它直接读取本地 Markdown，不依赖 Obsidian 进程或插件 API。默认跳过 Obsidian 配置目录和回收站，不跟随重解析点，不执行插件，也不获取外部链接。
+本人通过应用的本机目录选择器明确选择一个任意本地目录。Rust 适配器只读扫描和观察其普通文件，把根内相对路径作为来源定位，并通过通用摄取协调器归档；它直接读取本地 Markdown，不依赖 Obsidian 进程或插件 API。默认跳过 `.obsidian` 与 `.trash`，不跟随重解析点，不执行插件，也不获取外部链接。WebView 不获得通用文件 API 或任意路径读取能力。
 
-`eam-markdown-v1` 提取结果额外保留 Properties、标签、别名、标题、块标识、Wikilink 与 Markdown 内部链接以及嵌入目标。内部目标解析为同一资料源中的关系边；目标尚不存在时保留未解析关系，目标以后出现再增量解析。库内非 Markdown 附件独立进入通用文件摄取状态机，首版只归档并标记为不支持理解。
+`eam-markdown-v1` 提取结果保留 Properties、标签、别名、标题、块标识、Wikilink 与 Markdown 内部链接以及嵌入目标；这些 Obsidian 兼容语义只在目录内容实际使用相应结构时生效。内部目标解析为同一资料源中的关系边；目标尚不存在时保留未解析关系，目标以后出现再增量解析。目录内非 Markdown 文件独立进入通用文件摄取状态机，首版只归档并标记为不支持理解。
 
-S12 的 `source-obsidian` crate 只公开扫描、稳定读取和来源状态 port，不公开写 API。完整扫描成功后，摄取协调器才提交本轮未见记录的 `SOURCE_REMOVED`；根元数据不可读、扫描后文件变化、子目录遍历失败或读取越限都会在移除提交前终止。匹配现有 locator 的文件先处理，剩余新路径只在同内容旧路径唯一且未被本轮占用时识别为移动，重复内容不唯一时失败关闭为新记录。
+S12 的 `source-obsidian` crate 继续作为现有只读文件系统适配器，不在本次功能切片中混入 crate 重命名。它只公开扫描、稳定读取和来源状态 port，不公开写 API。完整扫描成功后，摄取协调器才提交本轮未见记录的 `SOURCE_REMOVED`；根元数据不可读、扫描后文件变化、子目录遍历失败或读取越限都会在移除提交前终止。匹配现有 locator 的文件先处理，剩余新路径只在同内容旧路径唯一且未被本轮占用时识别为移动，重复内容不唯一时失败关闭为新记录。
+
+S12M 在来源可用性之外增加 `STAGED | ACTIVE | DETACHED` 生命周期：新根或从未成功启用的候选为 `STAGED`，全库对账完整成功后才可成为唯一 `ACTIVE`，被其取代的旧根进入 `DETACHED`。启用事务同时写入新旧根的不可变状态事件；失败时旧活动根及默认检索不变。`STAGED` 证据不参与任何检索，`DETACHED` 证据只参与历史检索，重新选择已停用根时在成功前仍保持历史可见而不恢复当前性。
 
 ### 3.5 Core 内 Markdown 解析
 
@@ -224,7 +226,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 | Tauri 2 | Windows 单实例宿主、托盘、窗口与 WebView 生命周期、受限命令入口、打包入口 | 领域逻辑、保险库模式 |
 | Rust Core | 内嵌后台任务、Markdown 解析、领域模型、保险库单写、索引、策略、采集、运行时网关 | 直接渲染 UI、依赖 React 生命周期、作为 Windows Service 运行 |
 | Rust 摄取协调器 | 普通文件稳定性、资源上限、重解析点/非普通文件拒绝与先归档状态转换 | 解析内容、持有密钥、直接写数据库或跟随文件链接 |
-| Rust Obsidian 资料源适配器 | 只读扫描与观察、来源路径映射、变更协调 | 修改笔记、执行插件、把源目录当作权威存储 |
+| Rust Markdown 资料源适配器 | 只读扫描与观察、来源路径映射、Obsidian 兼容结构、变更协调 | 修改文件、执行插件、把源目录当作保险库或授予任意文件访问 |
 | TypeScript 浏览器扩展 | 浏览证据采集与本地提交 | 查询个人上下文、调用模型 |
 | Core Markdown 解析模块 | 从单个 UTF-8 原文提取结构、原文范围和受限元数据 | 格式转换、文件访问、联网、调用模型或工具、执行文档内容 |
 
@@ -290,19 +292,22 @@ S28 将 `self.db` schema 升至 v24：`capture_spans` 在同一有序时间线�
 
 S29-2 将 `self.db` schema 升至 v25：`browser_visits` 以不可改写行保存当前开放宿主会话下的 URL、标题、访问时间和停留时长，`submission_id` 提供跨重试幂等键。可选页面正文先进入认证密文对象与 `archived_evidence(ARCHIVED_UNPARSED)`，再由同一 SQLCipher 事务把浏览记录绑定到正文证据；失败时访问行和引用一起回滚，零引用对象由重启清理。
 
+S12M-1 已把 `self.db` schema 从 v27 升至 v28：`source_roots.lifecycle_state` 保存 `STAGED/ACTIVE/DETACHED`，局部唯一索引保证全库至多一个活动根，`source_root_lifecycle_events` 保存不可变转换。迁移按“最近一次成功对账时间、再按较大稳定 ID”确定唯一旧活动根；从未成功对账的旧根保持 `STAGED`，其他已对账根成为 `DETACHED`。启用候选时，新根 `ACTIVE` 与旧根 `DETACHED` 在同一事务提交，恢复与重启不得观察到双活动或零活动中间态。
+
 ### 4.2 逻辑数据模型
 
 以下是架构契约，不是最终数据库模式：
 
 ```text
 SourceRoot {
-  id, kind = OBSIDIAN,
+  id, kind = MARKDOWN_DIRECTORY,
+  lifecycle = STAGED | ACTIVE | DETACHED,
   availability = AVAILABLE | SOURCE_UNAVAILABLE,
   last_reconciled_at?
 }
 
 SourceRecord {
-  id, kind = INBOX | OBSIDIAN,
+  id, kind = INBOX | MARKDOWN_DIRECTORY,
   root_id?, locator,
   state = PRESENT | SOURCE_REMOVED,
   first_seen_at, last_seen_at,
@@ -534,15 +539,15 @@ InstallSignedUpdate
 
 窗口可见性不决定 Core 运行状态。宿主意外终止时，下一次启动只从最后一次已提交心跳起记录运行空缺，不猜测期间活动；系统时钟回退产生带异常标记的零长度空缺。Windows 会话锁定时采集器暂停，Core 关闭保险库并清除解锁后密钥；会话解锁后重新解封、执行恢复检查并继续采集。
 
-### 5.2 文件与 Obsidian 增量导入
+### 5.2 文件与只读资料源增量导入
 
 ```text
 Inbox 文件事件
   -> enqueue(source=INBOX, path)
 
-Obsidian 文件事件 | 启动和定期校准扫描
-  -> 配置目录或回收站：STOP
-  -> enqueue(source=OBSIDIAN, root_relative_path)
+活动资料源文件事件 | 启动和定期校准扫描
+  -> `.obsidian`、`.trash` 或根外路径：STOP
+  -> enqueue(source=MARKDOWN_DIRECTORY, root_id, root_relative_path)
 
 文件摄取任务
   -> 等待大小和修改时间稳定
@@ -563,7 +568,7 @@ Obsidian 文件事件 | 启动和定期校准扫描
   -> 结构越限或解析失败：
        MarkdownParseAttempt(REJECTED, reason)
        ARCHIVED_UNPARSED(reason)；STOP
-  -> Obsidian Markdown：提取 Properties、标签、别名、标题、块标识、
+  -> 含 Obsidian 结构的 Markdown：提取 Properties、标签、别名、标题、块标识、
        内部链接与嵌入，并解析库内关系
   -> 在 SQL 事务中写入加密解析产物、
        MarkdownParseAttempt(ACCEPTED)；Evidence(status=EXTRACTED)
@@ -602,10 +607,10 @@ new block without predecessor
 
 密文对象必须先于数据库引用持久化；若数据库提交失败，启动时清理没有引用的密文对象，从而避免数据库指向缺失原件。对象已经存在时可以复用密文，但仍需保留新来源的溯源关系；只有同一来源的同一版本已经记录时才停止处理。
 
-Obsidian 文件通知用于降低导入延迟，校准扫描用于修复应用退出、同步工具批量更新或通知丢失造成的偏差。适配器不写回稳定 ID、反向链接或任何其他元数据；外部 URL 只作为不可信文本关系保存，不由摄取链路获取内容。
+活动资料源文件通知只作为降低导入延迟的提示，校准扫描用于修复应用退出、同步工具批量更新或通知丢失造成的偏差。通知批次仍完整枚举根目录以安全确认删除，但只打开变化、新增或重新出现的文件；启动、定期全量校准、通知溢出和无法规范化的目录事件会重新读取全部普通文件。无论哪种入口，只有内容实际变化才重新解析和建立谱系。适配器不写回稳定 ID、反向链接或任何其他元数据；外部 URL 只作为不可信文本关系保存，不由摄取链路获取内容。
 
 ```text
-Obsidian 校准
+活动资料源校准
   -> 根目录不可访问：SourceRoot(SOURCE_UNAVAILABLE)；STOP
   -> 已确认重命名或移动：更新 SourceRecord.locator
   -> 已确认原路径缺失且不是移动：SourceRecord(SOURCE_REMOVED)
@@ -618,6 +623,25 @@ Obsidian 校准
 `SOURCE_REMOVED` 只改变来源当前性，不改变 Evidence 的解析可用性，也不等同于 Forget。每次转换记录发生时间；只有在根目录可访问且完成校准后才能确认缺失，避免同步盘离线、权限故障或磁盘断开造成批量误判。
 
 当前实现以 `reconcile_obsidian_source` 作为同一协调入口：按现有 locator 优先归档固定扫描中的普通文件，对新 Markdown 版本运行 S09 解析、S10 物化和 S11 相邻谱系，随后在一次成功的全根校准末尾提交来源当前性并重建内部关系解析。任何中途失败都可留下已安全归档的新版本，但绝不提交本轮批量移除；下一次完整扫描通过内容与来源幂等恢复。
+
+S12M 保留上述完整对账作为权威入口，并增加有界提示模式与后台调度：
+
+```text
+ReconcileScope = FULL | CHANGED_PATHS(set<root_relative_path>)
+
+NO_SOURCE
+  -> 本人选择目录 -> INITIAL_RECONCILE
+INITIAL_RECONCILE
+  -> 失败：旧 ACTIVE 不变；候选保持 STAGED 或 DETACHED
+  -> 成功：原子 ACTIVE <-> DETACHED；重装 watcher -> WATCHING
+WATCHING
+  -> 文件通知：按根与代际合并 -> DEBOUNCE -> CHANGED_PATHS 对账
+  -> 启动、周期、通知溢出、目录级歧义：FULL 对账
+  -> 根离线：SOURCE_UNAVAILABLE -> 有界退避重试
+  -> 显式退出：停止 watcher 和调度线程；不改变来源生命周期
+```
+
+每个通知携带 `root_id + watcher_generation`；资料源切换后，旧代际的迟到通知直接丢弃。任何时刻最多一个对账执行，执行中到达的路径合并进下一批；宿主沿用现有 Vault 单写边界，不打开第二个数据库写连接。窗口隐藏、React 卸载或“暂停活动记录”不停止资料源监控，只有显式退出应用才停止。
 
 ### 5.3 Windows 与浏览器活动采集
 
@@ -872,7 +896,7 @@ list_conversation()
 
 运行时失败时，本人发言仍按 Core 既有语义保留；React 重新调用 `list_conversation`，显示已落盘原文与错误。普通问答只有运行时显式提出并通过 Core 校验的结构化操作才可能入账，保留原文本身不产生 Claim。
 
-S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 Core 的 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭；S07C-4 把当前完整主体状态投影为有界、可审计且模型可替换的 `CounterpartSelfContext`；S07C-5 接通三个宿主创建 command，并把发送门禁前移到检索之前，同时保留 Core 第二层复核；S07C-6 已令 React 在 readiness `READY` 前不加载或显示正式聊天输入，并以显式归属码标识创建前回复；S07C-7 已把普通发言转成可为零的有界原子本人事实提议，并由 Core 逐项校验、去重后入账。旧回复继续逐字可读，但不得支持当前第二自我的判断、共同关系历史或身份修订。S07C-8 冻结反思回应与非自评边界，S07C-9 已完成系统重验收；只有 §9.31 记录的新冻结构建可以从零进入 S32。
+S07C-2 已在 Identity/Vault 边界提供原子首建与四态 `CounterpartReadiness`；S07C-3 已令 Core 的 `send_message` 在身份与 Self Bundle 缺失、版本错位或持久化状态不一致时失败关闭；S07C-4 把当前完整主体状态投影为有界、可审计且模型可替换的 `CounterpartSelfContext`；S07C-5 接通三个宿主创建 command，并把发送门禁前移到检索之前，同时保留 Core 第二层复核；S07C-6 已令 React 在 readiness `READY` 前不加载或显示正式聊天输入，并以显式归属码标识创建前回复；S07C-7 已把普通发言转成可为零的有界原子本人事实提议，并由 Core 逐项校验、去重后入账。旧回复继续逐字可读，但不得支持当前第二自我的判断、共同关系历史或身份修订。S07C-8 冻结反思回应与非自评边界，S07C-9 已完成当时的系统重验收；其构建已被 S12M 作废，只有 S12M-7 重新冻结的构建可以从零进入 S32。
 
 ```text
 WithdrawSharedAgreement(agreement_claim_id, actor, effective_at, reason?)
@@ -2246,4 +2270,4 @@ G10 真实资料和 S32 观察记录只能位于仓库外或 `/.local/`；仓库
 
 S31 本地构建只产生 NSIS 安装包，`createUpdaterArtifacts=false`。安装烟测用不打包、不输出 Recovery Key 的示例仅预置 `bundle.meta`，随后要求安装版 exe 自己创建 `self.db`；“进程仍存活”不再等价于 Vault 已打开。签名升级仍保持 G04 的 HTTPS endpoint + 内嵌公钥门禁；更新包只能在后续签名发布流水线同时提供静态 updater 配置与仓库外私钥时生成，不得为本地验收伪造签名材料。S31 不改变 schema 或领域语义。
 
-S07C-6 初始化页滚动修复后，S31 从构建来源 `74dd8123600f23a03c9e8e8e49507fa20623fa46` 完整重跑 18/18 gate，并冻结 `evrything-about-me_0.1.0_x64-setup.exe`（5,529,536 bytes，SHA-256 `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8`）作为唯一 S32 候选。安装烟测与独立摘要复算通过；更早构建及观察窗口失效，S32 必须在该安装包上从第 1 日重新开始并完成不少于十四个自然日。
+S07C-6 初始化页滚动修复后，S31 曾从构建来源 `74dd8123600f23a03c9e8e8e49507fa20623fa46` 完整重跑 18/18 gate，并冻结 `evrything-about-me_0.1.0_x64-setup.exe`（5,529,536 bytes，SHA-256 `f2dcd23f601d7eb8b98a10e47d6cdadd3fc9a503e89dd93629799f5383c767d8`）。安装烟测与独立摘要复算通过；该构建现因 S12M 范围变更失效，S32 必须等待 S12M-7 的新安装包，再从第 1 日开始不少于十四个自然日的观察。

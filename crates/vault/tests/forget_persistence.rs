@@ -123,6 +123,7 @@ fn forgotten_archive_is_unavailable_to_current_and_historical_retrieval() {
     repository
         .finish_source_reconciliation(root.id(), &[archived.source_record_id()], 30)
         .unwrap();
+    repository.activate_source_root(root.id(), 31).unwrap();
     assert!(matches!(
         process_archived_markdown(
             &mut repository,
