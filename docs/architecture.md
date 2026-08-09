@@ -214,7 +214,7 @@ materialize_accepted_markdown(evidence_id, parser_version)
 
 ### 3.6 模型运行时
 
-本地与远程模型实现同一 Core 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：默认适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格本人事实提议 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。S06D 对 URL 解析后的精确 host `api.deepseek.com` 派生 Chat Completions：发送 `messages` 与 `response_format=json_object`、显式关闭默认思考、从 `choices[0].message.content` 提取正文，再走同一严格领域解析；其他 host 继续使用 Responses。S07C-4 要求普通回应请求携带有界 `CounterpartSelfContext`：当前身份、关系状态、经 Core 解引用并复核证据的活动信念、未完成意图与本轮选中的第二自我经历，同时保留宪法、身份和 Self Bundle 版本；缺失、错位、悬空或超过 64 KiB 预算时请求不会被构造。S07C-5 让唯一活动运行时同时履行 `CounterpartRuntime` 与 `IdentityRuntime`，三个创建 command 在 `ManagedHost` 同一单写锁内借用当前 Repository、运行时和时钟；形成错误只返回固定脱敏类别，运行时档案切换与创建/对话不会混用实例。S07C-7 把普通发言出口改为最多 32 个原子本人事实提议；Core 逐项复核本人归属、当前 Evidence ID、逐字 quote、非空 statement、适用时间和重复事实，同一发言只保存一条对话证据。模型只接收 Core 显式选择的本轮状态与允许的结构化操作，不拥有保险库连接、身份版本链或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v3](runtime-contract-v3.md)。
+本地与远程模型实现同一 Core 严格结构化契约。S06R-1 把固定 endpoint 与模型升级为自有 Base URL 和模型 ID：默认适配器规范化 Base URL 后只追加一个 `/responses`，远程只允许 HTTPS，HTTP 只允许字面环回地址；传输层可持有可选、清零内存中的 Bearer Key，但认证信息不进入目标、请求记录或错误。S06R-2 在 SQLCipher schema v26 中只保存一个运行时档案，并把可信宿主完整读取与 command 脱敏视图分开；读取视图只有 Key 存在状态和安全末四位，1～4 字符短 Key 只返回存在状态，更新必须显式 `KEEP/REPLACE/CLEAR`。S06R-3 让 `ManagedHost` 先打开 Vault、再从完整档案构造唯一活动运行时，删除环境变量与固定 Cloud→Local fallback 配置源；`test_runtime_profile` 只以固定合成证据调用严格本人事实提议 contract，失败压缩为固定类别且不持久化、不切换；`save_runtime_profile` 在同一宿主锁内依次构造候选、提交 Vault、无失败替换 `MemoryCore` 运行时。S06R-4 只在已解锁持续对话页按需调用这三条白名单 command：模态读取时 Key 输入始终为空并只展示存在状态或安全末四位，空白、输入和单独清除确认分别映射 `KEEP/REPLACE/CLEAR`；测试保留草稿且不保存，保存成功清空 Key 输入并采用返回的脱敏视图，失败使用固定脱敏提示并保留草稿，Escape 关闭后焦点回到入口。Vault 直接复用 runtime-gateway 的 Base URL、模型和 Key 校验边界；完整档案随加密 `self.db` 和 Recovery Set 恢复。S06D 对 URL 解析后的精确 host `api.deepseek.com` 派生 Chat Completions：发送 `messages` 与 `response_format=json_object`、显式关闭默认思考、从 `choices[0].message.content` 提取正文，再走同一严格领域解析；其他 host 继续使用 Responses。S07C-4 要求普通回应请求携带有界 `CounterpartSelfContext`：当前身份、关系状态、经 Core 解引用并复核证据的活动信念、未完成意图与本轮选中的第二自我经历，同时保留宪法、身份和 Self Bundle 版本；缺失、错位、悬空或超过 64 KiB 预算时请求不会被构造。S07C-5 让唯一活动运行时同时履行 `CounterpartRuntime` 与 `IdentityRuntime`，三个创建 command 在 `ManagedHost` 同一单写锁内借用当前 Repository、运行时和时钟；形成错误只返回固定脱敏类别，运行时档案切换与创建/对话不会混用实例。S07C-7 把普通发言出口改为最多 32 个原子本人事实提议；Core 逐项复核本人归属、当前 Evidence ID、逐字 quote、非空 statement、适用时间和重复事实，同一发言只保存一条对话证据。S07C-8 冻结普通与高影响回应的任务优先、独立立场、证据/推断分离、可反驳行动和单例反模式边界；输出 schema 不增加自评或人格标签字段，持久解释继续经过既有提议与 Core 门禁。模型只接收 Core 显式选择的本轮状态与允许的结构化操作，不拥有保险库连接、身份版本链或现实行动工具。精确请求、目标矩阵和错误协议见 [G03 Runtime Contract v3](runtime-contract-v3.md)。
 
 ### 3.7 技术职责
 
@@ -695,6 +695,13 @@ ConversationStarted | EvidenceChanged | ScheduledReflection | ImportantChange
   -> invoke_runtime(required identity_state + self_bundle_version,
                     constitution, active_relational_constraints, working_context)
   -> express response in counterpart identity and relationship voice
+       complete the person's current task before reflection unless immediate safety risk
+       choose an independent stance: agree | challenge | provisional interpretation |
+                                     ask for counterevidence | verifiable action
+       distinguish supplied evidence from inference; state material uncertainty
+       keep interpretations revisable and name evidence that could change them
+       never generalize one performance into a pattern or personality label
+       never ask the runtime or another model to score the response
        do not narrate internal status names or fixed disclosure templates
        preserve the meaning of any materially used disagreement
        expand paired positions, sources and uncertainty when person requests details
@@ -1377,7 +1384,7 @@ Self Bundle 保存宪法版本、当前身份版本、第二自我经历引用�
 crates/runtime-gateway/src/
   transport.rs          # Base URL/模型/Key 校验、精确 host 协议选择、endpoint 与无重定向 HTTP
   deepseek.rs           # Chat Completions 请求、JSON Object 提示、关闭思考和 content 提取
-  adapter.rs            # 初始身份/本人事实提议/有界主体回应的双协议编码、严格 schema 与精确外发记录
+  adapter.rs            # 初始身份/本人事实提议/任务优先反思回应的双协议编码、严格 schema 与精确外发记录
   fallback.rs           # 保留的 runtime 组合原语与回归夹具；桌面宿主不再接线固定双档案
 crates/vault/src/
   schema.rs             # v26 单例 runtime_profiles；v27 第二自我回复身份归属
@@ -1413,9 +1420,14 @@ OpenAiResponsesRuntime::propose_person_facts(evidence)
 
 OpenAiResponsesRuntime::respond(RuntimeRequest)
   -> serialize prompt + WorkingContext.evidence only
+  -> require task-first independent stance from identity + evidence
+  -> separate evidence/inference, expose uncertainty and a falsifiable next step
+  -> forbid forced disagreement, therapy-by-default, unsupported reassurance,
+            single-performance patterns/personality labels and runtime self-scoring
   -> adapt and record exact provider request without credentials
   -> extract protocol-specific structured JSON text
-  -> parse free text, citations and propose_judgment
+  -> parse free text, citations and the unchanged structured-operation whitelist
+  -> persistent interpretation may use propose_judgment; free text remains evidence only
   -> preserve unknown operation name for Core rejection
 
 VaultRepository::update_runtime_profile(base_url, model, key_action)
@@ -1443,7 +1455,7 @@ React runtime settings open
   -> save_runtime_profile success clears Key input and refreshes redacted view
 ```
 
-任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra`、Local `gpt-oss-20b` 与 DeepSeek `deepseek-v4-pro` 固定夹具产生等价领域输出；S07C-1 进一步证明 Responses 与 DeepSeek 从同一六类介绍形成等价首个身份提议，并拒绝缺/多字段、提示注入控制字段、冒充本人、放弃反思使命和越界引用。S07C-4 证明两种普通回应后端接收逐字段相同的当前主体状态；悬空信念、版本错位和预算溢出在任何对话副作用前失败关闭，未选择经历与无关个人资料不会进入请求或披露记录。S07C-7 证明两种协议从同一混合发言产生等价的零项或多项原子本人事实提议，未知字段与超过 32 项的响应失败关闭；Core 再独立拒绝错误归属、来源、quote、statement、时间与重复项。只有精确官方 DeepSeek host 选择 Chat Completions；相似 host 与自定义代理不被猜测。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v3](runtime-contract-v3.md)。结构化输出错误仍失败关闭；桌面宿主只认 Vault 单档案，不再读取 `OPENAI_API_KEY` 或 `EAM_*_RESPONSES_ENDPOINT`，也不再接线固定 fallback。schema v26 与 Repository 故障注入证明迁移/更新中断保持旧档案，Recovery Set 测试证明完整 Key 随加密数据库恢复且不出现在原始字节中；桌面集成测试进一步证明测试零副作用、保存失败保留旧运行时、保存后下一请求与重启使用新档案，以及请求中切换不会混用配置。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0025](adr/0025-direct-self-reports-enter-person-ledger.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)、[ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md)、[ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)、[ADR-0054](adr/0054-deepseek-chat-completions-protocol-adapter.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
+任意合法模型 ID 都进入请求与外发记录，原 Cloud `gpt-5.6-terra`、Local `gpt-oss-20b` 与 DeepSeek `deepseek-v4-pro` 固定夹具产生等价领域输出；S07C-1 进一步证明 Responses 与 DeepSeek 从同一六类介绍形成等价首个身份提议，并拒绝缺/多字段、提示注入控制字段、冒充本人、放弃反思使命和越界引用。S07C-4 证明两种普通回应后端接收逐字段相同的当前主体状态；悬空信念、版本错位和预算溢出在任何对话副作用前失败关闭，未选择经历与无关个人资料不会进入请求或披露记录。S07C-7 证明两种协议从同一混合发言产生等价的零项或多项原子本人事实提议，未知字段与超过 32 项的响应失败关闭；Core 再独立拒绝错误归属、来源、quote、statement、时间与重复项。S07C-8 用四个脱敏场景证明普通与高影响回应共享任务优先、独立立场、证据/不确定性和非自评指令，Core 继续拒绝单例模式邀请与未知人格标签操作；固定语言质量只由本人验收。只有精确官方 DeepSeek host 选择 Chat Completions；相似 host 与自定义代理不被猜测。具体传输拒绝非环回 HTTP、URL 凭据/query/fragment 与全部重定向；可选 bearer 只进入最终 header，不进入目标、记录、错误或夹具。完整约束见 [G03 Runtime Contract v3](runtime-contract-v3.md)。结构化输出错误仍失败关闭；桌面宿主只认 Vault 单档案，不再读取 `OPENAI_API_KEY` 或 `EAM_*_RESPONSES_ENDPOINT`，也不再接线固定 fallback。schema v26 与 Repository 故障注入证明迁移/更新中断保持旧档案，Recovery Set 测试证明完整 Key 随加密数据库恢复且不出现在原始字节中；桌面集成测试进一步证明测试零副作用、保存失败保留旧运行时、保存后下一请求与重启使用新档案，以及请求中切换不会混用配置。该实现落实 [ADR-0002](adr/0002-portable-local-self-bundle.md)、[ADR-0004](adr/0004-trusted-core-access-boundary.md)、[ADR-0005](adr/0005-event-driven-presence.md)、[ADR-0025](adr/0025-direct-self-reports-enter-person-ledger.md)、[ADR-0026](adr/0026-retain-every-conversation-turn-as-evidence.md)、[ADR-0039](adr/0039-identity-evolves-autonomously-under-reflective-purpose.md)、[ADR-0040](adr/0040-counterpart-uses-deferrable-reflection-invitations.md)、[ADR-0042](adr/0042-pattern-reflection-requires-three-independent-events.md)、[ADR-0045](adr/0045-minimal-self-introduction-before-counterpart-creation.md)、[ADR-0048](adr/0048-openai-responses-runtime-family.md)、[ADR-0053](adr/0053-vault-backed-configurable-responses-runtime-profile.md)、[ADR-0054](adr/0054-deepseek-chat-completions-protocol-adapter.md) 和 [ADR-0055](adr/0055-formal-conversation-requires-complete-counterpart-state.md)。
 
 ### 9.7 S07 桌面宿主与持续对话当前实现边界
 

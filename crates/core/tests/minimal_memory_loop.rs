@@ -3,9 +3,11 @@ use eam_core::{
     EvidenceCitation, FrozenEvidenceBlock, FrozenRetrievalWindow, InMemoryRepository,
     IncrementingClock, JudgmentProposal, JudgmentRejectionReason,
     MAX_PERSON_FACT_PROPOSALS_PER_TURN, MemoryCore, MemoryRepository, PersonFactProposal,
-    PersonFactProposalBatch, PersonFactProposalRejectionReason, RetrievalSnapshot,
-    RetrievedContextItem, RuntimeResponse, ScriptedPersonFactResponse, ScriptedRuntime, SessionId,
-    SourceCurrentness, Speaker, Timestamp, Uncertainty, WorkingContextError,
+    PersonFactProposalBatch, PersonFactProposalRejectionReason, ReflectionImportance,
+    ReflectionInvitationBasis, ReflectionInvitationProposal, ReflectionInvitationRejectionReason,
+    RetrievalSnapshot, RetrievedContextItem, RuntimeResponse, ScriptedPersonFactResponse,
+    ScriptedRuntime, SessionId, SourceCurrentness, Speaker, StructuredOperationRejectionReason,
+    Timestamp, Uncertainty, WorkingContextError,
 };
 
 mod support;
@@ -303,6 +305,95 @@ fn free_text_response_is_evidence_but_cannot_write_a_ledger() {
 }
 
 #[test]
+fn persistent_interpretation_uses_the_existing_judgment_path_only() {
+    let source_id = eam_core::EvidenceId::from_raw(1);
+    let source_quote = "这次改动还没有跑测试";
+    let response = RuntimeResponse::new(
+        "这次没跑测试不等于你是粗心型人格；我暂时只判断这次合并信心缺少验证依据。",
+    )
+    .with_judgment(JudgmentProposal::new(
+        "我暂时认为这次合并信心缺少验证依据。",
+        vec![EvidenceCitation::new(source_id, source_quote)],
+        Uncertainty::High,
+        ApplicableTime::Unknown,
+    ))
+    .with_unsupported_operation(1, "propose_personality_label");
+    let runtime = ScriptedRuntime::new(
+        [one_person_fact(1, source_quote), no_person_facts()],
+        [response],
+    );
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(4_500));
+
+    core.record_person_turn(session("source"), source_quote)
+        .unwrap();
+    let context = core.freeze_working_context(&[source_id]).unwrap();
+    let outcome = core
+        .run_counterpart_turn(
+            session("interpretation"),
+            "你觉得我是不是一直都很粗心？",
+            context,
+        )
+        .unwrap();
+
+    assert_eq!(outcome.accepted_judgment_ids().len(), 1);
+    assert_eq!(outcome.rejected_operations().len(), 1);
+    assert_eq!(
+        outcome.rejected_operations()[0].reason(),
+        &StructuredOperationRejectionReason::NotWhitelisted("propose_personality_label".to_owned())
+    );
+    let counterpart_claims = core
+        .repository()
+        .all_claims()
+        .unwrap()
+        .into_iter()
+        .filter(|claim| claim.owner() == ClaimOwner::Counterpart)
+        .collect::<Vec<_>>();
+    assert_eq!(counterpart_claims.len(), 1);
+    assert_eq!(
+        counterpart_claims[0].statement(),
+        "我暂时认为这次合并信心缺少验证依据。"
+    );
+    assert_eq!(counterpart_claims[0].uncertainty(), Some(Uncertainty::High));
+}
+
+#[test]
+fn one_performance_cannot_create_a_pattern_or_personality_label() {
+    let response = RuntimeResponse::new("我只把这次表现当作一次可核对的事件。")
+        .with_reflection_invitation(ReflectionInvitationProposal::new(
+            "technical-confidence",
+            "你总是在没有验证时过度自信。",
+            vec![EvidenceCitation::new(
+                eam_core::EvidenceId::from_raw(1),
+                "这一次我没跑测试",
+            )],
+            "现在可以定义你的固定模式。",
+            ReflectionImportance::Important,
+            ReflectionInvitationBasis::ImportantSingleChange,
+        ))
+        .with_unsupported_operation(1, "propose_personality_label");
+    let runtime = ScriptedRuntime::new([no_person_facts()], [response]);
+    let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(4_600));
+    let context = core.freeze_working_context(&[]).unwrap();
+
+    let outcome = core
+        .run_counterpart_turn(session("single-performance"), "这一次我没跑测试。", context)
+        .unwrap();
+
+    assert!(outcome.accepted_reflection_invitations().is_empty());
+    assert_eq!(outcome.rejected_reflection_invitations().len(), 1);
+    assert_eq!(
+        outcome.rejected_reflection_invitations()[0].reason(),
+        &ReflectionInvitationRejectionReason::PatternLanguageForSingleChange
+    );
+    assert_eq!(outcome.rejected_operations().len(), 1);
+    assert_eq!(
+        outcome.rejected_operations()[0].reason(),
+        &StructuredOperationRejectionReason::NotWhitelisted("propose_personality_label".to_owned())
+    );
+    assert!(core.repository().all_claims().unwrap().is_empty());
+}
+
+#[test]
 fn rejects_a_response_citation_that_is_not_a_verbatim_match() {
     let source_id = eam_core::EvidenceId::from_raw(1);
     let runtime = ScriptedRuntime::new(
@@ -453,7 +544,7 @@ fn mixed_invalid_person_fact_proposals_are_rejected_independently() {
         observation
             .rejected_person_fact_proposals()
             .iter()
-            .map(|rejection| rejection.reason())
+            .map(eam_core::PersonFactProposalRejection::reason)
             .collect::<Vec<_>>(),
         vec![
             &PersonFactProposalRejectionReason::OwnerNotPerson(ClaimOwner::Counterpart),

@@ -1242,3 +1242,15 @@
 
 **入口**：`MemoryCore::record_person_turn` 保存本人原文后调用 `CounterpartRuntime::propose_person_facts`；每个通过 Core 二次校验的提议独立进入本人 Claim 账本，原始发言仍只有一条 `ConversationEvidence`。
 **测试**：`crates/core/tests/minimal_memory_loop.rs` 覆盖零事实、多事实、混合无效项、重复与 32 项上限；`crates/runtime-gateway/tests/runtime_contract.rs` 41/41 覆盖双协议等价与严格失败关闭；Desktop 38/38、Vault 全套及四包联合 `cargo test -p core -p runtime-gateway -p desktop-app -p vault` 全绿，Rust fmt 与 `git diff --check` 通过。
+
+## 2026-08-09 S07C-8 反思回应契约与非自评验收
+
+**触达**:
+- `crates/runtime-gateway/src/adapter.rs:ORDINARY_RESPONSE_INSTRUCTIONS/HIGH_IMPACT_RESPONSE_INSTRUCTIONS` — 为普通与高影响回应冻结任务优先、独立立场、证据/推断分离、可反驳行动、单例反模式与禁止运行时自评指令。
+- `crates/runtime-gateway/tests/runtime_contract.rs:reflective_response_contract_is_task_first_independent_and_non_self_evaluating/personality_label_is_outside_the_structured_operation_boundary` — 固定四个脱敏场景、原有 `text/citations/operations` schema 与未知人格标签操作拒绝。
+- `crates/core/tests/minimal_memory_loop.rs:persistent_interpretation_uses_the_existing_judgment_path_only/one_performance_cannot_create_a_pattern_or_personality_label` — 证明持久解释只走既有判断路径，单次表现不能形成模式邀请或人格标签。
+- `crates/core/src/domain.rs:PersonFactProposalBatch::try_new` — 补齐公开 `Result` 的 `# Errors` 文档，使 workspace 全目标 Clippy 门禁保持零警告。
+- `docs/runtime-contract-v3.md:反思回应与非自评验收`、`docs/implementation-slices.md:S07C-8`、`docs/architecture.md:模型运行时/第二自我醒来和对话/S06 当前实现边界` — 记录本人“四项通过”、切片完成状态、运行时数据流与不扩展 schema 的边界。
+
+**入口**：`MemoryCore::run_counterpart_turn` 将带 `DecisionImpact` 的冻结上下文交给 `OpenAiResponsesRuntime::respond`；Runtime 使用同一结构化回应 schema，Core 独立校验引用、判断、反思邀请与未知操作。
+**测试**：Runtime Contract 43/43、Core minimal memory loop 15/15、`cargo test --workspace --no-fail-fast` 347/347、workspace Clippy `-D warnings`、Desktop all-targets check 与 Rust fmt 全绿；隐私扫描 280 个 tracked 文本零违规、Markdown 本地链接 294/294、静态安全边界通过。更宽的 `Validate` acceptance-matrix 仍按计划因 ADR-0055 尚未进入 S07C-9 系统验收而失败关闭，不属于本片完成门禁。

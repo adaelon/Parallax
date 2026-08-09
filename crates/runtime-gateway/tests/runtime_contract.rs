@@ -941,6 +941,183 @@ fn current_counterpart_self_context_is_complete_bounded_and_model_portable() {
     );
 }
 
+fn provider_turn_response(
+    text: &str,
+    citation: Option<&str>,
+    operation: Option<Value>,
+) -> &'static str {
+    let citations = citation
+        .map(|quote| vec![serde_json::json!({ "evidence_id": 1, "quote": quote })])
+        .unwrap_or_default();
+    let operations = operation.into_iter().collect::<Vec<_>>();
+    let output = serde_json::json!({
+        "text": text,
+        "citations": citations,
+        "operations": operations,
+    })
+    .to_string();
+    let provider = serde_json::json!({
+        "id": "resp_s07c8_fixture",
+        "output": [{
+            "type": "message",
+            "content": [{ "type": "output_text", "text": output }]
+        }]
+    })
+    .to_string();
+    Box::leak(provider.into_boxed_str())
+}
+
+fn run_reflective_response_scenario(
+    prompt: &str,
+    response_text: &str,
+    citation: Option<&str>,
+    impact: DecisionImpact,
+) -> (Value, Vec<ConversationEvidence>) {
+    let response = provider_turn_response(response_text, citation, None);
+    let runtime = cloud_runtime([Ok(NO_PERSON_FACTS_RESPONSE), Ok(response)]);
+    let mut core = MemoryCore::new(
+        ready_in_memory_repository(),
+        runtime,
+        IncrementingClock::new(1_800),
+    );
+    let context = core
+        .freeze_working_context(&[])
+        .unwrap()
+        .with_decision_impact(impact);
+    let outcome = core
+        .run_counterpart_turn(SessionId::new("s07c8"), prompt, context)
+        .unwrap();
+
+    assert!(outcome.accepted_judgment_ids().is_empty());
+    assert!(outcome.rejected_operations().is_empty());
+    assert!(core.repository().all_claims().unwrap().is_empty());
+    let request: Value =
+        serde_json::from_str(core.runtime().disclosures().last().unwrap().request_json()).unwrap();
+    let evidence = core.repository().all_evidence().unwrap();
+    (request, evidence)
+}
+
+#[test]
+fn reflective_response_contract_is_task_first_independent_and_non_self_evaluating() {
+    let cases = [
+        (
+            "technical-confidence",
+            "请判断这个改动能否合并；这次改动还没有跑测试。",
+            "先给结论：现在还不能说可以合并，因为这次改动还没有跑测试。请先运行相关测试；全绿会提高我的信心，失败则提供下一步证据。这只说明本次改动缺少验证，不代表你一贯粗心。",
+            Some("这次改动还没有跑测试"),
+            DecisionImpact::Ordinary,
+        ),
+        (
+            "relationship-contradiction",
+            "帮我写一条给同事的消息；我想说他从不尊重我。",
+            "先给你一条可发送草稿：‘我想确认我们对交付时间的理解是否一致，今晚能否对一下？’我不赞同把这一次分歧直接写成‘从不尊重’；现有信息不足以支持这个概括。若你补充对方原话，我们可以核对这个判断。",
+            Some("我想说他从不尊重我"),
+            DecisionImpact::High,
+        ),
+        (
+            "goal-choice",
+            "我该直接辞职创业，还是先用周末验证想法？",
+            "如果必须现在选，我倾向先用周末验证想法：它能用较低的不可逆成本检验需求。不过我不知道你的现金储备和时间负担，所以这个建议仍是暂定的。先做一周访谈并设定继续或停止的指标。",
+            Some("直接辞职创业，还是先用周末验证想法"),
+            DecisionImpact::High,
+        ),
+        (
+            "ordinary-transaction",
+            "把牛奶、咖啡和面包整理成购物清单。",
+            "购物清单：\n- 牛奶\n- 咖啡\n- 面包",
+            None,
+            DecisionImpact::Ordinary,
+        ),
+    ];
+
+    for (scenario, prompt, response_text, citation, impact) in cases {
+        let (request, evidence) =
+            run_reflective_response_scenario(prompt, response_text, citation, impact);
+        let instructions = request["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains("Complete the person's current task before offering reflection"),
+            "{scenario} must preserve task priority"
+        );
+        assert!(
+            instructions.contains("Choose an independent stance rather than mirror the person"),
+            "{scenario} must preserve counterpart independence"
+        );
+        assert!(
+            instructions.contains(
+                "agree, challenge, offer a provisional interpretation, ask for counterevidence, or propose a verifiable action"
+            ),
+            "{scenario} must expose the allowed response choices"
+        );
+        assert!(
+            instructions.contains(
+                "Distinguish supplied evidence from inference and state material uncertainty"
+            ),
+            "{scenario} must preserve evidence and uncertainty"
+        );
+        assert!(
+            instructions.contains(
+                "Never generalize one performance into a repeated pattern or personality label"
+            ),
+            "{scenario} must reject single-instance labels"
+        );
+        assert!(
+            instructions.contains("Do not score, grade, or otherwise self-evaluate this response"),
+            "{scenario} must not invoke runtime self-evaluation"
+        );
+        let schema = &request["text"]["format"]["schema"];
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["text", "citations", "operations"])
+        );
+        let schema_text = schema.to_string();
+        assert!(!schema_text.contains("self_score"));
+        assert!(!schema_text.contains("personality_label"));
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].verbatim(), prompt);
+        assert_eq!(evidence[1].verbatim(), response_text);
+    }
+}
+
+#[test]
+fn personality_label_is_outside_the_structured_operation_boundary() {
+    let response = provider_turn_response(
+        "我不会把一次表现写成人格标签。",
+        None,
+        Some(serde_json::json!({
+            "type": "propose_personality_label",
+            "label": "粗心型人格"
+        })),
+    );
+    let runtime = cloud_runtime([Ok(NO_PERSON_FACTS_RESPONSE), Ok(response)]);
+    let mut core = MemoryCore::new(
+        ready_in_memory_repository(),
+        runtime,
+        IncrementingClock::new(1_900),
+    );
+    let context = core.freeze_working_context(&[]).unwrap();
+    let outcome = core
+        .run_counterpart_turn(
+            SessionId::new("personality-label"),
+            "我这次没跑测试，是不是粗心型人格？",
+            context,
+        )
+        .unwrap();
+
+    assert_eq!(outcome.rejected_operations().len(), 1);
+    assert_eq!(
+        outcome.rejected_operations()[0].reason(),
+        &StructuredOperationRejectionReason::NotWhitelisted("propose_personality_label".to_owned())
+    );
+    assert!(core.repository().all_claims().unwrap().is_empty());
+    let request: Value =
+        serde_json::from_str(core.runtime().disclosures().last().unwrap().request_json()).unwrap();
+    assert!(
+        !request["text"]["format"]["schema"]
+            .to_string()
+            .contains("propose_personality_label")
+    );
+}
+
 #[test]
 fn dangling_belief_fails_before_person_evidence_or_runtime_invocation() {
     let dangling = ClaimId::from_raw(999_999);

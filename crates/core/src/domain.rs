@@ -1669,6 +1669,12 @@ impl PersonFactProposalBatch {
         }
     }
 
+    /// Collects one bounded batch of atomic person-fact proposals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersonFactProposalBatchLimitError`] when the input contains
+    /// more than [`MAX_PERSON_FACT_PROPOSALS_PER_TURN`] proposals.
     pub fn try_new(
         proposals: impl IntoIterator<Item = PersonFactProposal>,
     ) -> Result<Self, PersonFactProposalBatchLimitError> {
