@@ -1,0 +1,14 @@
+{
+  "id": "resp_person_facts_fixture",
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"fact_proposals\":[{\"owner\":\"person\",\"statement\":\"我叫小林\",\"citation\":{\"evidence_id\":1,\"quote\":\"我叫小林\"},\"applicable_time\":{\"kind\":\"unknown\"}},{\"owner\":\"person\",\"statement\":\"我从 2024 年开始住在香港\",\"citation\":{\"evidence_id\":1,\"quote\":\"我从 2024 年开始住在香港\"},\"applicable_time\":{\"kind\":\"since\",\"since_millis\":1704067200000}}]}"
+        }
+      ]
+    }
+  ]
+}

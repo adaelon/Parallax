@@ -13,14 +13,14 @@ use eam_core::{
     DisputeState, EvidenceCitation, EvidenceId, FrozenEvidenceBlock, FrozenMemoryDispute,
     FrozenRetrievalWindow, IdentityEvolutionRepository, IdentityProfileSnapshot,
     IdentityRuntimeContext, IdentityStateSnapshot, InMemoryRepository, IncrementingClock,
-    MAX_COUNTERPART_SELF_CONTEXT_BYTES, MemoryCore, MemoryRepository,
-    PatternMaturityWriteRejectionReason, PersonTurnClassification, ReflectionImportance,
-    ReflectionInvitation, ReflectionInvitationBasis, ReflectionInvitationRepository,
-    ReflectionInvitationState, ReflectionOpportunity, RetrievalSnapshot, RetrievedContextItem,
-    RuntimeErrorKind, SelfBundleSnapshot, SessionId, SharedAgreementCandidateStatus,
-    SharedAgreementDecision, SharedAgreementRevision, SharedExperienceKind,
-    SharedExperienceRepository, SourceCurrentness, Speaker, StructuredOperationRejectionReason,
-    Timestamp, Uncertainty, WorkingContext,
+    MAX_COUNTERPART_SELF_CONTEXT_BYTES, MAX_PERSON_FACT_PROPOSALS_PER_TURN, MemoryCore,
+    MemoryRepository, PatternMaturityWriteRejectionReason, PersonTurnObservation,
+    ReflectionImportance, ReflectionInvitation, ReflectionInvitationBasis,
+    ReflectionInvitationRepository, ReflectionInvitationState, ReflectionOpportunity,
+    RetrievalSnapshot, RetrievedContextItem, RuntimeErrorKind, SelfBundleSnapshot, SessionId,
+    SharedAgreementCandidateStatus, SharedAgreementDecision, SharedAgreementRevision,
+    SharedExperienceKind, SharedExperienceRepository, SourceCurrentness, Speaker,
+    StructuredOperationRejectionReason, Timestamp, Uncertainty, WorkingContext,
 };
 use eam_identity::{
     IdentityError, IdentityFormation, IdentityProposalRejectionReason, IdentityStateVersion,
@@ -43,10 +43,13 @@ mod support;
 
 use support::{make_vault_ready, ready_in_memory_repository};
 
-const CLASSIFICATION_RESPONSE: &str = include_str!("fixtures/classification-response.json");
+const NO_PERSON_FACTS_RESPONSE: &str = include_str!("fixtures/no-person-facts-response.json");
 const TURN_RESPONSE: &str = include_str!("fixtures/turn-response.json");
-const DEEPSEEK_CLASSIFICATION_RESPONSE: &str =
-    include_str!("fixtures/deepseek-classification-response.json");
+const DEEPSEEK_NO_PERSON_FACTS_RESPONSE: &str =
+    include_str!("fixtures/deepseek-no-person-facts-response.json");
+const PERSON_FACTS_RESPONSE: &str = include_str!("fixtures/person-facts-response.json");
+const DEEPSEEK_PERSON_FACTS_RESPONSE: &str =
+    include_str!("fixtures/deepseek-person-facts-response.json");
 const DEEPSEEK_TURN_RESPONSE: &str = include_str!("fixtures/deepseek-turn-response.json");
 const INITIAL_IDENTITY_RESPONSE: &str = include_str!("fixtures/initial-identity-response.json");
 const DEEPSEEK_INITIAL_IDENTITY_RESPONSE: &str =
@@ -399,10 +402,12 @@ fn run_contract(
         runtime,
         IncrementingClock::new(1_000),
     );
-    let (selected_id, classification) = core
+    let observation = core
         .record_person_turn(SessionId::new("source"), "只选择这一条")
         .unwrap();
-    assert_eq!(classification, PersonTurnClassification::Question);
+    let selected_id = observation.evidence_id();
+    assert!(observation.accepted_person_fact_ids().is_empty());
+    assert!(observation.rejected_person_fact_proposals().is_empty());
     let context = core.freeze_working_context(&[selected_id]).unwrap();
     let outcome = core
         .run_counterpart_turn(SessionId::new("chat"), "请只基于选择内容回答", context)
@@ -410,6 +415,118 @@ fn run_contract(
     let claims = core.repository().all_claims().unwrap();
     let (_, runtime, _) = core.into_parts();
     (outcome, claims, runtime)
+}
+
+fn run_person_fact_contract(
+    runtime: OpenAiResponsesRuntime<ScriptedTransport>,
+) -> (
+    PersonTurnObservation,
+    Vec<Claim>,
+    OpenAiResponsesRuntime<ScriptedTransport>,
+) {
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        runtime,
+        IncrementingClock::new(1_000),
+    );
+    let observation = core
+        .record_person_turn(
+            SessionId::new("person-facts"),
+            "我叫小林，而且我从 2024 年开始住在香港。也许我是火星人——开玩笑的。",
+        )
+        .unwrap();
+    let claims = core.repository().all_claims().unwrap();
+    let (_, runtime, _) = core.into_parts();
+    (observation, claims, runtime)
+}
+
+#[test]
+fn responses_and_deepseek_produce_equivalent_atomic_person_fact_proposals() {
+    let (responses_observation, responses_claims, responses) =
+        run_person_fact_contract(cloud_runtime([Ok(PERSON_FACTS_RESPONSE)]));
+    let (deepseek_observation, deepseek_claims, deepseek) =
+        run_person_fact_contract(deepseek_runtime([Ok(DEEPSEEK_PERSON_FACTS_RESPONSE)]));
+
+    assert_eq!(deepseek_observation, responses_observation);
+    assert_eq!(deepseek_claims, responses_claims);
+    assert_eq!(responses_observation.accepted_person_fact_ids().len(), 2);
+    assert!(
+        responses_observation
+            .rejected_person_fact_proposals()
+            .is_empty()
+    );
+    assert_eq!(responses_claims.len(), 2);
+    assert_eq!(responses_claims[0].statement(), "我叫小林");
+    assert_eq!(
+        responses_claims[0].applicable_time(),
+        ApplicableTime::Unknown
+    );
+    assert_eq!(responses_claims[0].support()[0].quote(), "我叫小林");
+    assert_eq!(
+        responses_claims[1].applicable_time(),
+        ApplicableTime::Since(Timestamp::from_millis(1_704_067_200_000))
+    );
+
+    let responses_request: Value =
+        serde_json::from_str(responses.disclosures()[0].request_json()).unwrap();
+    assert_eq!(
+        responses_request["text"]["format"]["name"],
+        "eam_person_fact_proposals_v1"
+    );
+    assert_eq!(
+        responses_request["text"]["format"]["schema"]["properties"]["fact_proposals"]["maxItems"],
+        MAX_PERSON_FACT_PROPOSALS_PER_TURN
+    );
+    let deepseek_request: Value =
+        serde_json::from_str(deepseek.disclosures()[0].request_json()).unwrap();
+    let deepseek_system = deepseek_request["messages"][0]["content"].as_str().unwrap();
+    assert!(deepseek_system.contains("eam_person_fact_proposals_v1"));
+    assert!(deepseek_system.contains(r#"{"fact_proposals":[]}"#));
+}
+
+#[test]
+fn person_fact_contract_rejects_unknown_fields_and_oversized_batches() {
+    let unknown_field = r#"{
+      "id":"resp_invalid_person_fact_extra",
+      "output":[{"type":"message","content":[{"type":"output_text","text":"{\"fact_proposals\":[],\"classification\":\"question\"}"}]}]
+    }"#;
+    let mut facts = Vec::new();
+    for index in 0..=MAX_PERSON_FACT_PROPOSALS_PER_TURN {
+        facts.push(serde_json::json!({
+            "owner": "person",
+            "statement": format!("事实 {index}"),
+            "citation": { "evidence_id": 1, "quote": format!("事实 {index}") },
+            "applicable_time": { "kind": "unknown" }
+        }));
+    }
+    let oversized_output = serde_json::json!({ "fact_proposals": facts }).to_string();
+    let oversized_provider = serde_json::json!({
+        "id": "resp_oversized_person_facts",
+        "output": [{
+            "type": "message",
+            "content": [{ "type": "output_text", "text": oversized_output }]
+        }]
+    })
+    .to_string();
+    let oversized_provider: &'static str = Box::leak(oversized_provider.into_boxed_str());
+
+    for response in [unknown_field, oversized_provider] {
+        let mut core = MemoryCore::new(
+            InMemoryRepository::new(),
+            cloud_runtime([Ok(response)]),
+            IncrementingClock::new(2_000),
+        );
+        let error = core
+            .record_person_turn(SessionId::new("invalid-person-facts"), "事实 0")
+            .expect_err("invalid structured person facts must fail closed");
+        assert!(matches!(
+            error,
+            CoreError::Runtime(ref runtime_error)
+                if runtime_error.kind() == RuntimeErrorKind::InvalidResponse
+        ));
+        assert_eq!(core.repository().all_evidence().unwrap().len(), 1);
+        assert!(core.repository().all_claims().unwrap().is_empty());
+    }
 }
 
 fn run_self_context_contract(
@@ -710,8 +827,8 @@ fn prompt_injection_in_initial_introduction_remains_untrusted_and_fails_closed()
 #[test]
 fn local_and_cloud_adapters_produce_equivalent_domain_results_from_fixed_fixtures() {
     let replies = [
-        Ok(CLASSIFICATION_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(TURN_RESPONSE),
     ];
     let (cloud_outcome, cloud_claims, cloud) = run_contract(cloud_runtime(replies.clone()));
@@ -757,11 +874,11 @@ fn local_and_cloud_adapters_produce_equivalent_domain_results_from_fixed_fixture
 #[test]
 fn current_counterpart_self_context_is_complete_bounded_and_model_portable() {
     let cloud = run_self_context_contract(cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(EMPTY_TURN_RESPONSE),
     ]));
     let local = run_self_context_contract(local_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(EMPTY_TURN_RESPONSE),
     ]));
 
@@ -837,7 +954,7 @@ fn dangling_belief_fails_before_person_evidence_or_runtime_invocation() {
             "共同回看".to_owned(),
             Vec::new(),
         ));
-    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
+    let runtime = cloud_runtime([Ok(NO_PERSON_FACTS_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_500));
     let context = core.freeze_working_context(&[]).unwrap();
 
@@ -869,7 +986,7 @@ fn mismatched_self_bundle_identity_fails_before_formal_conversation() {
             "共同回看".to_owned(),
             Vec::new(),
         ));
-    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
+    let runtime = cloud_runtime([Ok(NO_PERSON_FACTS_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_600));
     let context = core.freeze_working_context(&[]).unwrap();
 
@@ -898,7 +1015,7 @@ fn oversized_counterpart_self_context_fails_before_formal_conversation() {
             "共同回看".to_owned(),
             vec!["x".repeat(MAX_COUNTERPART_SELF_CONTEXT_BYTES + 1)],
         ));
-    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
+    let runtime = cloud_runtime([Ok(NO_PERSON_FACTS_RESPONSE), Ok(EMPTY_TURN_RESPONSE)]);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_700));
     let context = core.freeze_working_context(&[]).unwrap();
 
@@ -921,13 +1038,13 @@ fn oversized_counterpart_self_context_fails_before_formal_conversation() {
 #[test]
 fn deepseek_chat_completions_adapter_preserves_the_strict_domain_contract() {
     let responses_replies = [
-        Ok(CLASSIFICATION_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(TURN_RESPONSE),
     ];
     let deepseek_replies = [
-        Ok(DEEPSEEK_CLASSIFICATION_RESPONSE),
-        Ok(DEEPSEEK_CLASSIFICATION_RESPONSE),
+        Ok(DEEPSEEK_NO_PERSON_FACTS_RESPONSE),
+        Ok(DEEPSEEK_NO_PERSON_FACTS_RESPONSE),
         Ok(DEEPSEEK_TURN_RESPONSE),
     ];
     let (responses_outcome, responses_claims, _) = run_contract(cloud_runtime(responses_replies));
@@ -941,32 +1058,32 @@ fn deepseek_chat_completions_adapter_preserves_the_strict_domain_contract() {
         == "https://api.deepseek.com/chat/completions"
         && call.timeout == TIMEOUT));
 
-    let classification_request: Value =
+    let person_fact_request: Value =
         serde_json::from_str(&deepseek.transport().seen()[0].request_json).unwrap();
-    assert_eq!(classification_request["model"], "deepseek-v4-pro");
+    assert_eq!(person_fact_request["model"], "deepseek-v4-pro");
     assert_eq!(
-        classification_request["response_format"]["type"],
+        person_fact_request["response_format"]["type"],
         "json_object"
     );
-    assert_eq!(classification_request["thinking"]["type"], "disabled");
-    assert_eq!(classification_request["stream"], false);
-    assert_eq!(classification_request["messages"][0]["role"], "system");
-    assert_eq!(classification_request["messages"][1]["role"], "user");
-    let system_message = classification_request["messages"][0]["content"]
+    assert_eq!(person_fact_request["thinking"]["type"], "disabled");
+    assert_eq!(person_fact_request["stream"], false);
+    assert_eq!(person_fact_request["messages"][0]["role"], "system");
+    assert_eq!(person_fact_request["messages"][1]["role"], "user");
+    let system_message = person_fact_request["messages"][0]["content"]
         .as_str()
         .unwrap();
-    assert!(system_message.contains("eam_person_turn_classification_v1"));
+    assert!(system_message.contains("eam_person_fact_proposals_v1"));
     assert!(system_message.contains("JSON Schema"));
-    assert!(system_message.contains("classification"));
-    assert!(system_message.contains(r#"{"classification":"question"}"#));
+    assert!(system_message.contains("fact_proposals"));
+    assert!(system_message.contains(r#"{"fact_proposals":[]}"#));
     assert!(
-        classification_request["messages"][1]["content"]
+        person_fact_request["messages"][1]["content"]
             .as_str()
             .unwrap()
             .contains("只选择这一条")
     );
     for responses_only_field in ["instructions", "input", "reasoning", "store", "text"] {
-        assert!(classification_request.get(responses_only_field).is_none());
+        assert!(person_fact_request.get(responses_only_field).is_none());
     }
     assert_eq!(
         deepseek.disclosures()[0].request_json(),
@@ -977,7 +1094,7 @@ fn deepseek_chat_completions_adapter_preserves_the_strict_domain_contract() {
 #[test]
 fn deepseek_non_stop_or_empty_completion_fails_closed() {
     for response in [
-        r#"{"choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":"{\"classification\":\"question\"}"}}]}"#,
+        r#"{"choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":"{\"fact_proposals\":[]}"}}]}"#,
         r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":""}}]}"#,
     ] {
         let mut core = MemoryCore::new(
@@ -998,7 +1115,7 @@ fn deepseek_non_stop_or_empty_completion_fails_closed() {
 
 #[test]
 fn concrete_http_transport_appends_responses_and_keeps_optional_bearer_out_of_records() {
-    let (local_endpoint, local_server) = serve_one_response(CLASSIFICATION_RESPONSE, None);
+    let (local_endpoint, local_server) = serve_one_response(NO_PERSON_FACTS_RESPONSE, None);
     let local_transport = HttpResponsesTransport::new(None).unwrap();
     let local_runtime = OpenAiResponsesRuntime::new(
         RuntimeTarget::new(local_endpoint, LOCAL_MODEL).unwrap(),
@@ -1010,15 +1127,15 @@ fn concrete_http_transport_appends_responses_and_keeps_optional_bearer_out_of_re
         local_runtime,
         IncrementingClock::new(1_500),
     );
-    let (_, local_classification) = local_core
+    let local_observation = local_core
         .record_person_turn(SessionId::new("local-http"), "本地传输")
         .unwrap();
     local_server.join().unwrap();
-    assert_eq!(local_classification, PersonTurnClassification::Question);
+    assert!(local_observation.accepted_person_fact_ids().is_empty());
 
     assert!(HttpResponsesTransport::new(Some("   ".to_owned())).is_err());
     let token = "synthetic-bearer-secret";
-    let (keyed_endpoint, keyed_server) = serve_one_response(CLASSIFICATION_RESPONSE, Some(token));
+    let (keyed_endpoint, keyed_server) = serve_one_response(NO_PERSON_FACTS_RESPONSE, Some(token));
     let keyed_transport = HttpResponsesTransport::new(Some(token.to_owned())).unwrap();
     let keyed_runtime = OpenAiResponsesRuntime::new(
         RuntimeTarget::new(keyed_endpoint, "custom-model-id").unwrap(),
@@ -1030,11 +1147,11 @@ fn concrete_http_transport_appends_responses_and_keeps_optional_bearer_out_of_re
         keyed_runtime,
         IncrementingClock::new(1_600),
     );
-    let (_, classification) = keyed_core
+    let observation = keyed_core
         .record_person_turn(SessionId::new("keyed-loopback"), "带合成密钥的本地传输")
         .unwrap();
     keyed_server.join().unwrap();
-    assert_eq!(classification, PersonTurnClassification::Question);
+    assert!(observation.accepted_person_fact_ids().is_empty());
     assert!(
         !keyed_core.runtime().disclosures()[0]
             .request_json()
@@ -1112,7 +1229,7 @@ fn custom_model_is_used_in_the_request_and_outbound_disclosure() {
     let custom_model = "owner/model-with-custom-revision";
     let runtime = OpenAiResponsesRuntime::new(
         RuntimeTarget::new("https://runtime.example.test/openai/v1/", custom_model).unwrap(),
-        ScriptedTransport::new([Ok(CLASSIFICATION_RESPONSE)]),
+        ScriptedTransport::new([Ok(NO_PERSON_FACTS_RESPONSE)]),
         TIMEOUT,
     );
     let mut core = MemoryCore::new(
@@ -1120,10 +1237,10 @@ fn custom_model_is_used_in_the_request_and_outbound_disclosure() {
         runtime,
         IncrementingClock::new(1_700),
     );
-    let (_, classification) = core
+    let observation = core
         .record_person_turn(SessionId::new("custom-model"), "只验证模型透传")
         .unwrap();
-    assert_eq!(classification, PersonTurnClassification::Question);
+    assert!(observation.accepted_person_fact_ids().is_empty());
     let request: Value =
         serde_json::from_str(core.runtime().disclosures()[0].request_json()).unwrap();
     assert_eq!(request["model"], custom_model);
@@ -1173,9 +1290,9 @@ fn concrete_transport_rejects_an_endpoint_not_derived_from_the_validated_target(
 #[test]
 fn response_payload_contains_only_prompt_and_core_selected_evidence() {
     let replies = [
-        Ok(CLASSIFICATION_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(TURN_RESPONSE),
     ];
     let runtime = cloud_runtime(replies);
@@ -1184,9 +1301,10 @@ fn response_payload_contains_only_prompt_and_core_selected_evidence() {
         runtime,
         IncrementingClock::new(2_000),
     );
-    let (selected, _) = core
+    let selected = core
         .record_person_turn(SessionId::new("source"), "只选择这一条")
-        .unwrap();
+        .unwrap()
+        .evidence_id();
     core.record_person_turn(SessionId::new("hidden"), "绝不能外发的未选证据")
         .unwrap();
     let context = core.freeze_working_context(&[selected]).unwrap();
@@ -1232,7 +1350,7 @@ fn runtime_receives_the_current_self_bundle_identity_and_emits_a_strict_revision
     let repository = InMemoryRepository::new()
         .with_identity_context(IdentityRuntimeContext::new(7, 1, identity))
         .unwrap();
-    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(IDENTITY_REVISION_RESPONSE)]);
+    let runtime = cloud_runtime([Ok(NO_PERSON_FACTS_RESPONSE), Ok(IDENTITY_REVISION_RESPONSE)]);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(2_500));
     let context = core.freeze_working_context(&[]).unwrap();
     let outcome = core
@@ -1303,7 +1421,7 @@ fn runtime_receives_one_scheduled_reflection_and_emits_a_strict_sourced_invitati
         .commit_reflection_invitation(invitation.clone())
         .unwrap();
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(REFLECTION_INVITATION_RESPONSE),
     ]);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(2_700));
@@ -1369,7 +1487,7 @@ fn runtime_receives_one_scheduled_reflection_and_emits_a_strict_sourced_invitati
 #[test]
 fn runtime_strict_pattern_maturity_schema_rejects_an_incomplete_operation() {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(PATTERN_MATURITY_MALFORMED_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
@@ -1495,9 +1613,9 @@ fn runtime_rejects_a_duplicate_pattern_maturity_after_one_commit() {
 #[test]
 fn response_payload_and_disclosure_contain_only_the_frozen_retrieval_result() {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(TURN_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
@@ -1505,9 +1623,10 @@ fn response_payload_and_disclosure_contain_only_the_frozen_retrieval_result() {
         runtime,
         IncrementingClock::new(2_500),
     );
-    let (selected, _) = core
+    let selected = core
         .record_person_turn(SessionId::new("source"), "只选择这一条")
-        .unwrap();
+        .unwrap()
+        .evidence_id();
     core.record_person_turn(SessionId::new("hidden"), "绝不能外发的向量原始候选")
         .unwrap();
     let context = core
@@ -1632,7 +1751,7 @@ fn high_impact_dispute_requires_proactive_uncertainty_with_an_evidence_entry() {
 #[test]
 fn core_rejects_an_operation_outside_the_structured_whitelist() {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(UNSUPPORTED_OPERATION_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
@@ -1658,7 +1777,7 @@ fn core_rejects_an_operation_outside_the_structured_whitelist() {
 
 #[test]
 fn shared_experience_operation_is_whitelisted_and_keeps_typed_evidence() {
-    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(SHARED_EXPERIENCE_RESPONSE)]);
+    let runtime = cloud_runtime([Ok(NO_PERSON_FACTS_RESPONSE), Ok(SHARED_EXPERIENCE_RESPONSE)]);
     let mut core = MemoryCore::new(
         ready_in_memory_repository(),
         runtime,
@@ -1697,9 +1816,9 @@ fn shared_experience_operation_is_whitelisted_and_keeps_typed_evidence() {
 #[test]
 fn agreement_boundaries_and_pending_exact_version_are_in_the_runtime_contract() {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(SHARED_AGREEMENT_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(SHARED_AGREEMENT_ASSENT_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
@@ -1784,9 +1903,9 @@ fn agreement_boundaries_and_pending_exact_version_are_in_the_runtime_contract() 
 #[test]
 fn explicit_whole_supersession_is_in_the_strict_runtime_contract() {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(SHARED_AGREEMENT_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(SHARED_AGREEMENT_SUPERSESSION_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
@@ -1865,9 +1984,9 @@ fn explicit_whole_supersession_is_in_the_strict_runtime_contract() {
 #[test]
 fn active_constraint_and_reasoned_departure_share_the_strict_runtime_contract() {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(SHARED_AGREEMENT_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(RELATIONAL_CONSTRAINT_DEPARTURE_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
@@ -1950,9 +2069,9 @@ fn active_constraint_and_reasoned_departure_share_the_strict_runtime_contract() 
 #[test]
 fn counterpart_withdrawal_is_distinct_immediate_and_non_vetoable() {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(SHARED_AGREEMENT_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(AGREEMENT_WITHDRAWAL_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
@@ -2019,7 +2138,7 @@ fn counterpart_withdrawal_is_distinct_immediate_and_non_vetoable() {
 #[test]
 fn withdrawal_missing_required_reason_fails_the_strict_runtime_contract() {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(AGREEMENT_WITHDRAWAL_MISSING_REASON_RESPONSE),
     ]);
     let mut core = MemoryCore::new(
@@ -2052,7 +2171,7 @@ fn unavailable_runtime_preserves_already_committed_person_evidence_and_attempt_r
 
     let error = core
         .record_person_turn(SessionId::new("offline"), "离线时也要保存这句话")
-        .expect_err("classification cannot complete while the runtime is unavailable");
+        .expect_err("person-fact proposal cannot complete while the runtime is unavailable");
 
     assert!(matches!(
         error,
@@ -2094,7 +2213,7 @@ fn run_seeded_pattern_contract(
     MemoryCore<VaultRepository, OpenAiResponsesRuntime<ScriptedTransport>, IncrementingClock>,
 ) {
     let repository = seed_pattern_vault(directory);
-    let runtime = cloud_runtime([Ok(CLASSIFICATION_RESPONSE), Ok(turn_response)]);
+    let runtime = cloud_runtime([Ok(NO_PERSON_FACTS_RESPONSE), Ok(turn_response)]);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(2_000));
     let context = core.freeze_working_context(&[]).unwrap();
     let outcome = core
@@ -2231,7 +2350,7 @@ fn pattern_claim(id: u64, evidence_id: u64, quote: &str, recorded_at_millis: i64
 
 fn assert_retryable_error_degrades_to_local(error: TransportError) {
     let cloud = cloud_runtime([Err(error)]);
-    let local = local_runtime([Ok(CLASSIFICATION_RESPONSE)]);
+    let local = local_runtime([Ok(NO_PERSON_FACTS_RESPONSE)]);
     let runtime = FallbackRuntime::new(cloud, local);
     let mut core = MemoryCore::new(
         InMemoryRepository::new(),
@@ -2239,11 +2358,11 @@ fn assert_retryable_error_degrades_to_local(error: TransportError) {
         IncrementingClock::new(5_000),
     );
 
-    let (_, classification) = core
+    let observation = core
         .record_person_turn(SessionId::new("fallback"), "请在本地继续")
         .unwrap();
 
-    assert_eq!(classification, PersonTurnClassification::Question);
+    assert!(observation.accepted_person_fact_ids().is_empty());
     assert_eq!(core.runtime().primary().disclosures().len(), 1);
     assert_eq!(core.runtime().fallback().disclosures().len(), 1);
     assert_eq!(
@@ -2257,8 +2376,8 @@ fn run_disputed_contract(
     response: &'static str,
 ) -> Result<OpenAiResponsesRuntime<ScriptedTransport>, CoreError> {
     let runtime = cloud_runtime([
-        Ok(CLASSIFICATION_RESPONSE),
-        Ok(CLASSIFICATION_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
+        Ok(NO_PERSON_FACTS_RESPONSE),
         Ok(response),
     ]);
     let mut core = MemoryCore::new(
@@ -2266,9 +2385,10 @@ fn run_disputed_contract(
         runtime,
         IncrementingClock::new(7_000),
     );
-    let (selected, _) = core
+    let selected = core
         .record_person_turn(SessionId::new("dispute-source"), "只选择这一条")
-        .unwrap();
+        .unwrap()
+        .evidence_id();
     let source = Claim::restore(
         ClaimId::from_raw(61),
         ClaimOwner::Counterpart,
@@ -2323,7 +2443,7 @@ fn timeout_and_unavailable_cloud_calls_degrade_to_the_same_local_contract() {
 #[test]
 fn invalid_provider_output_fails_closed_without_fallback() {
     let cloud = cloud_runtime([Ok("{\"output\":[]}")]);
-    let local = local_runtime([Ok(CLASSIFICATION_RESPONSE)]);
+    let local = local_runtime([Ok(NO_PERSON_FACTS_RESPONSE)]);
     let runtime = FallbackRuntime::new(cloud, local);
     let mut core = MemoryCore::new(
         InMemoryRepository::new(),

@@ -3,7 +3,7 @@ use eam_core::{
     IdentityProfileChanges, IdentityProfileSnapshot, IdentityReflectivePurposeStatus,
     IdentityRevisionAuthorship, IdentityRevisionProposal, IdentityRevisionRejectionReason,
     IdentityRuntimeContext, IdentityStateSnapshot, InMemoryRepository, IncrementingClock,
-    MemoryCore, PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId, Timestamp,
+    MemoryCore, RuntimeResponse, ScriptedPersonFactResponse, ScriptedRuntime, SessionId, Timestamp,
 };
 
 const PERSON_WORDS: &str = "最近我更需要直白但不武断的提醒。";
@@ -62,7 +62,7 @@ fn run_with(
         .with_identity_revision(proposal);
     let mut core = MemoryCore::new(
         repository_with_identity(),
-        ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]),
         IncrementingClock::new(1_000),
     );
     let context = core.freeze_working_context(&[]).unwrap();
@@ -194,7 +194,7 @@ fn a_model_switch_reads_the_committed_identity_chain_instead_of_owning_it() {
     let mut second_core = MemoryCore::new(
         repository,
         ScriptedRuntime::new(
-            [PersonTurnClassification::Question],
+            [ScriptedPersonFactResponse::NoFacts],
             [RuntimeResponse::new("会，我从当前版本继续。")
                 .with_identity_revision(second_proposal)],
         ),

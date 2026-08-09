@@ -1,5 +1,5 @@
 {
-  "id": "chatcmpl_deepseek_classification_fixture",
+  "id": "chatcmpl_deepseek_no_person_facts_fixture",
   "object": "chat.completion",
   "model": "deepseek-v4-pro",
   "choices": [
@@ -9,7 +9,7 @@
       "message": {
         "role": "assistant",
         "reasoning_content": null,
-        "content": "{\"classification\":\"question\"}"
+        "content": "{\"fact_proposals\":[]}"
       }
     }
   ]

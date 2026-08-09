@@ -1,12 +1,12 @@
 use eam_core::{
     CoreError, ForgetRequest, ForgetTarget, InMemoryRepository, IncrementingClock, MemoryCore,
-    MemoryRepository, PersonTurnClassification, ScriptedRuntime, SessionId,
+    MemoryRepository, ScriptedPersonFactResponse, ScriptedRuntime, SessionId,
 };
 
 fn core_with_person_fact() -> MemoryCore<InMemoryRepository, ScriptedRuntime, IncrementingClock> {
     let mut core = MemoryCore::new(
         InMemoryRepository::new(),
-        ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::VerbatimFactAtRecordedTime], []),
         IncrementingClock::new(1_000),
     );
     core.record_person_turn(SessionId::new("forget"), "我住在深圳。")

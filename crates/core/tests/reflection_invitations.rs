@@ -1,10 +1,10 @@
 use eam_core::{
     EvidenceCitation, EvidenceId, ForgetRepository, ForgetTarget, G08_IMMEDIATE_SAFETY_QUOTE,
-    IncrementingClock, MemoryCore, PersonTurnClassification, REFLECTION_DEFER_MILLIS,
-    ReflectionDecision, ReflectionDelivery, ReflectionImportance, ReflectionInvitation,
-    ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationProposal,
-    ReflectionInvitationRejectionReason, ReflectionInvitationRepository, ReflectionInvitationState,
-    ReflectionOpportunity, ReflectionRuntimeDisposition, RuntimeResponse, ScriptedRuntime,
+    IncrementingClock, MemoryCore, REFLECTION_DEFER_MILLIS, ReflectionDecision, ReflectionDelivery,
+    ReflectionImportance, ReflectionInvitation, ReflectionInvitationBasis, ReflectionInvitationId,
+    ReflectionInvitationProposal, ReflectionInvitationRejectionReason,
+    ReflectionInvitationRepository, ReflectionInvitationState, ReflectionOpportunity,
+    ReflectionRuntimeDisposition, RuntimeResponse, ScriptedPersonFactResponse, ScriptedRuntime,
     SessionId, Timestamp, decide_reflection_invitation, offer_reflection_invitation,
     reflection_delivery,
 };
@@ -117,7 +117,13 @@ fn ordinary_invitation_queues_on_unrelated_work_then_offers_on_related_topic() {
     let first = RuntimeResponse::new("我先回答当前问题。")
         .with_reflection_invitation(proposal(ReflectionImportance::Important, "工作节奏"));
     let second = RuntimeResponse::new("既然现在谈到节奏，我想邀请你一起看看。 ");
-    let runtime = ScriptedRuntime::new([PersonTurnClassification::Question; 2], [first, second]);
+    let runtime = ScriptedRuntime::new(
+        [
+            ScriptedPersonFactResponse::NoFacts,
+            ScriptedPersonFactResponse::NoFacts,
+        ],
+        [first, second],
+    );
     let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
 
     let unrelated = core.freeze_working_context(&[]).unwrap();
@@ -252,7 +258,7 @@ fn only_the_fixed_immediate_safety_fixture_can_interrupt_or_override_mute() {
         ReflectionInvitationBasis::ImportantSingleChange,
     );
     let runtime = ScriptedRuntime::new(
-        [PersonTurnClassification::DirectSelfReport],
+        [ScriptedPersonFactResponse::VerbatimFactAtRecordedTime],
         [RuntimeResponse::new("我需要先关心你的即时安全。").with_reflection_invitation(exact)],
     );
     let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(2_000));
@@ -277,7 +283,7 @@ fn only_the_fixed_immediate_safety_fixture_can_interrupt_or_override_mute() {
     let mut invalid_core = MemoryCore::new(
         ready_repository(),
         ScriptedRuntime::new(
-            [PersonTurnClassification::Question],
+            [ScriptedPersonFactResponse::NoFacts],
             [RuntimeResponse::new("普通变化不能冒充即时风险。")
                 .with_reflection_invitation(invalid)],
         ),
@@ -316,7 +322,10 @@ fn counterpart_quote_cannot_impersonate_person_immediate_safety_evidence() {
     let mut speaker_core = MemoryCore::new(
         ready_repository(),
         ScriptedRuntime::new(
-            [PersonTurnClassification::Question; 2],
+            [
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
+            ],
             [
                 RuntimeResponse::new(G08_IMMEDIATE_SAFETY_QUOTE),
                 RuntimeResponse::new("这不是本人的直接风险陈述。")
@@ -370,7 +379,10 @@ fn s26_rejects_pattern_basis_and_forget_removes_sourced_invitation() {
     let mut core = MemoryCore::new(
         ready_repository(),
         ScriptedRuntime::new(
-            [PersonTurnClassification::Question; 2],
+            [
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
+            ],
             [
                 RuntimeResponse::new("模式门槛留给下一片。").with_reflection_invitation(pattern),
                 RuntimeResponse::new("这次只记录直接变化。").with_reflection_invitation(accepted),

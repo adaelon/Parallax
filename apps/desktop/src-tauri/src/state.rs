@@ -45,7 +45,7 @@ use zeroize::Zeroize;
 
 const RUNTIME_TIMEOUT: Duration = Duration::from_secs(45);
 const RUNTIME_PROFILE_TEST_INPUT: &str =
-    "Synthetic runtime profile test: is the strict classification contract available?";
+    "Synthetic runtime profile test: is the strict person-fact proposal contract available?";
 const CONTINUOUS_SESSION_ID: &str = "continuous-conversation";
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_TURNS: usize = 32;
@@ -512,7 +512,7 @@ impl ManagedHost {
                     Timestamp::from_millis(0),
                 );
                 candidate
-                    .classify_person_turn(&evidence)
+                    .propose_person_facts(&evidence)
                     .map_err(|error| sanitized_runtime_test_error(error.kind()))?;
                 Ok(RuntimeProfileTestView { succeeded: true })
             }
@@ -2280,8 +2280,8 @@ mod tests {
     use eam_capture_browser::BrowserSubmissionPayload;
     use eam_core::{
         ClaimOwner, IdentityProfileSnapshot, IdentityRuntimeContext, IdentityStateSnapshot,
-        InMemoryRepository, IncrementingClock, PersonTurnClassification,
-        RelationalConstraintDeparture, RuntimeResponse, ScriptedRuntime, SharedAgreementAssent,
+        InMemoryRepository, IncrementingClock, RelationalConstraintDeparture, RuntimeResponse,
+        ScriptedPersonFactResponse, ScriptedRuntime, SharedAgreementAssent,
         SharedExperienceProposal, Timestamp,
     };
     use eam_identity::{
@@ -2761,7 +2761,7 @@ mod tests {
             .transition_reflection_invitation(ReflectionInvitationState::Offered, muted)
             .unwrap();
         let runtime = ScriptedRuntime::new(
-            [PersonTurnClassification::Question],
+            [ScriptedPersonFactResponse::NoFacts],
             [RuntimeResponse::new(
                 "可以，我们按你现在主动提起的方向继续谈。",
             )],
@@ -2795,7 +2795,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let repository = ready_vault_repository(directory.path());
         let runtime = ScriptedRuntime::new(
-            [PersonTurnClassification::Question],
+            [ScriptedPersonFactResponse::NoFacts],
             [RuntimeResponse::new("我会记得这段原话。")],
         );
         let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(10_000));
@@ -2844,7 +2844,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let repository = ready_vault_repository(directory.path());
         let runtime = ScriptedRuntime::new(
-            [PersonTurnClassification::Question],
+            [ScriptedPersonFactResponse::NoFacts],
             [RuntimeResponse::new("🙂")],
         );
         let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(25_000));
@@ -2880,7 +2880,7 @@ mod tests {
         let mut core = MemoryCore::new(
             InMemoryRepository::new(),
             ScriptedRuntime::new(
-                [PersonTurnClassification::Question],
+                [ScriptedPersonFactResponse::NoFacts],
                 [RuntimeResponse::new("这条回复不应被调用。")],
             ),
             IncrementingClock::new(35_000),
@@ -2891,7 +2891,7 @@ mod tests {
 
         assert!(core.repository().all_evidence().unwrap().is_empty());
         assert!(core.repository().all_claims().unwrap().is_empty());
-        assert!(core.runtime().seen_classification_inputs().is_empty());
+        assert!(core.runtime().seen_person_fact_inputs().is_empty());
         assert!(core.runtime().seen_requests().is_empty());
     }
 
@@ -2899,8 +2899,8 @@ mod tests {
     fn later_turn_receives_prior_continuous_conversation_as_frozen_context() {
         let runtime = ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [
                 RuntimeResponse::new("第一答"),
@@ -2951,7 +2951,7 @@ mod tests {
         );
         let mut core = MemoryCore::new(
             ready_in_memory_repository(),
-            ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+            ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]),
             IncrementingClock::new(50_000),
         );
 
@@ -3033,8 +3033,8 @@ mod tests {
             ready_in_memory_repository(),
             ScriptedRuntime::new(
                 [
-                    PersonTurnClassification::Question,
-                    PersonTurnClassification::Question,
+                    ScriptedPersonFactResponse::NoFacts,
+                    ScriptedPersonFactResponse::NoFacts,
                 ],
                 [original, replacement],
             ),
@@ -3092,8 +3092,8 @@ mod tests {
             ready_in_memory_repository(),
             ScriptedRuntime::new(
                 [
-                    PersonTurnClassification::Question,
-                    PersonTurnClassification::Question,
+                    ScriptedPersonFactResponse::NoFacts,
+                    ScriptedPersonFactResponse::NoFacts,
                 ],
                 [agreement, departure],
             ),
@@ -3145,7 +3145,7 @@ mod tests {
             );
         let mut core = MemoryCore::new(
             ready_in_memory_repository(),
-            ScriptedRuntime::new([PersonTurnClassification::Question], [agreement]),
+            ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [agreement]),
             IncrementingClock::new(90_000),
         );
         let first =
@@ -3227,8 +3227,8 @@ mod tests {
             ready_in_memory_repository(),
             ScriptedRuntime::new(
                 [
-                    PersonTurnClassification::Question,
-                    PersonTurnClassification::Question,
+                    ScriptedPersonFactResponse::NoFacts,
+                    ScriptedPersonFactResponse::NoFacts,
                 ],
                 [initial, assent],
             ),
@@ -3283,7 +3283,7 @@ mod tests {
         );
         let mut core = MemoryCore::new(
             ready_in_memory_repository(),
-            ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+            ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]),
             IncrementingClock::new(60_000),
         );
 

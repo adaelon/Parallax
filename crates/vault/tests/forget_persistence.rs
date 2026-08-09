@@ -1,7 +1,7 @@
 use std::{fs, time::Duration};
 
 use eam_core::{
-    ApplicableTime, ForgetRepository, ForgetTarget, MemoryRepository, PersonTurnClassification,
+    ApplicableTime, ForgetRepository, ForgetTarget, MemoryRepository, ScriptedPersonFactResponse,
     SessionId, Timestamp,
 };
 use eam_ingestion::{
@@ -38,12 +38,16 @@ fn forgotten_conversation_evidence_and_claim_are_absent_after_reopen() {
     let repository = VaultRepository::open(vault.path(), VaultKey::new(TEST_VAULT_KEY)).unwrap();
     let mut core = eam_core::MemoryCore::new(
         repository,
-        eam_core::ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []),
+        eam_core::ScriptedRuntime::new(
+            [ScriptedPersonFactResponse::VerbatimFactAtRecordedTime],
+            [],
+        ),
         eam_core::IncrementingClock::new(1_000),
     );
-    let (evidence_id, _) = core
+    let evidence_id = core
         .record_person_turn(SessionId::new("forget"), "我住在深圳。")
-        .unwrap();
+        .unwrap()
+        .evidence_id();
     assert_eq!(
         retrieve(core.repository_mut(), &RetrievalQuery::lexical("深圳"))
             .unwrap()
@@ -202,19 +206,21 @@ fn forgetting_original_evidence_removes_correction_memory_and_dispute_closure() 
         repository,
         eam_core::ScriptedRuntime::new(
             [
-                PersonTurnClassification::DirectSelfReport,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::VerbatimFactAtRecordedTime,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [],
         ),
         eam_core::IncrementingClock::new(1_000),
     );
-    let (original_evidence, _) = core
+    let original_evidence = core
         .record_person_turn(SessionId::new("closure"), "我住在深圳。")
-        .unwrap();
-    let (counter_evidence, _) = core
+        .unwrap()
+        .evidence_id();
+    let counter_evidence = core
         .record_person_turn(SessionId::new("closure"), "这条记忆还准确吗？")
-        .unwrap();
+        .unwrap()
+        .evidence_id();
     let original_claim = core.repository().all_claims().unwrap()[0].clone();
     let (repository, _, _) = core.into_parts();
 

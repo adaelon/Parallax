@@ -1,6 +1,6 @@
 # G03 Runtime Contract v3
 
-本契约在 v2 的可配置运行时目标上增加受限的 DeepSeek Chat Completions 协议适配，并纳入 S07C-1 的真实初始身份调用与 S07C-4 的当前主体状态出口。协议适配只改变运行时后端的 wire encoding；两种后端继续共享同一最小数据出口、领域 JSON schema、操作白名单、凭据边界和失败关闭语义。
+本契约在 v2 的可配置运行时目标上增加受限的 DeepSeek Chat Completions 协议适配，并纳入 S07C-1 的真实初始身份调用、S07C-4 的当前主体状态出口与 S07C-7 的原子本人事实提议。协议适配只改变运行时后端的 wire encoding；两种后端继续共享同一最小数据出口、领域 JSON schema、操作白名单、凭据边界和失败关闭语义。
 
 ## 1. 协议选择与 endpoint
 
@@ -59,7 +59,7 @@ require choices[0].finish_reason == "stop"
 structured_output = choices[0].message.content
 ```
 
-DeepSeek 的 `json_object` 只保证 JSON 语法，不替代严格 schema。适配器把现有 schema 放入可信 system message；返回内容继续经过初始身份/分类/回应各自的 wire 类型、字段约束、引用验证和 Core 操作白名单。空内容、非 `stop` 完成原因、未知字段造成的领域解析失败或未知操作均失败关闭。
+DeepSeek 的 `json_object` 只保证 JSON 语法，不替代严格 schema。适配器把现有 schema 放入可信 system message；返回内容继续经过初始身份/本人事实提议/回应各自的 wire 类型、字段约束、引用验证和 Core 操作白名单。空内容、非 `stop` 完成原因、未知字段造成的领域解析失败或未知操作均失败关闭。
 
 `deepseek-v4-pro` 的思考模式默认开启；本契约显式关闭它，以延续现有低推理强度并避免把桌面连接测试的 45 秒边界变成供应商特例。后续若开放思考模式，必须显式版本化超时和 UI 行为。
 
@@ -94,7 +94,35 @@ output = {
 
 六类介绍正文始终是不可信数据。Responses 使用严格 JSON Schema；DeepSeek 先按 `json_object` 提取，再进入同一个本地 `deny_unknown_fields` 解析器。随后 Identity 领域层拒绝本人作者、放弃反思使命、冒充本人、空字段、无证据及介绍范围外引用。`OutboundDisclosureRecord` 固定为 `InitialIdentity`，只登记六类介绍的六个 Evidence ID，`retrieved_sources` 为空。
 
-## 5. 普通回应的当前主体状态
+## 5. 普通发言的原子本人事实提议
+
+`CounterpartRuntime::propose_person_facts` 使用独立的 `eam_person_fact_proposals_v1` 契约，不再返回单一粗分类：
+
+```text
+input = {
+  kind: "person_fact_proposals",
+  evidence: { id, session_id, speaker="person", verbatim, recorded_at_millis }
+}
+
+output = {
+  fact_proposals: [0..32] {
+    owner: "person",
+    statement,
+    citation: { evidence_id, quote },
+    applicable_time:
+      { kind: "at", at_millis }
+      | { kind: "since", since_millis }
+      | { kind: "between", start_millis, end_millis }
+      | { kind: "unknown" }
+  }
+}
+```
+
+运行时只为清晰、直接的第一人称自述产生提议，并把同一发言中的多项事实拆成独立 statement；寒暄、问题、假设、引用、玩笑和含糊子句产生零项，混合发言只保留可独立逐字支持的清晰子句。Responses schema 固定 `maxItems=32`；DeepSeek 使用相同 schema 提示与本地 `deny_unknown_fields` 解析，未知字段或超限响应返回 `InvalidResponse`。
+
+Core 仍不信任结构化结果。每项必须本人归属、statement 非空、适用时间有效，citation 必须指向当前发言且 quote 逐字存在，statement 还必须逐字存在于 quote；相同 `(statement, applicable_time)` 在同批次或当前本人账本中只接受一次。有效项各追加一个 Person Claim，无效项逐项拒绝；无论提议数量多少，同一原始发言始终只追加一条 `ConversationEvidence`。`OutboundDisclosureRecord` 使用 `PersonFactProposals`，只登记当前 Evidence ID。
+
+## 6. 普通回应的当前主体状态
 
 普通回应不存在无身份或只携带 Self Bundle 版本号的降级路径。Core 在任何本人证据写入或运行时调用前构造以下必填投影：
 
@@ -115,14 +143,14 @@ Core 必须复核 `CounterpartReadiness::READY`、当前身份与 Self Bundle �
 
 `OutboundDisclosureRecord` 为每个普通回应登记 `SelfBundleState`、`IdentityState`、已投影的 `LedgerClaim` 及其实际支持 Evidence ID。请求体和披露记录均不得包含未选择的经历、证据或无关个人资料；Responses 与 DeepSeek 必须收到逐字段相同的 `self_context`。
 
-## 6. 传输、披露与错误
+## 7. 传输、披露与错误
 
 - HTTP 仍拒绝重定向，响应上限仍为 2 MiB，Bearer Key 仍只进入最终 `Authorization` header。
 - `OutboundDisclosureRecord.request_json` 记录实际发送给所选协议的 JSON，始终不含 Key。
-- timeout、connect failure、HTTP status 与 UTF-8 错误继续映射为相同的脱敏分类；provider 正文不进入错误。
+- timeout、connect failure、HTTP status 与 UTF-8 错误继续映射为相同的脱敏错误类别；provider 正文不进入错误。
 - DeepSeek 输出结构错误不得回退到 Responses、切换目标或放宽解析重试。
 
-## 7. 回归门禁
+## 8. 回归门禁
 
 1. Responses 与 DeepSeek 固定夹具从同一六类介绍产生等价 `InitialIdentityProposal`；缺/多字段、提示注入控制字段、冒充本人、放弃反思使命和越界引用均失败关闭。
 2. 初始身份外发记录只含六类介绍 Evidence ID，且调用类型为 `InitialIdentity`。
@@ -131,5 +159,6 @@ Core 必须复核 `CounterpartReadiness::READY`、当前身份与 Self Bundle �
 5. 未选择的经历、证据与无关个人资料不进入请求或披露记录；选中信念的 Claim 与支持 Evidence 可精确审计。
 6. 所有非 DeepSeek 目标继续产生逐字段相同的 Responses 请求和领域结果。
 7. DeepSeek 官方 Base URL 只产生一个 `/chat/completions`，请求含 `messages`、`json_object` 和关闭思考字段，不含 Responses-only 字段。
-8. 等价 DeepSeek fixture 产生与 Responses fixture 相同的 `PersonTurnClassification` 和 `RuntimeResponse`。
-9. DeepSeek 缺失 content 或非 `stop` 完成原因返回 `InvalidResponse`。
+8. 等价 DeepSeek fixture 与 Responses fixture 对零事实及多项混合自述产生相同的 `PersonFactProposalBatch`；Core 结果保持同一条 Evidence 和逐项 Person Claim。
+9. 本人事实 schema 固定最多 32 项；未知字段、超限输出、错误归属、错误 Evidence ID、非逐字 quote/statement、无效时间与重复事实均不能写入 Claim。
+10. DeepSeek 缺失 content 或非 `stop` 完成原因返回 `InvalidResponse`。

@@ -1,7 +1,7 @@
 use eam_core::{
     ApplicableTime, Claim, ClaimCorrectionRepository, ClaimOwner, ClaimStatus, CoreError,
     EvidenceCitation, InMemoryRepository, IncrementingClock, MemoryCore, MemoryRepository,
-    PersonTurnClassification, ScriptedRuntime, SessionId, Timestamp,
+    ScriptedPersonFactResponse, ScriptedRuntime, SessionId, Timestamp,
 };
 
 fn core_with_person_fact(
@@ -9,7 +9,7 @@ fn core_with_person_fact(
 ) -> MemoryCore<InMemoryRepository, ScriptedRuntime, IncrementingClock> {
     let mut core = MemoryCore::new(
         InMemoryRepository::new(),
-        ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::VerbatimFactAtRecordedTime], []),
         IncrementingClock::new(1_000),
     );
     core.record_person_turn(SessionId::new("facts"), statement)

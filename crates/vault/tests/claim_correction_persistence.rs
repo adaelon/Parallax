@@ -1,6 +1,6 @@
 use eam_core::{
     ApplicableTime, ClaimId, ClaimStatus, IncrementingClock, MemoryCore, MemoryRepository,
-    PersonTurnClassification, ScriptedRuntime, SessionId, Timestamp,
+    ScriptedPersonFactResponse, ScriptedRuntime, SessionId, Timestamp,
 };
 use eam_memory::{
     LongTermMemoryRepository, MemoryBasis, MemoryConfidence, MemoryDisputeOutcome,
@@ -24,8 +24,8 @@ fn correction_propagates_only_to_affected_memory_and_survives_reopen() {
         repository,
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::DirectSelfReport,
-                PersonTurnClassification::DirectSelfReport,
+                ScriptedPersonFactResponse::VerbatimFactAtRecordedTime,
+                ScriptedPersonFactResponse::VerbatimFactAtRecordedTime,
             ],
             [],
         ),
@@ -132,7 +132,7 @@ fn interpretive_memory_is_invalidated_for_review_instead_of_being_semantically_r
     let repository = VaultRepository::open(vault.path(), VaultKey::new([0xD8; 32])).unwrap();
     let mut core = MemoryCore::new(
         repository,
-        ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::VerbatimFactAtRecordedTime], []),
         IncrementingClock::new(1_000),
     );
     core.record_person_turn(SessionId::new("facts"), "我住在深圳。")
@@ -189,8 +189,8 @@ fn correction_preserves_an_old_open_dispute_without_blocking_the_successor_versi
         repository,
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::DirectSelfReport,
-                PersonTurnClassification::DirectSelfReport,
+                ScriptedPersonFactResponse::VerbatimFactAtRecordedTime,
+                ScriptedPersonFactResponse::VerbatimFactAtRecordedTime,
             ],
             [],
         ),

@@ -9,7 +9,7 @@ use super::*;
 struct RuntimeObservations {
     identity_requests: usize,
     identity_evidence_ids: Vec<Vec<u64>>,
-    classification_requests: usize,
+    person_fact_requests: usize,
     response_requests: usize,
 }
 
@@ -56,12 +56,12 @@ impl IdentityRuntime for RecordingDesktopRuntime {
 }
 
 impl CounterpartRuntime for RecordingDesktopRuntime {
-    fn classify_person_turn(
+    fn propose_person_facts(
         &mut self,
         _evidence: &ConversationEvidence,
-    ) -> Result<PersonTurnClassification, RuntimeError> {
-        self.observations.lock().unwrap().classification_requests += 1;
-        Ok(PersonTurnClassification::Question)
+    ) -> Result<eam_core::PersonFactProposalBatch, RuntimeError> {
+        self.observations.lock().unwrap().person_fact_requests += 1;
+        Ok(eam_core::PersonFactProposalBatch::empty())
     }
 
     fn respond(&mut self, _request: RuntimeRequest) -> Result<RuntimeResponse, RuntimeError> {
@@ -193,7 +193,7 @@ fn creation_commands_enforce_order_repetition_and_ready_send() {
         .unwrap();
     assert_eq!(turn.counterpart.verbatim, "合成第二自我回复");
     let observations = observations.lock().unwrap();
-    assert_eq!(observations.classification_requests, 1);
+    assert_eq!(observations.person_fact_requests, 1);
     assert_eq!(observations.response_requests, 1);
     drop(observations);
     managed.shutdown(ExitReason::Explicit).unwrap();
@@ -419,7 +419,7 @@ fn inconsistent_state_blocks_creation_and_host_send_without_runtime_calls() {
     );
     let observations = observations.lock().unwrap();
     assert_eq!(observations.identity_requests, 0);
-    assert_eq!(observations.classification_requests, 0);
+    assert_eq!(observations.person_fact_requests, 0);
     assert_eq!(observations.response_requests, 0);
     drop(observations);
     assert_eq!(evidence_count(&managed), 6);

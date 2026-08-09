@@ -2,7 +2,7 @@ use eam_core::{
     ActiveRelationalConstraint, AgreementWithdrawalActor, AgreementWithdrawalProposal,
     AgreementWithdrawalRejectionReason, ApplicableTime, Claim, ClaimId, ClaimOwner, CoreError,
     EvidenceCitation, EvidenceId, ForgetRequest, ForgetTarget, IncrementingClock, MemoryCore,
-    MemoryRepository, PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId,
+    MemoryRepository, RuntimeResponse, ScriptedPersonFactResponse, ScriptedRuntime, SessionId,
     SharedAgreementAssent, SharedAgreementAssentRejectionReason, SharedAgreementCandidateStatus,
     SharedAgreementDecision, SharedAgreementRevision, SharedExperience, SharedExperienceKind,
     SharedExperienceProposal, SharedExperienceRejectionReason, SharedExperienceRepository,
@@ -45,8 +45,8 @@ fn proposal(
 fn ordinary_question_and_person_external_experience_do_not_enter_shared_ledger() {
     let runtime = ScriptedRuntime::new(
         [
-            PersonTurnClassification::Question,
-            PersonTurnClassification::DirectSelfReport,
+            ScriptedPersonFactResponse::NoFacts,
+            ScriptedPersonFactResponse::VerbatimFactAtRecordedTime,
         ],
         [RuntimeResponse::new("这是普通回答。")],
     );
@@ -90,7 +90,7 @@ fn shared_agreement_waits_for_person_ceremony_before_ledger_entry() {
             "我同意以后直接指出关键逃避",
             "我也同意以后直接指出关键逃避",
         ));
-    let runtime = ScriptedRuntime::new([PersonTurnClassification::Question], [response]);
+    let runtime = ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]);
     let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
 
     let context = core.freeze_working_context(&[]).unwrap();
@@ -151,8 +151,8 @@ fn agreement_without_scope_or_effective_time_is_rejected_before_signing() {
         ready_repository(),
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [missing_scope, missing_time],
         ),
@@ -210,9 +210,9 @@ fn person_revision_creates_new_version_that_requires_exact_counterpart_assent() 
         ready_repository(),
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [initial, wrong_version, exact_version],
         ),
@@ -331,8 +331,8 @@ fn person_confirmation_admits_agreement_while_deferral_keeps_it_out() {
     );
     let runtime = ScriptedRuntime::new(
         [
-            PersonTurnClassification::Question,
-            PersonTurnClassification::Question,
+            ScriptedPersonFactResponse::NoFacts,
+            ScriptedPersonFactResponse::NoFacts,
         ],
         [confirmed, deferred],
     );
@@ -386,7 +386,7 @@ fn substantive_disagreement_with_both_positions_enters_history_without_veto() {
             "这只是小事",
             "我不同意把这看成可以忽略的小事",
         ));
-    let runtime = ScriptedRuntime::new([PersonTurnClassification::Question], [response]);
+    let runtime = ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]);
     let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
 
     let context = core.freeze_working_context(&[]).unwrap();
@@ -417,7 +417,7 @@ fn invalid_or_person_only_proposals_are_rejected_without_shared_history() {
             Timestamp::from_millis(1_000),
         ),
     );
-    let runtime = ScriptedRuntime::new([PersonTurnClassification::Question], [response]);
+    let runtime = ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]);
     let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
 
     let context = core.freeze_working_context(&[]).unwrap();
@@ -442,8 +442,8 @@ fn invalid_or_person_only_proposals_are_rejected_without_shared_history() {
 fn repository_rejects_shared_history_supported_only_by_one_participant() {
     let runtime = ScriptedRuntime::new(
         [
-            PersonTurnClassification::Question,
-            PersonTurnClassification::Question,
+            ScriptedPersonFactResponse::NoFacts,
+            ScriptedPersonFactResponse::NoFacts,
         ],
         [],
     );
@@ -491,7 +491,7 @@ fn forgetting_support_removes_pending_and_admitted_shared_derivatives() {
         "我同意保留这个约定",
         "我同意保留这个约定",
     ));
-    let runtime = ScriptedRuntime::new([PersonTurnClassification::Question], [agreement]);
+    let runtime = ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [agreement]);
     let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
     let context = core.freeze_working_context(&[]).unwrap();
     core.run_counterpart_turn(session(), "我同意保留这个约定。", context)
@@ -587,9 +587,9 @@ fn conflicting_agreement_requires_explicit_whole_supersession_before_staging() {
         ready_repository(),
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [original, undeclared, declared],
         ),
@@ -673,8 +673,8 @@ fn compatible_agreement_with_overlapping_scope_can_remain_parallel() {
         ready_repository(),
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [first, second],
         ),
@@ -714,7 +714,7 @@ fn person_withdrawal_requires_confirmation_and_preserves_agreement_history() {
     ));
     let mut core = MemoryCore::new(
         ready_repository(),
-        ScriptedRuntime::new([PersonTurnClassification::Question], [agreement]),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [agreement]),
         IncrementingClock::new(2_000),
     );
     let context = core.freeze_working_context(&[]).unwrap();
@@ -784,9 +784,9 @@ fn counterpart_withdrawal_requires_a_verbatim_reason_and_is_immediate() {
         ready_repository(),
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [agreement, empty_reason, valid],
         ),

@@ -4,9 +4,9 @@ use std::{
 };
 
 use eam_core::{
-    ApplicableTime, ClaimOwner, EvidenceCitation, IncrementingClock, JudgmentProposal, MemoryCore,
-    MemoryRepository, PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId,
-    Timestamp, Uncertainty,
+    ApplicableTime, ClaimOwner, EvidenceCitation, EvidenceId, IncrementingClock, JudgmentProposal,
+    MemoryCore, MemoryRepository, PersonFactProposal, PersonFactProposalBatch, RuntimeResponse,
+    ScriptedPersonFactResponse, ScriptedRuntime, SessionId, Timestamp, Uncertainty,
 };
 use eam_vault::{VaultError, VaultKey, VaultRepository};
 use tempfile::tempdir;
@@ -33,24 +33,42 @@ fn session(value: &str) -> SessionId {
 }
 
 #[test]
-fn preserves_exact_citations_and_separate_ledgers_across_reopen() {
+fn preserves_multiple_atomic_person_facts_and_exact_citations_across_reopen() {
     let _guard = sqlcipher_test_lock();
     let directory = tempdir().unwrap();
-    let marker = "S02-固定明文-不应出现在数据库字节中";
-    let runtime = ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []);
+    let marker = "S07C-7-我叫小林，而且我从 2024 年开始住在香港。";
+    let source_id = EvidenceId::from_raw(7);
+    let proposals = PersonFactProposalBatch::try_new([
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我叫小林",
+            EvidenceCitation::new(source_id, "我叫小林"),
+            ApplicableTime::Unknown,
+        ),
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我从 2024 年开始住在香港",
+            EvidenceCitation::new(source_id, "我从 2024 年开始住在香港"),
+            ApplicableTime::Since(Timestamp::from_millis(1_704_067_200_000)),
+        ),
+    ])
+    .unwrap();
+    let runtime = ScriptedRuntime::new([ScriptedPersonFactResponse::Exact(proposals)], []);
     let repository = ready_repository(directory.path(), VAULT_KEY_BYTES);
     assert_eq!(repository.schema_version().unwrap(), 27);
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(1_000));
 
-    let (source_id, classification) = core
+    let observation = core
         .record_person_turn(session("before-restart"), marker)
         .unwrap();
-    assert_eq!(classification, PersonTurnClassification::DirectSelfReport);
+    assert_eq!(observation.evidence_id(), source_id);
+    assert_eq!(observation.accepted_person_fact_ids().len(), 2);
+    assert!(observation.rejected_person_fact_proposals().is_empty());
     let (repository, _, _) = core.into_parts();
     let database_path = repository.database_path().to_owned();
     repository.close().unwrap();
 
-    let citation = EvidenceCitation::new(source_id, marker);
+    let citation = EvidenceCitation::new(source_id, "我叫小林");
     let response = RuntimeResponse::new("重启后仍可精确引用。")
         .with_citation(citation.clone())
         .with_judgment(JudgmentProposal::new(
@@ -59,8 +77,35 @@ fn preserves_exact_citations_and_separate_ledgers_across_reopen() {
             Uncertainty::Low,
             ApplicableTime::Since(Timestamp::from_millis(1_000)),
         ));
-    let runtime = ScriptedRuntime::new([PersonTurnClassification::Question], [response]);
+    let runtime = ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]);
     let repository = VaultRepository::open(directory.path(), key()).unwrap();
+    let reopened_person_facts = repository
+        .all_claims()
+        .unwrap()
+        .into_iter()
+        .filter(|claim| {
+            claim.owner() == ClaimOwner::Person
+                && claim
+                    .support()
+                    .iter()
+                    .any(|support| support.evidence_id() == source_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reopened_person_facts.len(), 2);
+    assert_eq!(reopened_person_facts[0].statement(), "我叫小林");
+    assert_eq!(reopened_person_facts[0].support()[0], citation);
+    assert_eq!(
+        reopened_person_facts[0].applicable_time(),
+        ApplicableTime::Unknown
+    );
+    assert_eq!(
+        reopened_person_facts[1].applicable_time(),
+        ApplicableTime::Since(Timestamp::from_millis(1_704_067_200_000))
+    );
+    assert_eq!(
+        reopened_person_facts[1].support()[0].quote(),
+        "我从 2024 年开始住在香港"
+    );
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(2_000));
     let frozen = core.freeze_working_context(&[source_id]).unwrap();
     let outcome = core
@@ -68,7 +113,7 @@ fn preserves_exact_citations_and_separate_ledgers_across_reopen() {
         .unwrap();
 
     assert_eq!(outcome.accepted_judgment_ids().len(), 1);
-    assert_eq!(core.resolve_citation(&citation).unwrap(), marker);
+    assert_eq!(core.resolve_citation(&citation).unwrap(), "我叫小林");
     let evidence = core.repository().all_evidence().unwrap();
     let claims = core.repository().all_claims().unwrap();
     let cited_claims = claims
@@ -123,7 +168,8 @@ fn rejects_a_second_writer_until_the_first_closes() {
 fn rejects_an_authenticated_page_corruption() {
     let _guard = sqlcipher_test_lock();
     let directory = tempdir().unwrap();
-    let runtime = ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []);
+    let runtime =
+        ScriptedRuntime::new([ScriptedPersonFactResponse::VerbatimFactAtRecordedTime], []);
     let repository = VaultRepository::open(directory.path(), key()).unwrap();
     let database_path = repository.database_path().to_owned();
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(3_000));

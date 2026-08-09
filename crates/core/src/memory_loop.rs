@@ -14,7 +14,8 @@ use crate::{
     JudgmentRejectionReason, MAX_OPEN_REFLECTION_INVITATIONS, MAX_REFLECTION_EVIDENCE_REFS,
     MAX_REFLECTION_OBSERVATION_BYTES, MAX_REFLECTION_TOPIC_BYTES, MAX_REFLECTION_WHY_NOW_BYTES,
     MemoryRepository, PatternMaturityCommitOutcome, PatternMaturityReceipt,
-    PatternMaturityWriteRejection, PatternMaturityWriteRejectionReason, PersonTurnClassification,
+    PatternMaturityWriteRejection, PatternMaturityWriteRejectionReason, PersonFactProposal,
+    PersonFactProposalRejection, PersonFactProposalRejectionReason, PersonTurnObservation,
     ReflectionDecision, ReflectionDelivery, ReflectionImportance, ReflectionInvitation,
     ReflectionInvitationBasis, ReflectionInvitationId, ReflectionInvitationProposal,
     ReflectionInvitationReceipt, ReflectionInvitationRejection,
@@ -314,37 +315,67 @@ where
         }
     }
 
-    /// Retains a person's turn verbatim and records a person fact only for a
-    /// structured direct-self-report classification.
+    /// Retains a person's turn once and independently validates each bounded,
+    /// atomic person-fact proposal before ledger admission.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError`] when the turn is empty, the runtime cannot classify
-    /// it, or the repository cannot append the evidence or resulting claim.
+    /// Returns [`CoreError`] when the turn is empty, the runtime cannot produce
+    /// a bounded proposal batch, or the repository cannot append accepted data.
     pub fn record_person_turn(
         &mut self,
         session_id: SessionId,
         verbatim: impl Into<String>,
-    ) -> Result<(EvidenceId, PersonTurnClassification), CoreError> {
+    ) -> Result<PersonTurnObservation, CoreError> {
         let evidence =
             self.append_conversation_evidence(session_id, Speaker::Person, verbatim, None)?;
-        let classification = self.runtime.classify_person_turn(&evidence)?;
+        let proposals = self.runtime.propose_person_facts(&evidence)?;
+        let mut known_facts = self
+            .repository
+            .all_claims()?
+            .into_iter()
+            .filter(|claim| {
+                claim.owner() == ClaimOwner::Person && claim.status() == ClaimStatus::Current
+            })
+            .map(|claim| (claim.statement().to_owned(), claim.applicable_time()))
+            .collect::<Vec<_>>();
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
 
-        if classification == PersonTurnClassification::DirectSelfReport {
-            let citation = EvidenceCitation::new(evidence.id(), evidence.verbatim());
+        for (proposal_index, proposal) in proposals.proposals().iter().enumerate() {
+            if let Some(reason) = validate_person_fact_proposal(&evidence, proposal) {
+                rejected.push(PersonFactProposalRejection::new(proposal_index, reason));
+                continue;
+            }
+            let fact_key = (proposal.statement().to_owned(), proposal.applicable_time());
+            if known_facts.contains(&fact_key) {
+                rejected.push(PersonFactProposalRejection::new(
+                    proposal_index,
+                    PersonFactProposalRejectionReason::DuplicateFact,
+                ));
+                continue;
+            }
+
+            let claim_id = self.repository.next_claim_id();
             let claim = Claim::new(
-                self.repository.next_claim_id(),
+                claim_id,
                 ClaimOwner::Person,
-                evidence.verbatim().to_owned(),
-                vec![citation],
+                proposal.statement().to_owned(),
+                vec![proposal.citation().clone()],
                 None,
-                ApplicableTime::At(evidence.recorded_at()),
+                proposal.applicable_time(),
                 evidence.recorded_at(),
             );
             self.repository.append_claim(claim)?;
+            known_facts.push(fact_key);
+            accepted.push(claim_id);
         }
 
-        Ok((evidence.id(), classification))
+        Ok(PersonTurnObservation::new(
+            evidence.id(),
+            accepted,
+            rejected,
+        ))
     }
 
     /// Copies selected evidence into an immutable, ordered working-context value.
@@ -504,8 +535,8 @@ where
         let (ready_identity_version, identity, self_context) =
             self.require_ready_counterpart_context(&working_context)?;
 
-        let (person_evidence_id, classification) =
-            self.record_person_turn(session_id.clone(), person_verbatim)?;
+        let person_observation = self.record_person_turn(session_id.clone(), person_verbatim)?;
+        let person_evidence_id = person_observation.evidence_id();
         let prompt = self
             .repository
             .evidence(person_evidence_id)?
@@ -587,9 +618,8 @@ where
             &counterpart_evidence,
         )?;
         Ok(TurnOutcome::new(
-            person_evidence_id,
+            person_observation,
             counterpart_evidence.id(),
-            classification,
             response.citations().to_vec(),
         )
         .with_judgments(judgments.accepted, judgments.rejected)
@@ -1542,6 +1572,40 @@ where
             .dismiss_shared_experience_ceremony(claim_id)
             .map_err(CoreError::from)
     }
+}
+
+fn validate_person_fact_proposal(
+    evidence: &ConversationEvidence,
+    proposal: &PersonFactProposal,
+) -> Option<PersonFactProposalRejectionReason> {
+    if proposal.owner() != ClaimOwner::Person {
+        return Some(PersonFactProposalRejectionReason::OwnerNotPerson(
+            proposal.owner(),
+        ));
+    }
+    if proposal.statement().trim().is_empty() {
+        return Some(PersonFactProposalRejectionReason::EmptyStatement);
+    }
+    if proposal.citation().evidence_id() != evidence.id() {
+        return Some(PersonFactProposalRejectionReason::EvidenceMismatch(
+            proposal.citation().evidence_id(),
+        ));
+    }
+    if proposal.citation().quote().trim().is_empty() {
+        return Some(PersonFactProposalRejectionReason::EmptyQuote);
+    }
+    if !evidence.verbatim().contains(proposal.citation().quote()) {
+        return Some(PersonFactProposalRejectionReason::QuoteMismatch(
+            evidence.id(),
+        ));
+    }
+    if !proposal.citation().quote().contains(proposal.statement()) {
+        return Some(PersonFactProposalRejectionReason::StatementNotVerbatim);
+    }
+    if !proposal.applicable_time().is_valid() {
+        return Some(PersonFactProposalRejectionReason::InvalidApplicableTime);
+    }
+    None
 }
 
 fn validate_judgment(

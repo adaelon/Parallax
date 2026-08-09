@@ -1581,14 +1581,195 @@ impl ClaimCorrectionReceipt {
     }
 }
 
+pub const MAX_PERSON_FACT_PROPOSALS_PER_TURN: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonFactProposal {
+    owner: ClaimOwner,
+    statement: String,
+    citation: EvidenceCitation,
+    applicable_time: ApplicableTime,
+}
+
+impl PersonFactProposal {
+    #[must_use]
+    pub fn new(
+        owner: ClaimOwner,
+        statement: impl Into<String>,
+        citation: EvidenceCitation,
+        applicable_time: ApplicableTime,
+    ) -> Self {
+        Self {
+            owner,
+            statement: statement.into(),
+            citation,
+            applicable_time,
+        }
+    }
+
+    #[must_use]
+    pub const fn owner(&self) -> ClaimOwner {
+        self.owner
+    }
+
+    #[must_use]
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    #[must_use]
+    pub const fn citation(&self) -> &EvidenceCitation {
+        &self.citation
+    }
+
+    #[must_use]
+    pub const fn applicable_time(&self) -> ApplicableTime {
+        self.applicable_time
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PersonTurnClassification {
-    DirectSelfReport,
-    Question,
-    Joke,
-    Hypothetical,
-    Quotation,
-    Ambiguous,
+pub struct PersonFactProposalBatchLimitError {
+    actual: usize,
+    maximum: usize,
+}
+
+impl PersonFactProposalBatchLimitError {
+    #[must_use]
+    pub const fn actual(self) -> usize {
+        self.actual
+    }
+
+    #[must_use]
+    pub const fn maximum(self) -> usize {
+        self.maximum
+    }
+}
+
+impl fmt::Display for PersonFactProposalBatchLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "person fact proposal batch contains {} items; maximum is {}",
+            self.actual, self.maximum
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PersonFactProposalBatch {
+    proposals: Vec<PersonFactProposal>,
+}
+
+impl PersonFactProposalBatch {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            proposals: Vec::new(),
+        }
+    }
+
+    pub fn try_new(
+        proposals: impl IntoIterator<Item = PersonFactProposal>,
+    ) -> Result<Self, PersonFactProposalBatchLimitError> {
+        let proposals = proposals.into_iter().collect::<Vec<_>>();
+        if proposals.len() > MAX_PERSON_FACT_PROPOSALS_PER_TURN {
+            return Err(PersonFactProposalBatchLimitError {
+                actual: proposals.len(),
+                maximum: MAX_PERSON_FACT_PROPOSALS_PER_TURN,
+            });
+        }
+        Ok(Self { proposals })
+    }
+
+    #[must_use]
+    pub fn proposals(&self) -> &[PersonFactProposal] {
+        &self.proposals
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.proposals.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.proposals.len()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersonFactProposalRejectionReason {
+    OwnerNotPerson(ClaimOwner),
+    EmptyStatement,
+    EvidenceMismatch(EvidenceId),
+    EmptyQuote,
+    QuoteMismatch(EvidenceId),
+    StatementNotVerbatim,
+    InvalidApplicableTime,
+    DuplicateFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonFactProposalRejection {
+    proposal_index: usize,
+    reason: PersonFactProposalRejectionReason,
+}
+
+impl PersonFactProposalRejection {
+    #[must_use]
+    pub const fn new(proposal_index: usize, reason: PersonFactProposalRejectionReason) -> Self {
+        Self {
+            proposal_index,
+            reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn proposal_index(&self) -> usize {
+        self.proposal_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &PersonFactProposalRejectionReason {
+        &self.reason
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonTurnObservation {
+    evidence_id: EvidenceId,
+    accepted_person_fact_ids: Vec<ClaimId>,
+    rejected_person_fact_proposals: Vec<PersonFactProposalRejection>,
+}
+
+impl PersonTurnObservation {
+    pub(crate) fn new(
+        evidence_id: EvidenceId,
+        accepted_person_fact_ids: Vec<ClaimId>,
+        rejected_person_fact_proposals: Vec<PersonFactProposalRejection>,
+    ) -> Self {
+        Self {
+            evidence_id,
+            accepted_person_fact_ids,
+            rejected_person_fact_proposals,
+        }
+    }
+
+    #[must_use]
+    pub const fn evidence_id(&self) -> EvidenceId {
+        self.evidence_id
+    }
+
+    #[must_use]
+    pub fn accepted_person_fact_ids(&self) -> &[ClaimId] {
+        &self.accepted_person_fact_ids
+    }
+
+    #[must_use]
+    pub fn rejected_person_fact_proposals(&self) -> &[PersonFactProposalRejection] {
+        &self.rejected_person_fact_proposals
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4227,7 +4408,8 @@ impl StructuredOperationRejection {
 pub struct TurnOutcome {
     person_evidence_id: EvidenceId,
     counterpart_evidence_id: EvidenceId,
-    person_classification: PersonTurnClassification,
+    accepted_person_fact_ids: Vec<ClaimId>,
+    rejected_person_fact_proposals: Vec<PersonFactProposalRejection>,
     accepted_judgment_ids: Vec<ClaimId>,
     rejected_judgments: Vec<JudgmentRejection>,
     pending_agreement_candidate_ids: Vec<SharedAgreementCandidateId>,
@@ -4252,15 +4434,20 @@ pub struct TurnOutcome {
 
 impl TurnOutcome {
     pub(crate) fn new(
-        person_evidence_id: EvidenceId,
+        person_observation: PersonTurnObservation,
         counterpart_evidence_id: EvidenceId,
-        person_classification: PersonTurnClassification,
         validated_citations: Vec<EvidenceCitation>,
     ) -> Self {
+        let PersonTurnObservation {
+            evidence_id: person_evidence_id,
+            accepted_person_fact_ids,
+            rejected_person_fact_proposals,
+        } = person_observation;
         Self {
             person_evidence_id,
             counterpart_evidence_id,
-            person_classification,
+            accepted_person_fact_ids,
+            rejected_person_fact_proposals,
             accepted_judgment_ids: Vec::new(),
             rejected_judgments: Vec::new(),
             pending_agreement_candidate_ids: Vec::new(),
@@ -4387,8 +4574,13 @@ impl TurnOutcome {
     }
 
     #[must_use]
-    pub const fn person_classification(&self) -> PersonTurnClassification {
-        self.person_classification
+    pub fn accepted_person_fact_ids(&self) -> &[ClaimId] {
+        &self.accepted_person_fact_ids
+    }
+
+    #[must_use]
+    pub fn rejected_person_fact_proposals(&self) -> &[PersonFactProposalRejection] {
+        &self.rejected_person_fact_proposals
     }
 
     #[must_use]

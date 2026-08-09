@@ -1,7 +1,7 @@
 use eam_core::{
     ActiveRelationalConstraint, AgreementWithdrawalActor, ClaimId, ClaimOwner, EvidenceCitation,
     EvidenceId, ForgetRequest, ForgetTarget, IncrementingClock, MemoryCore, MemoryRepository,
-    PersonTurnClassification, RelationalConstraintDeparture, RuntimeResponse, ScriptedRuntime,
+    RelationalConstraintDeparture, RuntimeResponse, ScriptedPersonFactResponse, ScriptedRuntime,
     SessionId, SharedAgreementAssent, SharedAgreementCandidateStatus, SharedAgreementDecision,
     SharedAgreementRevision, SharedExperienceKind, SharedExperienceProposal,
     SharedExperienceRepository, Timestamp, WorkingContext,
@@ -66,8 +66,8 @@ fn persist_person_withdrawal_with_breach(
         repository,
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [agreement_response(), departure],
         ),
@@ -124,7 +124,10 @@ fn agreement_candidate_survives_reopen_without_entering_shared_ledger_until_conf
     let repository = ready_repository(vault.path(), TEST_VAULT_KEY);
     let mut core = MemoryCore::new(
         repository,
-        ScriptedRuntime::new([PersonTurnClassification::Question], [agreement_response()]),
+        ScriptedRuntime::new(
+            [ScriptedPersonFactResponse::NoFacts],
+            [agreement_response()],
+        ),
         IncrementingClock::new(1_000),
     );
     let context = core.freeze_working_context(&[]).unwrap();
@@ -210,8 +213,8 @@ fn reasoned_agreement_breach_survives_reopen_and_forgets_with_its_agreement() {
         repository,
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [agreement_response(), departure],
         ),
@@ -365,7 +368,7 @@ fn disagreement_and_notice_dismissal_survive_reopen_without_retracting_history()
     let mut core = MemoryCore::new(
         repository,
         ScriptedRuntime::new(
-            [PersonTurnClassification::Question],
+            [ScriptedPersonFactResponse::NoFacts],
             [disagreement_response()],
         ),
         IncrementingClock::new(1_000),
@@ -434,7 +437,10 @@ fn forgetting_support_removes_an_unconfirmed_candidate_without_foreign_key_leaka
     let repository = ready_repository(vault.path(), [0xA7; 32]);
     let mut core = MemoryCore::new(
         repository,
-        ScriptedRuntime::new([PersonTurnClassification::Question], [agreement_response()]),
+        ScriptedRuntime::new(
+            [ScriptedPersonFactResponse::NoFacts],
+            [agreement_response()],
+        ),
         IncrementingClock::new(1_000),
     );
     let context = core.freeze_working_context(&[]).unwrap();
@@ -475,7 +481,10 @@ fn revised_candidate_and_exact_dual_signatures_survive_reopen_and_forget_as_a_ch
     let repository = ready_repository(vault.path(), [0xB7; 32]);
     let mut core = MemoryCore::new(
         repository,
-        ScriptedRuntime::new([PersonTurnClassification::Question], [agreement_response()]),
+        ScriptedRuntime::new(
+            [ScriptedPersonFactResponse::NoFacts],
+            [agreement_response()],
+        ),
         IncrementingClock::new(1_000),
     );
     let context = core.freeze_working_context(&[]).unwrap();
@@ -525,7 +534,7 @@ fn revised_candidate_and_exact_dual_signatures_survive_reopen_and_forget_as_a_ch
     );
     let mut core = MemoryCore::new(
         repository,
-        ScriptedRuntime::new([PersonTurnClassification::Question], [assent]),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [assent]),
         IncrementingClock::new(3_000),
     );
     let context = core.freeze_working_context(&[]).unwrap();
@@ -615,9 +624,9 @@ fn supersession_survives_reopen_preserves_old_breach_and_forgets_as_one_closure(
         repository,
         ScriptedRuntime::new(
             [
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
-                PersonTurnClassification::Question,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
+                ScriptedPersonFactResponse::NoFacts,
             ],
             [original, breach, replacement],
         ),

@@ -8,7 +8,7 @@ use crate::{
     Claim, ClaimCorrectionReceipt, ClaimId, ConversationEvidence, CounterpartReadiness,
     EvidenceCitation, EvidenceId, ForgetReceipt, ForgetTarget, IdentityRevisionCommit,
     IdentityRevisionReceipt, IdentityRuntimeContext, IdentityStateSnapshot,
-    PatternMaturityCommitOutcome, PatternMaturityProposal, PersonTurnClassification,
+    PatternMaturityCommitOutcome, PatternMaturityProposal, PersonFactProposalBatch,
     ReflectionInvitation, ReflectionInvitationId, ReflectionInvitationReceipt,
     ReflectionInvitationState, RuntimeRequest, RuntimeResponse, SelfBundleSnapshot,
     SharedAgreementCandidate, SharedAgreementCandidateId, SharedAgreementDecision,
@@ -423,15 +423,15 @@ pub trait SharedExperienceRepository: MemoryRepository {
 /// Runtime implementations receive only typed values selected by the trusted
 /// core. The repository is intentionally absent from both method signatures.
 pub trait CounterpartRuntime {
-    /// Classifies a person turn without receiving repository access.
+    /// Proposes zero or more atomic person facts without receiving repository access.
     ///
     /// # Errors
     ///
-    /// Returns a runtime error when no structured classification can be produced.
-    fn classify_person_turn(
+    /// Returns a runtime error when no bounded structured proposal batch can be produced.
+    fn propose_person_facts(
         &mut self,
         evidence: &ConversationEvidence,
-    ) -> Result<PersonTurnClassification, RuntimeError>;
+    ) -> Result<PersonFactProposalBatch, RuntimeError>;
 
     /// Produces free text and optional structured operations from a frozen request.
     ///
@@ -445,11 +445,11 @@ impl<T> CounterpartRuntime for Box<T>
 where
     T: CounterpartRuntime + ?Sized,
 {
-    fn classify_person_turn(
+    fn propose_person_facts(
         &mut self,
         evidence: &ConversationEvidence,
-    ) -> Result<PersonTurnClassification, RuntimeError> {
-        self.as_mut().classify_person_turn(evidence)
+    ) -> Result<PersonFactProposalBatch, RuntimeError> {
+        self.as_mut().propose_person_facts(evidence)
     }
 
     fn respond(&mut self, request: RuntimeRequest) -> Result<RuntimeResponse, RuntimeError> {

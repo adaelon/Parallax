@@ -5,7 +5,7 @@ use eam_core::{
     IdentityEvolutionRepository, IdentityProfileChanges, IdentityProfileSnapshot,
     IdentityRevisionCommit, IdentityRevisionProposal, IdentityRevisionRejectionReason,
     IdentityStateSnapshot, IncrementingClock, JudgmentRejectionReason, MemoryCore,
-    MemoryRepository, PersonTurnClassification, RuntimeResponse, ScriptedRuntime, SessionId,
+    MemoryRepository, RuntimeResponse, ScriptedPersonFactResponse, ScriptedRuntime, SessionId,
     SharedExperienceKind, SharedExperienceProposal, SharedExperienceRepository, Speaker, Timestamp,
 };
 use eam_identity::{
@@ -355,7 +355,7 @@ fn identity_revision_and_self_bundle_reopen_as_one_immutable_chain() {
         .with_identity_revision(revision);
     let mut core = MemoryCore::new(
         repository,
-        ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]),
         IncrementingClock::new(20_000),
     );
     let context = core.freeze_working_context(&[]).unwrap();
@@ -489,7 +489,7 @@ fn legacy_unbound_reply_remains_verbatim_but_cannot_support_current_counterpart_
         ));
     let mut core = MemoryCore::new(
         repository,
-        ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]),
         IncrementingClock::new(20_000),
     );
     let context = core.freeze_working_context(&[legacy_reply_id]).unwrap();

@@ -16,12 +16,12 @@ use super::*;
 const PROFILE_TEST_KEY: [u8; 32] = [0x6d; 32];
 const OLD_BEARER: &str = "synthetic-old-bearer-1111";
 const NEW_BEARER: &str = "synthetic-new-bearer-2222";
-const CLASSIFICATION_RESPONSE: &str = r#"{
+const NO_PERSON_FACTS_RESPONSE: &str = r#"{
   "output": [{
     "type": "message",
     "content": [{
       "type": "output_text",
-      "text": "{\"classification\":\"question\"}"
+      "text": "{\"fact_proposals\":[]}"
     }]
   }]
 }"#;
@@ -202,8 +202,8 @@ fn assert_runtime_request(request: &str, model: &str, bearer: Option<&str>) {
     }
 }
 
-fn assert_strict_classification_request(request: &str) {
-    assert!(request.contains(r#""name":"eam_person_turn_classification_v1""#));
+fn assert_strict_person_fact_request(request: &str) {
+    assert!(request.contains(r#""name":"eam_person_fact_proposals_v1""#));
     assert!(request.contains(r#""strict":true"#));
 }
 
@@ -211,9 +211,9 @@ fn assert_strict_classification_request(request: &str) {
 fn strict_profile_test_uses_only_synthetic_input_without_persisting_or_switching() {
     let _guard = sqlcipher_test_lock();
     let directory = tempdir().unwrap();
-    let active_server = serve_runtime(vec![ServerReply::ok(CLASSIFICATION_RESPONSE)], None, None);
+    let active_server = serve_runtime(vec![ServerReply::ok(NO_PERSON_FACTS_RESPONSE)], None, None);
     let candidate_server =
-        serve_runtime(vec![ServerReply::ok(CLASSIFICATION_RESPONSE)], None, None);
+        serve_runtime(vec![ServerReply::ok(NO_PERSON_FACTS_RESPONSE)], None, None);
     seed_profile(
         directory.path(),
         &active_server.base_url,
@@ -261,7 +261,7 @@ fn strict_profile_test_uses_only_synthetic_input_without_persisting_or_switching
     let candidate_requests = candidate_server.finish();
     assert_eq!(candidate_requests.len(), 1);
     assert_runtime_request(&candidate_requests[0], "candidate-model", Some(OLD_BEARER));
-    assert_strict_classification_request(&candidate_requests[0]);
+    assert_strict_person_fact_request(&candidate_requests[0]);
     assert!(candidate_requests[0].contains(RUNTIME_PROFILE_TEST_INPUT));
     assert!(!candidate_requests[0].contains("active runtime remains selected"));
 
@@ -276,7 +276,7 @@ fn clear_profile_test_omits_auth_without_clearing_the_persisted_key() {
     let _guard = sqlcipher_test_lock();
     let directory = tempdir().unwrap();
     let candidate_server =
-        serve_runtime(vec![ServerReply::ok(CLASSIFICATION_RESPONSE)], None, None);
+        serve_runtime(vec![ServerReply::ok(NO_PERSON_FACTS_RESPONSE)], None, None);
     seed_profile(
         directory.path(),
         "http://127.0.0.1:9/v1",
@@ -302,14 +302,14 @@ fn clear_profile_test_omits_auth_without_clearing_the_persisted_key() {
     let candidate_requests = candidate_server.finish();
     assert_eq!(candidate_requests.len(), 1);
     assert_runtime_request(&candidate_requests[0], "clear-candidate-model", None);
-    assert_strict_classification_request(&candidate_requests[0]);
+    assert_strict_person_fact_request(&candidate_requests[0]);
 }
 
 #[test]
 fn profile_test_failure_is_sanitized_and_keeps_the_active_profile() {
     let _guard = sqlcipher_test_lock();
     let directory = tempdir().unwrap();
-    let active_server = serve_runtime(vec![ServerReply::ok(CLASSIFICATION_RESPONSE)], None, None);
+    let active_server = serve_runtime(vec![ServerReply::ok(NO_PERSON_FACTS_RESPONSE)], None, None);
     let rejected_body = "provider-body-secret-9999";
     let candidate_server = serve_runtime(vec![ServerReply::rejected(rejected_body)], None, None);
     seed_profile(
@@ -363,7 +363,7 @@ fn profile_test_failure_is_sanitized_and_keeps_the_active_profile() {
 fn failed_vault_commit_keeps_both_the_old_profile_and_runtime() {
     let _guard = sqlcipher_test_lock();
     let directory = tempdir().unwrap();
-    let active_server = serve_runtime(vec![ServerReply::ok(CLASSIFICATION_RESPONSE)], None, None);
+    let active_server = serve_runtime(vec![ServerReply::ok(NO_PERSON_FACTS_RESPONSE)], None, None);
     seed_profile(
         directory.path(),
         &active_server.base_url,
@@ -416,9 +416,9 @@ fn saved_profile_drives_the_next_request_and_a_reopened_host() {
     let directory = tempdir().unwrap();
     let new_server = serve_runtime(
         vec![
-            ServerReply::ok(CLASSIFICATION_RESPONSE),
+            ServerReply::ok(NO_PERSON_FACTS_RESPONSE),
             ServerReply::ok(TURN_RESPONSE),
-            ServerReply::ok(CLASSIFICATION_RESPONSE),
+            ServerReply::ok(NO_PERSON_FACTS_RESPONSE),
             ServerReply::ok(TURN_RESPONSE),
         ],
         None,
@@ -459,9 +459,9 @@ fn saved_profile_drives_the_next_request_and_a_reopened_host() {
     for request in &requests {
         assert_runtime_request(request, "new-model", Some(NEW_BEARER));
     }
-    assert_strict_classification_request(&requests[0]);
+    assert_strict_person_fact_request(&requests[0]);
     assert!(requests[1].contains(r#""name":"eam_runtime_response_v1""#));
-    assert_strict_classification_request(&requests[2]);
+    assert_strict_person_fact_request(&requests[2]);
     assert!(requests[3].contains(r#""name":"eam_runtime_response_v1""#));
 }
 
@@ -473,7 +473,7 @@ fn in_flight_request_serializes_save_and_never_mixes_profiles() {
     let (release_first_request_tx, release_first_request_rx) = mpsc::channel();
     let old_server = serve_runtime(
         vec![
-            ServerReply::ok(CLASSIFICATION_RESPONSE),
+            ServerReply::ok(NO_PERSON_FACTS_RESPONSE),
             ServerReply::ok(TURN_RESPONSE),
         ],
         Some(first_request_seen_tx),
@@ -481,7 +481,7 @@ fn in_flight_request_serializes_save_and_never_mixes_profiles() {
     );
     let new_server = serve_runtime(
         vec![
-            ServerReply::ok(CLASSIFICATION_RESPONSE),
+            ServerReply::ok(NO_PERSON_FACTS_RESPONSE),
             ServerReply::ok(TURN_RESPONSE),
         ],
         None,

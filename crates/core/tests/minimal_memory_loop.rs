@@ -1,10 +1,11 @@
 use eam_core::{
     ApplicableTime, ClaimOwner, CoreError, CounterpartInconsistencyReason, CounterpartReadiness,
     EvidenceCitation, FrozenEvidenceBlock, FrozenRetrievalWindow, InMemoryRepository,
-    IncrementingClock, JudgmentProposal, JudgmentRejectionReason, MemoryCore, MemoryRepository,
-    PersonTurnClassification, RetrievalSnapshot, RetrievedContextItem, RuntimeResponse,
-    ScriptedRuntime, SessionId, SourceCurrentness, Speaker, Timestamp, Uncertainty,
-    WorkingContextError,
+    IncrementingClock, JudgmentProposal, JudgmentRejectionReason,
+    MAX_PERSON_FACT_PROPOSALS_PER_TURN, MemoryCore, MemoryRepository, PersonFactProposal,
+    PersonFactProposalBatch, PersonFactProposalRejectionReason, RetrievalSnapshot,
+    RetrievedContextItem, RuntimeResponse, ScriptedPersonFactResponse, ScriptedRuntime, SessionId,
+    SourceCurrentness, Speaker, Timestamp, Uncertainty, WorkingContextError,
 };
 
 mod support;
@@ -12,6 +13,22 @@ use support::ready_repository;
 
 fn session(id: &str) -> SessionId {
     SessionId::new(id)
+}
+
+fn no_person_facts() -> ScriptedPersonFactResponse {
+    ScriptedPersonFactResponse::NoFacts
+}
+
+fn one_person_fact(evidence_id: u64, statement: &str) -> ScriptedPersonFactResponse {
+    ScriptedPersonFactResponse::Exact(
+        PersonFactProposalBatch::try_new([PersonFactProposal::new(
+            ClaimOwner::Person,
+            statement,
+            EvidenceCitation::new(eam_core::EvidenceId::from_raw(evidence_id), statement),
+            ApplicableTime::Unknown,
+        )])
+        .unwrap(),
+    )
 }
 
 #[test]
@@ -47,7 +64,7 @@ fn every_non_ready_state_fails_before_any_formal_conversation_side_effect() {
 
     for readiness in cases {
         let runtime = ScriptedRuntime::new(
-            [PersonTurnClassification::Question],
+            [no_person_facts()],
             [RuntimeResponse::new("这条回复不应被调用。")],
         );
         let repository = InMemoryRepository::new().with_counterpart_readiness(readiness.clone());
@@ -61,7 +78,7 @@ fn every_non_ready_state_fails_before_any_formal_conversation_side_effect() {
         assert_eq!(error, CoreError::CounterpartNotReady(readiness));
         assert!(core.repository().all_evidence().unwrap().is_empty());
         assert!(core.repository().all_claims().unwrap().is_empty());
-        assert!(core.runtime().seen_classification_inputs().is_empty());
+        assert!(core.runtime().seen_person_fact_inputs().is_empty());
         assert!(core.runtime().seen_requests().is_empty());
     }
 }
@@ -73,7 +90,7 @@ fn ready_versions_are_revalidated_before_any_formal_conversation_side_effect() {
         self_bundle_version: 2,
     });
     let runtime = ScriptedRuntime::new(
-        [PersonTurnClassification::Question],
+        [no_person_facts()],
         [RuntimeResponse::new("这条回复不应被调用。")],
     );
     let mut core = MemoryCore::new(repository, runtime, IncrementingClock::new(60));
@@ -86,7 +103,7 @@ fn ready_versions_are_revalidated_before_any_formal_conversation_side_effect() {
     assert_eq!(error, CoreError::CounterpartStateChanged);
     assert!(core.repository().all_evidence().unwrap().is_empty());
     assert!(core.repository().all_claims().unwrap().is_empty());
-    assert!(core.runtime().seen_classification_inputs().is_empty());
+    assert!(core.runtime().seen_person_fact_inputs().is_empty());
     assert!(core.runtime().seen_requests().is_empty());
 }
 
@@ -137,18 +154,17 @@ fn closes_the_minimal_memory_loop_with_exact_sources_and_separate_ledgers() {
             ApplicableTime::Since(Timestamp::from_millis(1_000)),
         ));
     let runtime = ScriptedRuntime::new(
-        [
-            PersonTurnClassification::DirectSelfReport,
-            PersonTurnClassification::Question,
-        ],
+        [one_person_fact(1, first_statement), no_person_facts()],
         [response],
     );
     let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(1_000));
 
-    let (source_id, classification) = core
+    let observation = core
         .record_person_turn(session("first"), first_statement)
         .expect("the first turn should be accepted");
-    assert_eq!(classification, PersonTurnClassification::DirectSelfReport);
+    let source_id = observation.evidence_id();
+    assert_eq!(observation.accepted_person_fact_ids().len(), 1);
+    assert!(observation.rejected_person_fact_proposals().is_empty());
     assert_eq!(source_id.get(), 1);
 
     let frozen = core
@@ -191,13 +207,7 @@ fn closes_the_minimal_memory_loop_with_exact_sources_and_separate_ledgers() {
 
 #[test]
 fn questions_and_jokes_remain_verbatim_evidence_without_person_facts() {
-    let runtime = ScriptedRuntime::new(
-        [
-            PersonTurnClassification::Question,
-            PersonTurnClassification::Joke,
-        ],
-        [],
-    );
+    let runtime = ScriptedRuntime::new([no_person_facts(), no_person_facts()], []);
     let mut core = MemoryCore::new(
         InMemoryRepository::new(),
         runtime,
@@ -236,8 +246,8 @@ fn rejects_unsourced_and_out_of_context_judgments() {
         .with_judgment(guessed_repository_reference);
     let runtime = ScriptedRuntime::new(
         [
-            PersonTurnClassification::DirectSelfReport,
-            PersonTurnClassification::Question,
+            one_person_fact(1, "一条不会暴露给运行时的事实"),
+            no_person_facts(),
         ],
         [response],
     );
@@ -274,7 +284,7 @@ fn rejects_unsourced_and_out_of_context_judgments() {
 #[test]
 fn free_text_response_is_evidence_but_cannot_write_a_ledger() {
     let runtime = ScriptedRuntime::new(
-        [PersonTurnClassification::Question],
+        [no_person_facts()],
         [RuntimeResponse::new("这是普通回答，不是持久判断提议。")],
     );
     let mut core = MemoryCore::new(ready_repository(), runtime, IncrementingClock::new(4_000));
@@ -296,10 +306,7 @@ fn free_text_response_is_evidence_but_cannot_write_a_ledger() {
 fn rejects_a_response_citation_that_is_not_a_verbatim_match() {
     let source_id = eam_core::EvidenceId::from_raw(1);
     let runtime = ScriptedRuntime::new(
-        [
-            PersonTurnClassification::DirectSelfReport,
-            PersonTurnClassification::Question,
-        ],
+        [one_person_fact(1, "原始逐字内容"), no_person_facts()],
         [RuntimeResponse::new("错误地改写了来源。")
             .with_citation(EvidenceCitation::new(source_id, "并不存在的逐字内容"))],
     );
@@ -318,4 +325,222 @@ fn rejects_a_response_citation_that_is_not_a_verbatim_match() {
     );
     assert_eq!(core.repository().all_evidence().unwrap().len(), 2);
     assert_eq!(core.repository().all_claims().unwrap().len(), 1);
+}
+
+#[test]
+fn greeting_produces_zero_person_facts_and_one_verbatim_evidence() {
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], []),
+        IncrementingClock::new(6_000),
+    );
+
+    let observation = core
+        .record_person_turn(session("greeting"), "你好")
+        .expect("a greeting remains valid conversation evidence");
+
+    assert!(observation.accepted_person_fact_ids().is_empty());
+    assert!(observation.rejected_person_fact_proposals().is_empty());
+    assert_eq!(core.repository().all_evidence().unwrap().len(), 1);
+    assert!(core.repository().all_claims().unwrap().is_empty());
+}
+
+#[test]
+fn one_turn_can_admit_multiple_atomic_person_facts_with_exact_time_and_source() {
+    let evidence_id = eam_core::EvidenceId::from_raw(1);
+    let proposals = PersonFactProposalBatch::try_new([
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我叫小林",
+            EvidenceCitation::new(evidence_id, "我叫小林"),
+            ApplicableTime::Unknown,
+        ),
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我从 2024 年开始住在香港",
+            EvidenceCitation::new(evidence_id, "我从 2024 年开始住在香港"),
+            ApplicableTime::Since(Timestamp::from_millis(1_704_067_200_000)),
+        ),
+    ])
+    .unwrap();
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::Exact(proposals)], []),
+        IncrementingClock::new(7_000),
+    );
+
+    let observation = core
+        .record_person_turn(
+            session("multiple-facts"),
+            "我叫小林，而且我从 2024 年开始住在香港。",
+        )
+        .unwrap();
+
+    assert_eq!(observation.accepted_person_fact_ids().len(), 2);
+    assert!(observation.rejected_person_fact_proposals().is_empty());
+    assert_eq!(core.repository().all_evidence().unwrap().len(), 1);
+    let claims = core.repository().all_claims().unwrap();
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0].statement(), "我叫小林");
+    assert_eq!(claims[0].applicable_time(), ApplicableTime::Unknown);
+    assert_eq!(claims[0].support()[0].evidence_id(), evidence_id);
+    assert_eq!(claims[0].support()[0].quote(), "我叫小林");
+    assert_eq!(claims[1].statement(), "我从 2024 年开始住在香港");
+    assert_eq!(
+        claims[1].applicable_time(),
+        ApplicableTime::Since(Timestamp::from_millis(1_704_067_200_000))
+    );
+    assert_eq!(claims[1].support()[0].evidence_id(), evidence_id);
+}
+
+#[test]
+fn mixed_invalid_person_fact_proposals_are_rejected_independently() {
+    let evidence_id = eam_core::EvidenceId::from_raw(1);
+    let proposals = PersonFactProposalBatch::try_new([
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我在香港工作",
+            EvidenceCitation::new(evidence_id, "我在香港工作"),
+            ApplicableTime::Unknown,
+        ),
+        PersonFactProposal::new(
+            ClaimOwner::Counterpart,
+            "我在香港工作",
+            EvidenceCitation::new(evidence_id, "我在香港工作"),
+            ApplicableTime::Unknown,
+        ),
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            " ",
+            EvidenceCitation::new(evidence_id, "我在香港工作"),
+            ApplicableTime::Unknown,
+        ),
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我是木星人",
+            EvidenceCitation::new(evidence_id, "我是木星人"),
+            ApplicableTime::Unknown,
+        ),
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我住在香港",
+            EvidenceCitation::new(evidence_id, "我在香港工作"),
+            ApplicableTime::Unknown,
+        ),
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我在香港工作",
+            EvidenceCitation::new(evidence_id, "我在香港工作"),
+            ApplicableTime::Between {
+                start: Timestamp::from_millis(2),
+                end: Timestamp::from_millis(1),
+            },
+        ),
+    ])
+    .unwrap();
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::Exact(proposals)], []),
+        IncrementingClock::new(8_000),
+    );
+
+    let observation = core
+        .record_person_turn(session("mixed"), "我在香港工作。也许我是火星人——开玩笑的。")
+        .unwrap();
+
+    assert_eq!(observation.accepted_person_fact_ids().len(), 1);
+    assert_eq!(
+        observation
+            .rejected_person_fact_proposals()
+            .iter()
+            .map(|rejection| rejection.reason())
+            .collect::<Vec<_>>(),
+        vec![
+            &PersonFactProposalRejectionReason::OwnerNotPerson(ClaimOwner::Counterpart),
+            &PersonFactProposalRejectionReason::EmptyStatement,
+            &PersonFactProposalRejectionReason::QuoteMismatch(evidence_id),
+            &PersonFactProposalRejectionReason::StatementNotVerbatim,
+            &PersonFactProposalRejectionReason::InvalidApplicableTime,
+        ]
+    );
+    let claims = core.repository().all_claims().unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].statement(), "我在香港工作");
+}
+
+#[test]
+fn duplicate_person_facts_do_not_create_duplicate_claims() {
+    let first_id = eam_core::EvidenceId::from_raw(1);
+    let second_id = eam_core::EvidenceId::from_raw(2);
+    let first = PersonFactProposalBatch::try_new([
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我住在香港",
+            EvidenceCitation::new(first_id, "我住在香港"),
+            ApplicableTime::Unknown,
+        ),
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            "我住在香港",
+            EvidenceCitation::new(first_id, "我住在香港"),
+            ApplicableTime::Unknown,
+        ),
+    ])
+    .unwrap();
+    let repeated = PersonFactProposalBatch::try_new([PersonFactProposal::new(
+        ClaimOwner::Person,
+        "我住在香港",
+        EvidenceCitation::new(second_id, "我住在香港"),
+        ApplicableTime::Unknown,
+    )])
+    .unwrap();
+    let mut core = MemoryCore::new(
+        InMemoryRepository::new(),
+        ScriptedRuntime::new(
+            [
+                ScriptedPersonFactResponse::Exact(first),
+                ScriptedPersonFactResponse::Exact(repeated),
+            ],
+            [],
+        ),
+        IncrementingClock::new(9_000),
+    );
+
+    let first_observation = core
+        .record_person_turn(session("duplicates"), "我住在香港")
+        .unwrap();
+    let repeated_observation = core
+        .record_person_turn(session("duplicates"), "我住在香港")
+        .unwrap();
+
+    assert_eq!(first_observation.accepted_person_fact_ids().len(), 1);
+    assert_eq!(first_observation.rejected_person_fact_proposals().len(), 1);
+    assert_eq!(
+        first_observation.rejected_person_fact_proposals()[0].reason(),
+        &PersonFactProposalRejectionReason::DuplicateFact
+    );
+    assert!(repeated_observation.accepted_person_fact_ids().is_empty());
+    assert_eq!(
+        repeated_observation.rejected_person_fact_proposals()[0].reason(),
+        &PersonFactProposalRejectionReason::DuplicateFact
+    );
+    assert_eq!(core.repository().all_evidence().unwrap().len(), 2);
+    assert_eq!(core.repository().all_claims().unwrap().len(), 1);
+}
+
+#[test]
+fn person_fact_proposal_batch_is_bounded() {
+    let proposals = (0..=MAX_PERSON_FACT_PROPOSALS_PER_TURN).map(|index| {
+        PersonFactProposal::new(
+            ClaimOwner::Person,
+            format!("事实 {index}"),
+            EvidenceCitation::new(eam_core::EvidenceId::from_raw(1), format!("事实 {index}")),
+            ApplicableTime::Unknown,
+        )
+    });
+
+    let error = PersonFactProposalBatch::try_new(proposals)
+        .expect_err("more than the contract maximum must fail closed");
+    assert_eq!(error.actual(), MAX_PERSON_FACT_PROPOSALS_PER_TURN + 1);
+    assert_eq!(error.maximum(), MAX_PERSON_FACT_PROPOSALS_PER_TURN);
 }

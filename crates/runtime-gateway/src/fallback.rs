@@ -1,5 +1,5 @@
 use eam_core::{
-    ConversationEvidence, CounterpartRuntime, PersonTurnClassification, RuntimeError,
+    ConversationEvidence, CounterpartRuntime, PersonFactProposalBatch, RuntimeError,
     RuntimeErrorKind, RuntimeRequest, RuntimeResponse,
 };
 
@@ -35,12 +35,12 @@ where
     P: CounterpartRuntime,
     F: CounterpartRuntime,
 {
-    fn classify_person_turn(
+    fn propose_person_facts(
         &mut self,
         evidence: &ConversationEvidence,
-    ) -> Result<PersonTurnClassification, RuntimeError> {
-        match self.primary.classify_person_turn(evidence) {
-            Err(error) if retryable(error.kind()) => self.fallback.classify_person_turn(evidence),
+    ) -> Result<PersonFactProposalBatch, RuntimeError> {
+        match self.primary.propose_person_facts(evidence) {
+            Err(error) if retryable(error.kind()) => self.fallback.propose_person_facts(evidence),
             result => result,
         }
     }

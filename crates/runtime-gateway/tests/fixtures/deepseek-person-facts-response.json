@@ -1,0 +1,16 @@
+{
+  "id": "chatcmpl_deepseek_person_facts_fixture",
+  "object": "chat.completion",
+  "model": "deepseek-v4-pro",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "reasoning_content": null,
+        "content": "{\"fact_proposals\":[{\"owner\":\"person\",\"statement\":\"我叫小林\",\"citation\":{\"evidence_id\":1,\"quote\":\"我叫小林\"},\"applicable_time\":{\"kind\":\"unknown\"}},{\"owner\":\"person\",\"statement\":\"我从 2024 年开始住在香港\",\"citation\":{\"evidence_id\":1,\"quote\":\"我从 2024 年开始住在香港\"},\"applicable_time\":{\"kind\":\"since\",\"since_millis\":1704067200000}}]}"
+      }
+    }
+  ]
+}

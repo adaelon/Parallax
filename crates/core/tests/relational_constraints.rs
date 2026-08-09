@@ -1,9 +1,9 @@
 use eam_core::{
     ActiveRelationalConstraint, EvidenceCitation, EvidenceId, IncrementingClock, MemoryCore,
-    PersonTurnClassification, RelationalConstraintDeparture,
-    RelationalConstraintDepartureRejectionReason, RelationalConstraintPriority, RuntimeResponse,
-    ScriptedRuntime, SessionId, SharedAgreementDecision, SharedExperienceKind,
-    SharedExperienceProposal, SharedExperienceRejectionReason, SharedExperienceRepository,
+    RelationalConstraintDeparture, RelationalConstraintDepartureRejectionReason,
+    RelationalConstraintPriority, RuntimeResponse, ScriptedPersonFactResponse, ScriptedRuntime,
+    SessionId, SharedAgreementDecision, SharedExperienceKind, SharedExperienceProposal,
+    SharedExperienceRejectionReason, SharedExperienceRepository,
     StructuredOperationRejectionReason, Timestamp, WorkingContext, WorkingContextError,
 };
 
@@ -76,7 +76,7 @@ fn working_context_accepts_only_active_unique_subconstitutional_constraints() {
     );
 
     let runtime = ScriptedRuntime::new(
-        [PersonTurnClassification::Question],
+        [ScriptedPersonFactResponse::NoFacts],
         [RuntimeResponse::new("约定不能授予写入能力。")
             .with_unsupported_operation(0, "write_vault")],
     );
@@ -103,8 +103,8 @@ fn reasoned_departure_is_atomically_admitted_as_shared_history() {
         ));
     let runtime = ScriptedRuntime::new(
         [
-            PersonTurnClassification::Question,
-            PersonTurnClassification::Question,
+            ScriptedPersonFactResponse::NoFacts,
+            ScriptedPersonFactResponse::NoFacts,
         ],
         [agreement_response(), departure_response],
     );
@@ -165,8 +165,8 @@ fn departure_without_an_explicit_reason_is_rejected_by_core() {
         );
     let runtime = ScriptedRuntime::new(
         [
-            PersonTurnClassification::Question,
-            PersonTurnClassification::Question,
+            ScriptedPersonFactResponse::NoFacts,
+            ScriptedPersonFactResponse::NoFacts,
         ],
         [agreement_response(), departure_response],
     );
@@ -223,7 +223,7 @@ fn generic_shared_experience_operation_cannot_forge_an_agreement_breach() {
     );
     let mut core = MemoryCore::new(
         ready_repository(),
-        ScriptedRuntime::new([PersonTurnClassification::Question], [response]),
+        ScriptedRuntime::new([ScriptedPersonFactResponse::NoFacts], [response]),
         IncrementingClock::new(1_000),
     );
     let context = core.freeze_working_context(&[]).unwrap();

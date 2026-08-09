@@ -11,7 +11,7 @@ pub(crate) fn request_json(
 ) -> Result<String, RuntimeError> {
     let example = match schema_name {
         "eam_initial_identity_v1" => initial_identity_example(input)?,
-        "eam_person_turn_classification_v1" => r#"{"classification":"question"}"#.to_owned(),
+        "eam_person_fact_proposals_v1" => r#"{"fact_proposals":[]}"#.to_owned(),
         "eam_runtime_response_v1" => {
             r#"{"text":"Example response","citations":[],"operations":[]}"#.to_owned()
         }

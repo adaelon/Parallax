@@ -3,8 +3,8 @@
 use std::fs;
 
 use eam_core::{
-    ConversationEvidence, ForgetRequest, ForgetTarget, MemoryRepository, PersonTurnClassification,
-    SessionId, Speaker, Timestamp,
+    ConversationEvidence, ForgetRequest, ForgetTarget, MemoryRepository,
+    ScriptedPersonFactResponse, SessionId, Speaker, Timestamp,
 };
 use eam_ingestion::{ArchiveInput, ArchiveRepository, ArchiveStatus};
 use eam_retrieval::{RetrievalQuery, SourceScope, retrieve};
@@ -32,12 +32,16 @@ fn record_person_fact(
 ) {
     let mut core = eam_core::MemoryCore::new(
         repository,
-        eam_core::ScriptedRuntime::new([PersonTurnClassification::DirectSelfReport], []),
+        eam_core::ScriptedRuntime::new(
+            [ScriptedPersonFactResponse::VerbatimFactAtRecordedTime],
+            [],
+        ),
         eam_core::IncrementingClock::new(1_000),
     );
-    let (evidence_id, _) = core
+    let evidence_id = core
         .record_person_turn(SessionId::new("s30"), PRIVATE_TEXT)
-        .unwrap();
+        .unwrap()
+        .evidence_id();
     (core, evidence_id)
 }
 

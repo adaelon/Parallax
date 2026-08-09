@@ -1227,3 +1227,18 @@
 
 **入口**：Vault 确认就绪后 React 先 invoke `get_counterpart_readiness`；介绍、形成和正式聊天分别只能经 `record_initial_self_introduction({ draft })`、`form_initial_counterpart` 与 `send_message({ verbatim })` 进入宿主白名单。
 **测试**：`apps/desktop/src/App.test.tsx` 24/24、`state::tests::counterpart_creation` 7/7、`npm run typecheck/build --prefix apps/desktop`、`cargo test --workspace --no-fail-fast`、全目标 Clippy、Rust fmt 与 `git diff --check` 全绿。
+
+## 2026-08-09 S07C-7 普通对话本人事实原子化
+
+**触达**:
+- `crates/core/src/domain.rs:PersonFactProposal/PersonFactProposalBatch/PersonFactProposalRejection` — 定义最多 32 项、带本人归属、精确引用和适用时间的原子事实提议及逐项拒绝结果。
+- `crates/core/src/ports.rs:CounterpartRuntime::propose_person_facts` — 以单条类型化对话证据替换旧的整句粗分类运行时端口。
+- `crates/core/src/memory_loop.rs:MemoryCore::observe_person_turn` — 一次只保留一条原始对话证据，并独立校验每项归属、当前 Evidence、逐字 quote/statement、时间和重复项后追加 Person Claim。
+- `crates/core/src/scripted_runtime.rs:ScriptedPersonFactResponse` — 为零事实、逐字事实和精确批次提供可检查的确定性 Core 夹具。
+- `crates/runtime-gateway/src/adapter.rs:OpenAiResponsesRuntime::propose_person_facts` — 为 Responses 与 DeepSeek 编码同一 `eam_person_fact_proposals_v1` 严格 schema，并拒绝未知字段与超限批次。
+- `apps/desktop/src-tauri/src/state.rs:AppRuntimeContract::propose_person_facts` — 将桌面宿主及运行时档案合成测试迁移到新的事实提议端口。
+- `crates/vault/tests/encrypted_repository.rs:preserves_multiple_atomic_person_facts_and_exact_citations_across_reopen` — 固定两条 Claim 跨 SQLCipher 重启保留独立陈述、归属、适用时间和精确引用。
+- `docs/runtime-contract-v3.md:普通发言的原子本人事实提议`、`docs/architecture.md:最小记忆闭环/模型运行时`、`docs/implementation-slices.md:S07C-7` — 同步有界契约、主数据流和下一切片状态。
+
+**入口**：`MemoryCore::record_person_turn` 保存本人原文后调用 `CounterpartRuntime::propose_person_facts`；每个通过 Core 二次校验的提议独立进入本人 Claim 账本，原始发言仍只有一条 `ConversationEvidence`。
+**测试**：`crates/core/tests/minimal_memory_loop.rs` 覆盖零事实、多事实、混合无效项、重复与 32 项上限；`crates/runtime-gateway/tests/runtime_contract.rs` 41/41 覆盖双协议等价与严格失败关闭；Desktop 38/38、Vault 全套及四包联合 `cargo test -p core -p runtime-gateway -p desktop-app -p vault` 全绿，Rust fmt 与 `git diff --check` 通过。
