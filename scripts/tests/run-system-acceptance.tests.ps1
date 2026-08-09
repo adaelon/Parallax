@@ -40,10 +40,10 @@ $repositoryRoot = Get-EamRepositoryRoot
 $summary = Test-AcceptanceMatrix -RepositoryRoot $repositoryRoot
 Assert-Equal 33 $summary.DeterministicCriteria "DET count drifted"
 Assert-Equal 12 $summary.FunctionalRequirements "FR count drifted"
-Assert-Equal 51 $summary.AcceptedAdrs "accepted ADR count drifted"
+Assert-Equal 52 $summary.AcceptedAdrs "accepted ADR count drifted"
 Assert-Equal 8 $summary.ThreatBoundaries "threat count drifted"
 Assert-Equal 5 $summary.MigrationContracts "migration count drifted"
-Assert-Equal 33 $summary.EvidenceEntries "evidence registry count drifted"
+Assert-Equal 39 $summary.EvidenceEntries "evidence registry count drifted"
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("eam-acceptance-tests-" + [guid]::NewGuid().ToString("N"))
 [System.IO.Directory]::CreateDirectory($tempRoot) | Out-Null
@@ -57,6 +57,21 @@ try {
     Assert-Throws {
         Test-AcceptanceMatrix -RepositoryRoot $repositoryRoot -MatrixPath $brokenMatrix | Out-Null
     } "missing accepted ADR did not fail the matrix gate"
+
+    $missingS07cEvidence = Join-Path $tempRoot "missing-s07c-evidence.md"
+    $missingS07cText = [regex]::Replace(
+        $matrixText,
+        '(?m)^(\| ADR-0055 \|[^\r\n]*?), EV-PERSON-FACTS(\s*\| automated \|)$',
+        '$1$2',
+        1
+    )
+    if ($missingS07cText -eq $matrixText) {
+        throw "S07C rejection fixture did not change ADR-0055"
+    }
+    [System.IO.File]::WriteAllText($missingS07cEvidence, $missingS07cText, $encoding)
+    Assert-Throws {
+        Test-AcceptanceMatrix -RepositoryRoot $repositoryRoot -MatrixPath $missingS07cEvidence | Out-Null
+    } "ADR-0055 without atomic person-fact evidence did not fail the matrix gate"
 
     $missingProfileEvidence = Join-Path $tempRoot "missing-runtime-profile-evidence.md"
     $missingProfileText = [regex]::Replace(

@@ -29,10 +29,16 @@
 | EV-OBSIDIAN | `cargo test -p source-obsidian`; `cargo test -p vault --test obsidian_reconciliation`; `cargo test -p vault --test obsidian_source_persistence` | 只读扫描、配置排除、移除/离线与结构查询 | automated |
 | EV-RETRIEVAL | `cargo test -p retrieval`; `cargo test -p vault --test retrieval_persistence` | 全文/向量/时间/关系/记忆召回、权威回读与冻结窗口 | automated |
 | EV-UNDERSTANDING | `cargo test -p understanding`; `cargo test -p vault --test understanding_persistence` | 有限触发、显式来源、可重建投影与失效 | automated |
-| EV-RUNTIME | `cargo test -p runtime-gateway --test runtime_contract` | Responses/DeepSeek 等价初始身份、分类与回应 contract，最小输出、HTTPS、严格 schema 与结构化白名单 | automated |
+| EV-RUNTIME | `cargo test -p runtime-gateway --test runtime_contract` | Responses/DeepSeek 等价初始身份、原子本人事实提议与任务优先反思回应 contract，最小输出、HTTPS、严格 schema 与结构化白名单 | automated |
+| EV-COUNTERPART-CREATION | `cargo test -p identity --test initial_identity`; `cargo test -p vault --test identity_persistence` | 首个身份与首个自我包原子创建、四态派生、重复拒绝及故障重启无半状态 | automated |
+| EV-COUNTERPART-READINESS | `cargo test -p core --test minimal_memory_loop`; `cargo test -p desktop-app counterpart_creation` | 正式对话双层 READY 门禁、版本一致性与非就绪零副作用 | automated |
+| EV-REPLY-ATTRIBUTION | `cargo test -p core --test minimal_memory_loop`; `cargo test -p vault --test identity_persistence`; `cargo test -p desktop-app counterpart_creation` | 新回复绑定产生它的身份版本，schema v27 迁移保留旧回复但隔离未绑定认识来源 | automated |
+| EV-COUNTERPART-SELF-CONTEXT | `cargo test -p core --test minimal_memory_loop`; `cargo test -p runtime-gateway --test runtime_contract` | 当前身份、自我包、关系、信念、意图与相关经历的有界模型无关出口及失败关闭 | automated |
+| EV-DESKTOP-CREATION | `cargo test -p desktop-app counterpart_creation`; `npm test -- App.test.tsx -t "S07C-6 counterpart creation ceremony"` in `apps/desktop` | 三条创建 command、六类介绍、失败重试、READY 路由、输入门禁与创建前回复标识 | automated |
+| EV-PERSON-FACTS | `cargo test -p core --test minimal_memory_loop`; `cargo test -p runtime-gateway --test runtime_contract`; `cargo test -p vault --test encrypted_repository preserves_multiple_atomic_person_facts_and_exact_citations_across_reopen -- --exact` | 零到多项原子本人事实提议、逐项拒绝、去重与 SQLCipher 重启后精确引用 | automated |
 | EV-RUNTIME-PROFILE | `cargo test -p vault --test runtime_profile_persistence`; `cargo test -p vault --test backup_recovery encrypted_snapshot_round_trips_authority_and_rebuilds_indexes -- --exact`; `cargo test -p desktop-app runtime_profile`; `npm test -- App.test.tsx -t "S06R-4 local runtime settings"` in `apps/desktop` | v25→v26 默认档案、`KEEP/REPLACE/CLEAR` 与 write-only Key、Recovery Set 完整恢复、严格合成测试、提交后热切换、重启和并发隔离 | automated |
 | EV-VAULT | `cargo test -p vault --test encrypted_repository`; `cargo test -p vault --test windows_unlock`; `cargo test -p vault --lib` | SQLCipher、对象 AEAD、DPAPI/恢复密钥、确认前零写入、错误密钥、清零与故障注入 | automated |
-| EV-SCHEMA | `cargo test -p vault schema::tests` | schema v1→v26 逐版事务迁移、中断回滚与数据回填 | automated |
+| EV-SCHEMA | `cargo test -p vault schema::tests` | schema v1→v27 逐版事务迁移、中断回滚与数据回填 | automated |
 | EV-HOST | `cargo test -p desktop-host`; `cargo test -p desktop-app` | 首次初始化状态机、单实例、关窗隐藏、安全退出、更新失败回复与白名单投影 | automated |
 | EV-WIN-CAPTURE | `cargo test -p capture-windows`; `cargo test -p vault --test capture_persistence` | 前台/空闲元数据、暂停、崩溃空缺与不伪造活动 | automated |
 | EV-BROWSER | `cargo test -p capture-browser`; `cargo test -p vault --test browser_capture_persistence` | 固定扩展来源、环回、进程令牌、范围与幂等持久化 | automated |
@@ -41,17 +47,17 @@
 | EV-BACKUP | `cargo test -p backup`; `cargo test -p vault --test backup_recovery` | 认证快照、最新删除头、遗忘重放、索引重建与 Vault Key 轮换 | automated |
 | EV-STATIC | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo check -p desktop-app --all-targets` | 格式、lint、全目标编译与静态安全边界 | automated |
 | EV-PRIVACY | `scripts/run-system-acceptance.ps1 -Mode Validate` | G10 ignore、tracked 私有路径、常见密钥/令牌与本机用户路径扫描 | automated |
-| EV-MATRIX | `scripts/run-system-acceptance.ps1 -Mode Validate` | 33 DET、12 FR、51 accepted ADR、8 THR、5 MIG 精确集合、S06R 强制证据与证据外键 | automated |
+| EV-MATRIX | `scripts/run-system-acceptance.ps1 -Mode Validate` | 33 DET、12 FR、52 accepted ADR、8 THR、5 MIG 精确集合、S06R/S07C 强制证据与证据外键 | automated |
 | EV-PACKAGE | `npm run tauri -- build`; `scripts/run-system-acceptance.ps1 -Mode Smoke` | 版本一致、NSIS 产物、SHA-256、安装版真实创建加密数据库、退出/卸载烟雾 | automated |
 
 ## 3. 产品第 6.1 节确定性验收
 
 | ID | 判据 | 自动化证据 | 状态 |
 | --- | --- | --- | --- |
-| DET-01 | 初始形成 | EV-IDENTITY-INIT | automated |
+| DET-01 | 初始形成 | EV-IDENTITY-INIT, EV-COUNTERPART-CREATION, EV-DESKTOP-CREATION | automated |
 | DET-02 | 记忆准确 | EV-CORE-MEMORY, EV-RETRIEVAL | automated |
 | DET-03 | 时间理解 | EV-CORRECTION, EV-RETRIEVAL | automated |
-| DET-04 | 身份隔离 | EV-CORE-MEMORY, EV-CORE-IDENTITY | automated |
+| DET-04 | 身份隔离 | EV-CORE-MEMORY, EV-CORE-IDENTITY, EV-COUNTERPART-READINESS, EV-REPLY-ATTRIBUTION, EV-COUNTERPART-SELF-CONTEXT | automated |
 | DET-05 | 判断入账 | EV-CORE-MEMORY | automated |
 | DET-06 | 长期记忆晋升 | EV-MEMORY, EV-PATTERN | automated |
 | DET-07 | 记忆争议 | EV-DISPUTE | automated |
@@ -75,42 +81,42 @@
 | DET-25 | 后台连续 | EV-HOST, EV-WIN-CAPTURE | automated |
 | DET-26 | 纠错传播 | EV-CORRECTION | automated |
 | DET-27 | 遗忘传播 | EV-FORGET, EV-BACKUP | automated |
-| DET-28 | 身份连续 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-VAULT | automated |
-| DET-29 | 对话证据 | EV-CORE-MEMORY, EV-DESKTOP, EV-FORGET | automated |
-| DET-30 | 模型迁移 | EV-CORE-IDENTITY, EV-RUNTIME, EV-RUNTIME-PROFILE | automated |
-| DET-31 | 数据边界 | EV-VAULT, EV-RUNTIME, EV-RUNTIME-PROFILE | automated |
-| DET-32 | 内容隔离 | EV-MARKDOWN, EV-INGESTION, EV-RUNTIME | automated |
+| DET-28 | 身份连续 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-VAULT, EV-COUNTERPART-CREATION, EV-COUNTERPART-READINESS, EV-REPLY-ATTRIBUTION, EV-COUNTERPART-SELF-CONTEXT | automated |
+| DET-29 | 对话证据 | EV-CORE-MEMORY, EV-DESKTOP, EV-FORGET, EV-REPLY-ATTRIBUTION, EV-PERSON-FACTS | automated |
+| DET-30 | 模型迁移 | EV-CORE-IDENTITY, EV-RUNTIME, EV-RUNTIME-PROFILE, EV-COUNTERPART-SELF-CONTEXT | automated |
+| DET-31 | 数据边界 | EV-VAULT, EV-RUNTIME, EV-RUNTIME-PROFILE, EV-COUNTERPART-SELF-CONTEXT | automated |
+| DET-32 | 内容隔离 | EV-MARKDOWN, EV-INGESTION, EV-RUNTIME, EV-COUNTERPART-SELF-CONTEXT | automated |
 | DET-33 | 威胁边界 | EV-VAULT, EV-BROWSER, EV-EXTENSION, EV-PRIVACY | automated |
 
 ## 4. 功能需求覆盖
 
 | ID | 需求 | 自动化证据 | 状态 |
 | --- | --- | --- | --- |
-| FR-01 | 渐进式共同回忆 | EV-IDENTITY-INIT, EV-DESKTOP | automated |
+| FR-01 | 渐进式共同回忆 | EV-IDENTITY-INIT, EV-DESKTOP, EV-COUNTERPART-CREATION, EV-DESKTOP-CREATION | automated |
 | FR-02 | 上下文收件箱 | EV-INGESTION, EV-MARKDOWN, EV-LINEAGE, EV-OBSIDIAN | automated |
 | FR-03 | Windows 日常采集 | EV-WIN-CAPTURE, EV-BROWSER, EV-EXTENSION | automated |
-| FR-04 | 时间化事实账本 | EV-CORE-MEMORY, EV-CORRECTION, EV-SHARED | automated |
+| FR-04 | 时间化事实账本 | EV-CORE-MEMORY, EV-CORRECTION, EV-SHARED, EV-PERSON-FACTS | automated |
 | FR-05 | 全库检索与工作上下文 | EV-RETRIEVAL, EV-UNDERSTANDING | automated |
 | FR-06 | 长期记忆维护 | EV-MEMORY, EV-DISPUTE, EV-PATTERN, EV-CORRECTION, EV-FORGET | automated |
-| FR-07 | 第二自我运行时 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-REFLECTION, EV-RUNTIME, EV-RUNTIME-PROFILE | automated |
-| FR-08 | 持续对话界面 | EV-DESKTOP, EV-SHARED, EV-DISPUTE, EV-RUNTIME-PROFILE | automated |
+| FR-07 | 第二自我运行时 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-REFLECTION, EV-RUNTIME, EV-RUNTIME-PROFILE, EV-COUNTERPART-CREATION, EV-COUNTERPART-READINESS, EV-REPLY-ATTRIBUTION, EV-COUNTERPART-SELF-CONTEXT | automated |
+| FR-08 | 持续对话界面 | EV-DESKTOP, EV-SHARED, EV-DISPUTE, EV-RUNTIME-PROFILE, EV-REPLY-ATTRIBUTION, EV-DESKTOP-CREATION | automated |
 | FR-09 | 纠错与遗忘 | EV-CORRECTION, EV-FORGET, EV-BACKUP | automated |
 | FR-10 | 本地加密与恢复 | EV-VAULT, EV-BACKUP, EV-RUNTIME-PROFILE | automated |
-| FR-11 | 不可信内容隔离 | EV-INGESTION, EV-MARKDOWN, EV-BROWSER, EV-RUNTIME | automated |
+| FR-11 | 不可信内容隔离 | EV-INGESTION, EV-MARKDOWN, EV-BROWSER, EV-RUNTIME, EV-COUNTERPART-SELF-CONTEXT | automated |
 | FR-12 | 首版威胁边界 | EV-VAULT, EV-RUNTIME, EV-BROWSER, EV-EXTENSION, EV-PRIVACY | automated |
 
 ## 5. accepted ADR 覆盖
 
 | ID | 决策 | 自动化证据 | 状态 |
 | --- | --- | --- | --- |
-| ADR-0001 | 第二自我是数字对应者 | EV-IDENTITY-INIT, EV-CORE-IDENTITY | automated |
-| ADR-0002 | 本地可迁移自我包 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-BACKUP | automated |
-| ADR-0003 | 时间化三账本 | EV-CORE-MEMORY, EV-CORRECTION | automated |
-| ADR-0004 | 核心访问边界 | EV-RETRIEVAL, EV-RUNTIME | automated |
+| ADR-0001 | 第二自我是数字对应者 | EV-IDENTITY-INIT, EV-CORE-IDENTITY, EV-RUNTIME, EV-COUNTERPART-READINESS, EV-REPLY-ATTRIBUTION, EV-DESKTOP-CREATION | automated |
+| ADR-0002 | 本地可迁移自我包 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-BACKUP, EV-COUNTERPART-CREATION, EV-COUNTERPART-SELF-CONTEXT | automated |
+| ADR-0003 | 时间化三账本 | EV-CORE-MEMORY, EV-CORRECTION, EV-PERSON-FACTS | automated |
+| ADR-0004 | 核心访问边界 | EV-RETRIEVAL, EV-RUNTIME, EV-COUNTERPART-READINESS, EV-COUNTERPART-SELF-CONTEXT, EV-DESKTOP-CREATION | automated |
 | ADR-0005 | 事件驱动存在 | EV-IDENTITY-PRESENCE, EV-HOST | automated |
 | ADR-0006 | 本人自持恢复密钥 | EV-VAULT, EV-BACKUP | automated |
 | ADR-0007 | Inbox 导入而非镜像 | EV-INGESTION, EV-FORGET | automated |
-| ADR-0008 | Tauri、React 和 Rust 职责边界 | EV-HOST, EV-DESKTOP, EV-STATIC | automated |
+| ADR-0008 | Tauri、React 和 Rust 职责边界 | EV-HOST, EV-DESKTOP, EV-STATIC, EV-DESKTOP-CREATION | automated |
 | ADR-0009 | 混合加密保险库 | EV-VAULT, EV-FORGET, EV-BACKUP | automated |
 | ADR-0011 | 信任当前 Windows 登录会话 | EV-VAULT, EV-RUNTIME, EV-BROWSER, EV-PRIVACY | automated |
 | ADR-0012 | 托盘常驻 Tauri 宿主 | EV-HOST, EV-WIN-CAPTURE, EV-DESKTOP | automated |
@@ -124,9 +130,9 @@
 | ADR-0022 | 首版只理解 UTF-8 Markdown | EV-INGESTION, EV-MARKDOWN | automated |
 | ADR-0023 | Core 内受限纯 Rust Markdown 解析 | EV-MARKDOWN | automated |
 | ADR-0024 | 版本化 Markdown 方言 | EV-MARKDOWN | automated |
-| ADR-0025 | 清晰本人自述直接入账 | EV-CORE-MEMORY, EV-IDENTITY-INIT | automated |
-| ADR-0026 | 每轮对话作为证据保留 | EV-CORE-MEMORY, EV-DESKTOP, EV-FORGET | automated |
-| ADR-0027 | 第二自我显式提议持久判断 | EV-CORE-MEMORY, EV-RUNTIME | automated |
+| ADR-0025 | 清晰本人自述直接入账 | EV-CORE-MEMORY, EV-IDENTITY-INIT, EV-PERSON-FACTS | automated |
+| ADR-0026 | 每轮对话作为证据保留 | EV-CORE-MEMORY, EV-DESKTOP, EV-FORGET, EV-REPLY-ATTRIBUTION, EV-PERSON-FACTS | automated |
+| ADR-0027 | 第二自我显式提议持久判断 | EV-CORE-MEMORY, EV-RUNTIME, EV-REPLY-ATTRIBUTION | automated |
 | ADR-0028 | 共同经历分类仪式 | EV-SHARED, EV-DESKTOP | automated |
 | ADR-0029 | 共同约定候选版本双签 | EV-SHARED | automated |
 | ADR-0030 | 次于宪法的关系约束 | EV-CONSTRAINTS, EV-RUNTIME | automated |
@@ -137,14 +143,14 @@
 | ADR-0035 | 长期记忆显式提议 | EV-MEMORY | automated |
 | ADR-0036 | 记忆质疑采用说服与争议 | EV-DISPUTE | automated |
 | ADR-0037 | 争议记忆自然分层披露 | EV-DISPUTE, EV-RUNTIME | automated |
-| ADR-0038 | 狭义关系事件边界 | EV-SHARED | automated |
-| ADR-0039 | 身份自主演化受反思使命约束 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY | automated |
+| ADR-0038 | 狭义关系事件边界 | EV-SHARED, EV-REPLY-ATTRIBUTION | automated |
+| ADR-0039 | 身份自主演化受反思使命约束 | EV-IDENTITY-PRESENCE, EV-CORE-IDENTITY, EV-COUNTERPART-CREATION, EV-COUNTERPART-SELF-CONTEXT | automated |
 | ADR-0040 | 可延后的主动反思邀请 | EV-REFLECTION, EV-RUNTIME | automated |
 | ADR-0041 | 本人可静默主动反思 | EV-REFLECTION | automated |
 | ADR-0042 | 三个独立事件的模式门槛 | EV-PATTERN, EV-REFLECTION | automated |
 | ADR-0043 | 模式成熟为稳定第二自我看法 | EV-PATTERN, EV-DISPUTE | automated |
 | ADR-0044 | 模式成熟须第二自我显式提议 | EV-PATTERN, EV-RUNTIME | automated |
-| ADR-0045 | 创建前需要最小自我介绍 | EV-IDENTITY-INIT, EV-RUNTIME | automated |
+| ADR-0045 | 创建前需要最小自我介绍 | EV-IDENTITY-INIT, EV-RUNTIME, EV-COUNTERPART-CREATION, EV-DESKTOP-CREATION | automated |
 | ADR-0046 | 用途隔离的保险库密码配置 | EV-VAULT | automated |
 | ADR-0047 | 版本化独立双解锁 | EV-VAULT | automated |
 | ADR-0048 | OpenAI Responses 运行时家族 | EV-RUNTIME, EV-CORE-IDENTITY | automated |
@@ -154,6 +160,7 @@
 | ADR-0052 | 首次创建一次性展示恢复密钥 | EV-VAULT, EV-HOST, EV-DESKTOP | automated |
 | ADR-0053 | 运行时采用 Vault 单档案热切换 | EV-RUNTIME-PROFILE, EV-VAULT, EV-DESKTOP | automated |
 | ADR-0054 | DeepSeek 官方后端使用 Chat Completions 适配 | EV-RUNTIME | automated |
+| ADR-0055 | 正式对话以完整第二自我状态为就绪门禁 | EV-RUNTIME, EV-COUNTERPART-CREATION, EV-COUNTERPART-READINESS, EV-REPLY-ATTRIBUTION, EV-COUNTERPART-SELF-CONTEXT, EV-DESKTOP-CREATION, EV-PERSON-FACTS | automated |
 
 ## 6. 威胁边界
 
@@ -162,19 +169,19 @@
 | THR-01 | 丢失/脱机复制的保险库与备份不泄漏正文或运行时密钥 | EV-VAULT, EV-BACKUP, EV-RUNTIME-PROFILE, EV-PRIVACY | automated |
 | THR-02 | 其他非管理员账户不能用错误密钥或非当前用户封装打开 Vault | EV-VAULT | automated |
 | THR-03 | 网络客户端不能远程控制 Core，云端凭据不走明文 HTTP | EV-BROWSER, EV-RUNTIME | automated |
-| THR-04 | 外部模型只获得冻结工作上下文，不获得 Vault、密钥或持久身份所有权 | EV-RETRIEVAL, EV-RUNTIME | automated |
+| THR-04 | 外部模型只获得冻结工作上下文，不获得 Vault、密钥或持久身份所有权 | EV-RETRIEVAL, EV-RUNTIME, EV-COUNTERPART-SELF-CONTEXT | automated |
 | THR-05 | 恶意 Markdown、文件边界和网页内容不执行、不触发工具、不进入控制通道 | EV-INGESTION, EV-MARKDOWN, EV-BROWSER, EV-RUNTIME | automated |
 | THR-06 | 浏览器扩展权限等于实际 API 需求，正文只在精确来源授权后读取 | EV-BROWSER, EV-EXTENSION | automated |
-| THR-07 | WebView 只有领域 command，运行时密钥只写不回显，关系约束不扩大宪法、安全或现实行动权 | EV-HOST, EV-CONSTRAINTS, EV-DESKTOP, EV-RUNTIME-PROFILE | automated |
+| THR-07 | WebView 只有领域 command，运行时密钥只写不回显，关系约束不扩大宪法、安全或现实行动权 | EV-HOST, EV-CONSTRAINTS, EV-DESKTOP, EV-RUNTIME-PROFILE, EV-COUNTERPART-READINESS, EV-DESKTOP-CREATION | automated |
 | THR-08 | 测试和文档不声称抵抗已控制当前登录会话、管理员、内核或解锁设备物理攻击 | EV-MATRIX, EV-PRIVACY | automated |
 
 ## 7. 迁移契约
 
 | ID | 迁移边界 | 自动化证据 | 状态 |
 | --- | --- | --- | --- |
-| MIG-01 | SQLCipher schema v1→v26 逐版迁移在中断时整体回滚，并以单例默认档案重开 | EV-SCHEMA, EV-RUNTIME-PROFILE | automated |
+| MIG-01 | SQLCipher schema v1→v27 逐版迁移在中断时整体回滚，并以单例默认档案重开 | EV-SCHEMA, EV-RUNTIME-PROFILE, EV-REPLY-ATTRIBUTION | automated |
 | MIG-02 | 有数据迁移回填 Claim/谱系/检索状态，派生索引损坏可从权威数据重建 | EV-SCHEMA, EV-VAULT, EV-RETRIEVAL | automated |
-| MIG-03 | 热切换运行时后端、模型或 Key 不转移自我包所有权、丢失身份链或混用配置 | EV-CORE-IDENTITY, EV-RUNTIME, EV-RUNTIME-PROFILE | automated |
+| MIG-03 | 热切换运行时后端、模型或 Key 不转移自我包所有权、丢失身份链或混用配置 | EV-CORE-IDENTITY, EV-RUNTIME, EV-RUNTIME-PROFILE, EV-COUNTERPART-SELF-CONTEXT | automated |
 | MIG-04 | Markdown 解析库变化仍必须保持 `eam-markdown-v1` 等价输出，否则提升契约版本 | EV-MARKDOWN, EV-LINEAGE | automated |
 | MIG-05 | 历史备份恢复须先重放最新遗忘、恢复完整运行时档案、重建索引并轮换 Vault Key | EV-BACKUP, EV-FORGET, EV-RUNTIME-PROFILE | automated |
 

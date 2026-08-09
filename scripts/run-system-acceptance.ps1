@@ -174,7 +174,7 @@ function Assert-RequiredEvidenceCoverage {
                 Where-Object { $_ -notin $matching[0].Evidence }
         )
         if ($missing.Count -gt 0) {
-            throw "required S06R evidence is missing from ${rowId}: $($missing -join ',')"
+            throw "required evidence is missing from ${rowId}: $($missing -join ',')"
         }
     }
 }
@@ -233,13 +233,24 @@ function Test-AcceptanceMatrix {
     }
 
     Assert-RequiredEvidenceCoverage -Rows $rows -RequiredEvidenceByRow @{
+        "DET-01" = @("EV-COUNTERPART-CREATION", "EV-DESKTOP-CREATION")
+        "DET-04" = @("EV-COUNTERPART-READINESS", "EV-REPLY-ATTRIBUTION", "EV-COUNTERPART-SELF-CONTEXT")
+        "DET-28" = @("EV-COUNTERPART-CREATION", "EV-COUNTERPART-READINESS", "EV-REPLY-ATTRIBUTION", "EV-COUNTERPART-SELF-CONTEXT")
+        "DET-29" = @("EV-REPLY-ATTRIBUTION", "EV-PERSON-FACTS")
         "DET-30" = @("EV-RUNTIME-PROFILE")
-        "DET-31" = @("EV-RUNTIME-PROFILE")
-        "FR-07" = @("EV-RUNTIME-PROFILE")
+        "DET-31" = @("EV-RUNTIME-PROFILE", "EV-COUNTERPART-SELF-CONTEXT")
+        "DET-32" = @("EV-COUNTERPART-SELF-CONTEXT")
+        "FR-01" = @("EV-COUNTERPART-CREATION", "EV-DESKTOP-CREATION")
+        "FR-04" = @("EV-PERSON-FACTS")
+        "FR-07" = @("EV-RUNTIME-PROFILE", "EV-COUNTERPART-CREATION", "EV-COUNTERPART-READINESS", "EV-REPLY-ATTRIBUTION", "EV-COUNTERPART-SELF-CONTEXT")
+        "FR-08" = @("EV-REPLY-ATTRIBUTION", "EV-DESKTOP-CREATION")
+        "FR-11" = @("EV-COUNTERPART-SELF-CONTEXT")
         "ADR-0053" = @("EV-RUNTIME-PROFILE")
-        "THR-07" = @("EV-RUNTIME-PROFILE")
-        "MIG-01" = @("EV-SCHEMA", "EV-RUNTIME-PROFILE")
-        "MIG-03" = @("EV-RUNTIME-PROFILE")
+        "ADR-0055" = @("EV-RUNTIME", "EV-COUNTERPART-CREATION", "EV-COUNTERPART-READINESS", "EV-REPLY-ATTRIBUTION", "EV-COUNTERPART-SELF-CONTEXT", "EV-DESKTOP-CREATION", "EV-PERSON-FACTS")
+        "THR-04" = @("EV-COUNTERPART-SELF-CONTEXT")
+        "THR-07" = @("EV-RUNTIME-PROFILE", "EV-COUNTERPART-READINESS", "EV-DESKTOP-CREATION")
+        "MIG-01" = @("EV-SCHEMA", "EV-RUNTIME-PROFILE", "EV-REPLY-ATTRIBUTION")
+        "MIG-03" = @("EV-RUNTIME-PROFILE", "EV-COUNTERPART-SELF-CONTEXT")
         "MIG-05" = @("EV-RUNTIME-PROFILE")
     }
 
